@@ -330,7 +330,7 @@ class ColumnSelectDialog(ctk.CTkToplevel):
 class App(ctk.CTk):
     def __init__(self) -> None:
         super().__init__()
-        self.title("Osci/LTspice → LaTeX Data Tool")
+        self.title("LabPlotter")
         self.geometry("1480x880")
         self.minsize(1200, 700)
 

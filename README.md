@@ -1,4 +1,4 @@
-# Osci/LTspice → LaTeX Data Tool
+# LabPlotter
 
 Aplicación de escritorio (CustomTkinter + Matplotlib) para cargar, previsualizar,
 recortar/diezmar y exportar señales de osciloscopio o simulaciones de LTspice

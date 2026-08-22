@@ -28,10 +28,20 @@ from core.data_io import (
     Signal, build_signal, read_table, x_units_for_domain, y_units_for_kind,
 )
 from core.export import (
-    FONT_FAMILIES, LEGEND_POSITIONS, export_csv_combined, export_csv_individual,
-    export_figure, export_xy_csv, legend_kwargs, set_publication_style,
+    FONT_FAMILIES, export_csv_combined, export_csv_individual,
+    export_figure, export_xy_csv, set_publication_style,
+)
+from core.layout import (
+    CUSTOM_ANCHOR_CORNERS, CUSTOM_POSITION, LEGEND_POSITIONS,
+    legend_kwargs, reserve_legend_space,
 )
 from core.processing import crop, decimate, decimate_to_target
+from gui.overlays import AnnotationManager, CursorManager
+from gui.overlay_panel import OverlayWindow
+from gui.theme import (
+    apply_monochrome_theme, apply_plot_chrome, set_theme_mode,
+    style_matplotlib_toolbar,
+)
 
 PLOT_MODES = ["Tiempo / Frecuencia", "Modo X/Y", "Diagrama de Bode"]
 BODE_LAYOUTS = ["Juntos (superpuestos, Y1/Y2)", "Separados (independientes)"]
@@ -330,12 +340,15 @@ class ColumnSelectDialog(ctk.CTkToplevel):
 class App(ctk.CTk):
     def __init__(self) -> None:
         super().__init__()
-        self.title("LabPlotter")
+        self.title("Osci/LTspice → LaTeX Data Tool")
         self.geometry("1480x880")
         self.minsize(1200, 700)
 
-        ctk.set_appearance_mode("System")
-        ctk.set_default_color_theme("blue")
+        # NOTE: appearance mode / color theme are no longer set here.
+        # `apply_monochrome_theme()` installs the monochrome palette and the
+        # appearance mode BEFORE this window is constructed (see `main()`
+        # at the bottom of this file) -- CustomTkinter reads the theme
+        # dictionary at widget-creation time, so it must run first.
 
         # ------------------------- Application state ------------------------- #
         self.signals: dict[str, Signal] = {}
@@ -344,6 +357,7 @@ class App(ctk.CTk):
         self.row_widgets: dict[str, dict] = {}
         self._color_index = 0
         self._axis_labels_dirty = False   # True once the user edits axis labels
+        self.overlay_window = None        # floating cursor/annotation palette
 
         self.decimal_comma_var = ctk.BooleanVar(value=False)
         # Default font matches a typical LaTeX report (lmodern / Computer
@@ -425,6 +439,8 @@ class App(ctk.CTk):
                          ).pack(side="left", padx=(6, 12))
         ctk.CTkButton(top, text="Actualizar gráfico", command=self.update_plot,
                       width=150).pack(side="left")
+        ctk.CTkButton(top, text="Cursores / Anotaciones...", width=190,
+                      command=self._open_overlay_window).pack(side="left", padx=(8, 0))
         self.status_label = ctk.CTkLabel(top, text="", text_color="gray")
         self.status_label.pack(side="left", padx=12)
 
@@ -440,6 +456,14 @@ class App(ctk.CTk):
         toolbar_frame.pack(fill="x")
         self.mpl_toolbar = EditableNavigationToolbar(self.canvas, toolbar_frame)
         self.mpl_toolbar.update()
+        style_matplotlib_toolbar(self.mpl_toolbar, "dark")
+
+        # Overlay layer. Both managers keep plain specs, so they survive the
+        # fig.clear() performed on every re-plot (see `update_plot`).
+        self.cursors = CursorManager(self.canvas, max_cursors=None)
+        self.annotations = AnnotationManager(self.canvas)
+        self.cursors.attach(self.axes)
+        self.annotations.attach(self.axes)
 
         # X/Y mode axis pickers, shown only when that mode is active.
         self.xy_frame = ctk.CTkFrame(center)
@@ -612,6 +636,17 @@ class App(ctk.CTk):
                          command=lambda _=None: self._on_font_change()
                          ).grid(row=0, column=1, padx=6)
 
+        # Theme (monochrome light/dark switch)
+        theme_frame = ctk.CTkFrame(right, fg_color="transparent")
+        theme_frame.pack(fill="x", padx=10, pady=(10, 2))
+        ctk.CTkLabel(theme_frame, text="Tema:", width=90, anchor="w"
+                     ).grid(row=0, column=0, sticky="w")
+        self.theme_mode_var = ctk.StringVar(value="Oscuro")
+        ctk.CTkSegmentedButton(theme_frame, values=["Claro", "Oscuro"],
+                                variable=self.theme_mode_var,
+                                command=self._on_theme_change
+                                ).grid(row=0, column=1, padx=6)
+
         # Legend
         ctk.CTkLabel(right, text="Leyenda", font=ctk.CTkFont(weight="bold", size=13)
                      ).pack(pady=(12, 2), padx=10, anchor="w")
@@ -624,6 +659,37 @@ class App(ctk.CTk):
         self.legend_pos_var = ctk.StringVar(value="upper right")
         ctk.CTkComboBox(leg, values=LEGEND_POSITIONS, variable=self.legend_pos_var,
                          width=190).pack(side="left", padx=6)
+
+        # Free legend placement: (x, y) in axes fractions, pinned by `corner`.
+        # Values outside [0, 1] push the legend beyond the axes, which is what
+        # keeps transient and Bode traces uncovered.
+        leg_xy = ctk.CTkFrame(right, fg_color="transparent")
+        leg_xy.pack(fill="x", padx=10, pady=2)
+        ctk.CTkLabel(leg_xy, text="X / Y:", width=90, anchor="w"
+                     ).grid(row=0, column=0, sticky="w")
+        self.legend_x_var = ctk.StringVar(value="1.02")
+        self.legend_y_var = ctk.StringVar(value="1.00")
+        for column, var in ((1, self.legend_x_var), (2, self.legend_y_var)):
+            entry = ctk.CTkEntry(leg_xy, textvariable=var, width=70)
+            entry.grid(row=0, column=column, padx=4)
+            entry.bind("<Return>", lambda _e: self.update_plot())
+        ctk.CTkLabel(leg_xy, text="Anclaje:", width=90, anchor="w"
+                     ).grid(row=1, column=0, sticky="w", pady=(6, 0))
+        self.legend_corner_var = ctk.StringVar(value="upper left")
+        ctk.CTkComboBox(leg_xy, values=CUSTOM_ANCHOR_CORNERS,
+                         variable=self.legend_corner_var, width=148
+                         ).grid(row=1, column=1, columnspan=2, padx=4,
+                                pady=(6, 0), sticky="w")
+        ctk.CTkLabel(leg_xy, text="Columnas:", width=90, anchor="w"
+                     ).grid(row=2, column=0, sticky="w", pady=(6, 0))
+        self.legend_ncol_var = ctk.StringVar(value="1")
+        ncol_entry = ctk.CTkEntry(leg_xy, textvariable=self.legend_ncol_var, width=70)
+        ncol_entry.grid(row=2, column=1, padx=4, pady=(6, 0))
+        ncol_entry.bind("<Return>", lambda _e: self.update_plot())
+        ctk.CTkLabel(right, text="X/Y y anclaje aplican con «personalizada (x, y)». "
+                                 "Fuera de [0, 1] la leyenda queda por fuera del área.",
+                     text_color="gray", font=ctk.CTkFont(size=10),
+                     wraplength=300, justify="left").pack(padx=12, anchor="w")
 
         self.grid_var = ctk.BooleanVar(value=True)
         ctk.CTkCheckBox(right, text="Mostrar grilla", variable=self.grid_var
@@ -1141,6 +1207,19 @@ class App(ctk.CTk):
         set_publication_style(font_family=self.font_family_var.get())
         self.update_plot()
 
+    def _on_theme_change(self, value: str) -> None:
+        """Live switch between the two monochrome variants."""
+        mode = "light" if value.lower().startswith("c") else "dark"
+        set_theme_mode(mode)
+        style_matplotlib_toolbar(self.mpl_toolbar, mode)
+
+    def _legend_anchor(self) -> Optional[tuple[float, float]]:
+        """(x, y) in axes fractions, only meaningful for the custom position."""
+        if self.legend_pos_var.get() != CUSTOM_POSITION:
+            return None
+        return (_parse_float(self.legend_x_var.get(), 1.02),
+                _parse_float(self.legend_y_var.get(), 1.0))
+
     def _read_settings(self) -> dict:
         mode = self.plot_mode_var.get()
         x_unit = self.unit_x_var.get()
@@ -1180,6 +1259,9 @@ class App(ctk.CTk):
             "minor_grid": self.minor_grid_var.get(),
             "show_legend": self.legend_var.get(),
             "legend_pos": self.legend_pos_var.get(),
+            "legend_anchor": self._legend_anchor(),
+            "legend_corner": self.legend_corner_var.get(),
+            "legend_ncol": max(1, int(_parse_float(self.legend_ncol_var.get(), 1.0))),
             "bode_layout": "separate" if self.bode_layout_var.get().startswith("Separados") else "shared",
         }
 
@@ -1281,13 +1363,34 @@ class App(ctk.CTk):
             self.fig.tight_layout()
         except Exception:
             pass   # tight_layout can fail with an outside legend; harmless
+
+        # tight_layout ignores legends anchored outside the axes: reserve the
+        # margin explicitly so the preview matches the exported figure.
+        reserve_legend_space(self.fig, settings["legend_pos"],
+                             settings.get("legend_anchor"))
+        apply_plot_chrome(self.fig)
+
+        # The axes were re-created by _reset_figure (fig.clear()), so the
+        # overlay artists have to be rebuilt from their persistent specs.
+        self.cursors.attach(self.axes)
+        self.annotations.attach(self.axes)
+        self.cursors.x_unit = settings["x_unit"]
+        self.cursors.y_unit = "dB" if mode == "Diagrama de Bode" else settings["y_unit"]
+        self.cursors.redraw()
+        self.annotations.redraw()
+        if self.overlay_window is not None and self.overlay_window.winfo_exists():
+            self.overlay_window.panel.refresh_all()
+
         self.canvas.draw_idle()
         self.status_label.configure(text=f"{n_points} puntos en gráfico · modo: {mode}")
 
     def _finish_legend(self, ax, settings: dict, handles=None, labels=None) -> None:
         if not settings["show_legend"]:
             return
-        kwargs = legend_kwargs(settings["legend_pos"])
+        kwargs = legend_kwargs(settings["legend_pos"],
+                               anchor=settings.get("legend_anchor"),
+                               corner=settings.get("legend_corner", "upper left"),
+                               ncol=settings.get("legend_ncol", 1))
         if handles is not None:
             if handles:
                 ax.legend(handles, labels, **kwargs)
@@ -1341,7 +1444,10 @@ class App(ctk.CTk):
         h1, l1 = ax.get_legend_handles_labels()
         h2, l2 = ax2.get_legend_handles_labels() if ax2 is not None else ([], [])
         if settings["show_legend"] and (h1 or h2):
-            ax.legend(h1 + h2, l1 + l2, **legend_kwargs(settings["legend_pos"]))
+            ax.legend(h1 + h2, l1 + l2, **legend_kwargs(settings["legend_pos"],
+                                                         anchor=settings.get("legend_anchor"),
+                                                         corner=settings.get("legend_corner", "upper left"),
+                                                         ncol=settings.get("legend_ncol", 1)))
         return total
 
     def _draw_bode(self, settings: dict) -> int:
@@ -1395,7 +1501,10 @@ class App(ctk.CTk):
                 ax_mag.set_title(settings["title"])
             self._finish_legend(ax_mag, settings)
             if ax_ph.get_legend_handles_labels()[0] and settings["show_legend"]:
-                ax_ph.legend(**legend_kwargs(settings["legend_pos"]))
+                ax_ph.legend(**legend_kwargs(settings["legend_pos"],
+                                             anchor=settings.get("legend_anchor"),
+                                             corner=settings.get("legend_corner", "upper left"),
+                                             ncol=settings.get("legend_ncol", 1)))
             return total
 
         # "Juntos": true overlay, one set of axes, dual Y scales (twinx).
@@ -1446,7 +1555,10 @@ class App(ctk.CTk):
         h1, l1 = ax_mag.get_legend_handles_labels()
         h2, l2 = ax_ph.get_legend_handles_labels()
         if settings["show_legend"] and (h1 or h2):
-            ax_mag.legend(h1 + h2, l1 + l2, **legend_kwargs(settings["legend_pos"]))
+            ax_mag.legend(h1 + h2, l1 + l2, **legend_kwargs(settings["legend_pos"],
+                                                             anchor=settings.get("legend_anchor"),
+                                                             corner=settings.get("legend_corner", "upper left"),
+                                                             ncol=settings.get("legend_ncol", 1)))
         return total
 
     def _draw_xy(self, settings: dict) -> int:
@@ -1596,8 +1708,40 @@ class App(ctk.CTk):
             return
         messagebox.showinfo("Exportación completa", f"Figura guardada en:\n{out_path}")
 
+    # ------------------------------------------------------------------ #
+    # Overlay layer: cursors and annotations
+    # ------------------------------------------------------------------ #
+    def _overlay_units(self) -> tuple[str, str]:
+        """Units used to format the cursor readout."""
+        return self.cursors.x_unit, self.cursors.y_unit
+
+    def _refresh_overlays(self) -> None:
+        """Re-render only the overlay artists; the data plot is untouched."""
+        self.cursors.attach(self.axes)
+        self.annotations.attach(self.axes)
+        self.cursors.redraw()
+        self.annotations.redraw()
+        self.canvas.draw_idle()
+
+    def _open_overlay_window(self) -> None:
+        if self.overlay_window is not None and self.overlay_window.winfo_exists():
+            self.overlay_window.lift()
+            self.overlay_window.focus()
+            return
+        self.overlay_window = OverlayWindow(
+            self, self.cursors, self.annotations,
+            on_refresh=self._refresh_overlays,
+            unit_provider=self._overlay_units,
+            on_close=self._on_overlay_closed)
+
+    def _on_overlay_closed(self) -> None:
+        self.overlay_window = None
+
 
 def main() -> None:
+    # CustomTkinter reads the theme dictionary when each widget is built, so
+    # the monochrome palette must be installed before the window exists.
+    apply_monochrome_theme("dark")        # use "light" for the light variant
     app = App()
     app.mainloop()
 

@@ -64,10 +64,17 @@ python main.py
 `requirements.txt`:
 
 ```
-customtkinter>=5.2.0
-matplotlib>=3.7
-numpy>=1.24
-pandas>=2.0
+customtkinter>=5.2.0   # solo GUI (main.py)
+matplotlib>=3.7        # GUI + core/ headless
+numpy>=1.24             # GUI + core/ headless
+pandas>=2.0             # GUI + core/ headless
+```
+
+Para usar únicamente `core/` desde un script, sin la GUI (ver sección 13), no hace falta
+`customtkinter`: alcanza con
+
+```bash
+pip install matplotlib pandas numpy
 ```
 
 ---
@@ -262,3 +269,87 @@ mientras está abierta, así que nunca captura el bucle de eventos.
   la distancia perpendicular a la curva.
 - `tight_layout()` puede fallar con leyendas externas muy grandes; en ese caso se conservan los
   márgenes reservados y conviene ajustarlos a mano desde *Configure subplots*.
+
+---
+
+## 13. Uso headless (scripting con `core/`)
+
+`core/` no importa nada de `gui/` ni de CustomTkinter (ver sección 2), así que puede usarse
+directamente desde un script de Python sin abrir la aplicación. Esto sirve para regenerar en
+lote las figuras de un informe (por ejemplo, cada vez que se corrige un dato crudo) con
+exactamente el mismo estilo de publicación que produce la GUI.
+
+### Requisitos
+
+Solo las dependencias numéricas/de graficado, sin `customtkinter`:
+
+```bash
+pip install matplotlib pandas numpy
+```
+
+### Flujo mínimo
+
+```python
+import sys
+sys.path.insert(0, "/ruta/a/LabPlotter")   # o agregar LabPlotter al PYTHONPATH
+
+import matplotlib
+matplotlib.use("Agg")                       # sin ventana: solo exportar a archivo
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
+import pandas as pd
+
+from core.export import set_publication_style, export_figure
+
+# 1) Aplicar el mismo estilo que usa la GUI (fuente, grillas, tamaños).
+set_publication_style("LaTeX (Computer Modern)", base_fontsize=10)
+
+# 2) Cargar datos. `core.data_io.read_table` hace la detección automática de
+#    separador/encoding/formato Bode si el archivo viene directo de un
+#    osciloscopio o de LTspice; para un CSV ya limpio, `pandas.read_csv` alcanza.
+df = pd.read_csv("data/processed/mi_medicion_clean.csv")
+
+# 3) Graficar con Matplotlib estándar.
+fig, ax = plt.subplots(figsize=(14.9 / 2.54, 6 / 2.54))   # cm -> inch
+ax.plot(df["time_us"], df["Vin_V"], "--", label=r"$v(t)$")
+ax.plot(df["time_us"], df["Vc_V"], "-", label=r"$v_C(t)$")
+ax.set_xlabel(r"Tiempo [$\mu$s]")
+ax.set_ylabel("Tensión [V]")
+ax.grid(True, which="both")
+ax.legend(loc="upper right")
+fig.tight_layout()
+
+# 4) Exportar. `export_figure` aplica bbox_inches="tight" y respeta el dpi/formato
+#    según la extensión (.pdf/.svg/.pgf vectorial, .png rasterizado).
+export_figure(fig, "assets/plots/mi_figura.pdf")
+```
+
+Para un eje de frecuencia logarítmico con notación de ingeniería (100, 1k, 10k, ...) como el
+que usa la GUI:
+
+```python
+ax.set_xscale("log")
+ax.xaxis.set_major_formatter(mticker.EngFormatter(unit="", sep=""))
+```
+
+Funciones de `core/` más usadas en scripts:
+
+| Módulo | Función | Para qué |
+|---|---|---|
+| `core.export` | `set_publication_style(font_family, base_fontsize)` | Aplica el estilo de publicación (fuente, grillas, tamaños) antes de graficar. |
+| `core.export` | `export_figure(fig, out_path, dpi=300)` | Guarda PDF/SVG/PGF vectorial o PNG rasterizado, con `bbox_inches="tight"`. |
+| `core.export` | `export_csv_individual` / `export_csv_combined` | Exportan CSV listos para `\addplot table` de pgfplots, si en vez de una figura se necesita solo la tabla. |
+| `core.data_io` | `read_table(path, decimal_comma=False)` | Lee un archivo de osciloscopio/LTspice con detección automática de formato. |
+| `core.data_io` | `build_signal(df, ...)` | Arma un `Signal` (offset/ganancia/inversión no destructivos) a partir de dos columnas. |
+| `core.processing` | `crop`, `decimate`, `decimate_to_target` | Recorte temporal y diezmado antes de graficar/exportar. |
+| `core.layout` | `legend_kwargs(position, ...)` | Traduce una posición de leyenda (incluidas las "outside …") a kwargs de `Axes.legend()`. |
+| `core.latex` | `figure_block(path, caption, label, ...)` | Genera el bloque `figure` de LaTeX completo (`\includegraphics`/`\input`, caption, label) listo para pegar. |
+
+### Ejemplo real
+
+El script [`generar_figuras.py`](../25.13-LaboratorioDeElectrónica%201/TPN1/scripts/generar_figuras.py)
+del informe TPN1 usa exactamente este flujo para regenerar sus 13 figuras (Bode, respuesta a
+onda cuadrada/triangular, mediciones punto a punto) a partir de los CSV/TXT crudos, reemplazando
+los antiguos diagramas `pgfplots` embebidos en el `.tex` por `\includegraphics` de los PDF
+exportados. Sirve como referencia de cómo estructurar un script de generación en lote para un
+informe con muchas figuras.

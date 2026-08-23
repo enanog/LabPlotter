@@ -35,8 +35,8 @@ OVERLAY_GID = "_labplotter_overlay"
 
 # Overlay chrome is intentionally greyscale: the color channel belongs to the
 # data. Annotations may override the color per item (e.g. to match a curve).
-CURSOR_COLOR = "#1A1A1A"
-ANNOTATION_COLOR = "#222222"
+CURSOR_COLOR = "#2A2724"
+ANNOTATION_COLOR = "#2A2724"
 
 ARROW_STYLES: list[str] = ["->", "<-", "<->", "-|>", "<|-|>", "-"]
 LINESTYLES: list[str] = ["--", "-", "-.", ":"]
@@ -317,8 +317,8 @@ class CursorManager:
             if self.tag_with_value:
                 unit = self.x_unit if spec.orientation == "v" else self.y_unit
                 name = f"{name}: {format_eng(spec.position, unit, 4, mathtext=True)}"
-            box = dict(boxstyle="square,pad=0.22", fc="white", ec="0.45", lw=0.6,
-                       alpha=0.9)
+            box = dict(boxstyle="square,pad=0.24", fc="white", ec="#4A473F",
+                       lw=0.6, alpha=0.92)
             if spec.orientation == "v":
                 tag = ax.text(spec.position, 0.985, name,
                               transform=ax.get_xaxis_transform(),
@@ -726,8 +726,10 @@ class AnnotationManager:
     def _box(self, spec: AnnotationSpec) -> Optional[dict]:
         if not spec.boxed:
             return None
-        return dict(boxstyle="round,pad=0.28", fc="white", ec="0.45",
-                    lw=0.6, alpha=0.88)
+        # Square box: the report figure and the application chrome share the
+        # same right-angled vocabulary.
+        return dict(boxstyle="square,pad=0.30", fc="white", ec="#4A473F",
+                    lw=0.6, alpha=0.90)
 
     def _render(self, spec: AnnotationSpec) -> list:
         ax = self.axes[spec.axes_index]

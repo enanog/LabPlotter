@@ -22,6 +22,8 @@ from typing import Callable, Optional, Sequence
 
 import customtkinter as ctk
 
+from core.i18n import t
+
 from .theme import BORDER, RADIUS, col, font, spaced, tk_color
 
 
@@ -80,6 +82,11 @@ LINE_GLYPHS: dict[str, str] = {
     "--": "─ ─ ─",
     "-.": "─ · ─",
     ":":  "· · · ·",
+    # No connecting line at all -- just the trace's marker at each sample,
+    # for data that should not read as continuous/interpolated (see
+    # `LINESTYLES` in gui/app.py). Bullets, not the finer dots used for
+    # ":", so the two are never confused at a glance.
+    "None": "•  •  •",
 }
 
 
@@ -154,11 +161,25 @@ class Field(ctk.CTkFrame):
 
 def entry_field(master, label: str, variable, suffix: str = "",
                 width: int = 78, on_enter: Optional[Callable[[], None]] = None,
-                rule: bool = True, label_width: int = 118) -> ctk.CTkEntry:
-    """Label + numeric entry + optional unit suffix. Returns the entry."""
+                rule: bool = True, label_width: int = 118,
+                suffix_var: Optional[ctk.Variable] = None) -> ctk.CTkEntry:
+    """
+    Label + numeric entry + optional unit suffix. Returns the entry.
+
+    `suffix` is a static label, fixed for the life of the widget. Pass
+    `suffix_var` instead when the unit it displays can change at runtime
+    (e.g. a per-trace unit combo next to it) -- a suffix built from `suffix`
+    would otherwise keep showing the unit that was active when the field
+    was built, silently mismatched against whatever unit the value is
+    actually interpreted in once the surrounding unit combo changes.
+    """
     field = Field(master, label, rule=rule, label_width=label_width)
     field.pack(fill="x", pady=(0, 6))
-    if suffix:
+    if suffix_var is not None:
+        ctk.CTkLabel(field.control, textvariable=suffix_var, font=font("small"),
+                     text_color=col("fg_faint"), width=22, anchor="w"
+                     ).pack(side="right", padx=(6, 0))
+    elif suffix:
         ctk.CTkLabel(field.control, text=suffix, font=font("small"),
                      text_color=col("fg_faint"), width=22, anchor="w"
                      ).pack(side="right", padx=(6, 0))
@@ -187,13 +208,21 @@ def text_field(master, label: str, variable, width: int = 150,
 
 def combo_field(master, label: str, variable, values: Sequence[str],
                 width: int = 150, command: Optional[Callable] = None,
-                rule: bool = True) -> ctk.CTkComboBox:
-    """Label + dropdown, for value sets that change at runtime."""
+                rule: bool = True, labels: Optional[dict] = None):
+    """
+    Label + dropdown. With `labels`, the visible text is translated while the
+    variable keeps a stable internal identifier (see `LabeledCombo`).
+    """
     field = Field(master, label, rule=rule)
     field.pack(fill="x", pady=(0, 6))
-    combo = ctk.CTkComboBox(field.control, values=list(values), variable=variable,
-                            width=width, height=26, font=font("body"),
-                            dropdown_font=font("body"), command=command)
+    if labels is not None:
+        combo = LabeledCombo(field.control, values, variable, labels=labels,
+                             command=command, width=width)
+    else:
+        combo = ctk.CTkComboBox(field.control, values=list(values),
+                                variable=variable, width=width, height=26,
+                                font=font("body"), dropdown_font=font("body"),
+                                command=command)
     combo.pack(side="right")
     return combo
 
@@ -367,24 +396,114 @@ class Chip(ctk.CTkFrame):
 # --------------------------------------------------------------------------- #
 class StaticSection(ctk.CTkFrame):
     """
-    A titled group whose body is always visible.
+    A titled group that can be folded away with the caret in its header.
 
-    This replaces an earlier collapsible/accordion implementation that was
-    removed outright. Collapsing sections inside a scrolling column moved the
-    content under the pointer by the height of whatever had just opened or
-    closed, so every interaction with the panel felt like it jumped. The panel
-    scrolls; there is nothing to gain from hiding parts of it, and a header
-    that cannot be clicked is a header that cannot misbehave.
+    This is the third iteration of this widget and the constraints that broke
+    the first two are encoded here:
+
+    * **Sections are independent.** The original was an exclusive accordion,
+      so opening one silently closed another and the content under the
+      pointer jumped by the height of whatever had just collapsed.
+    * **The body is never destroyed**, only unmapped. Rebuilding it on every
+      toggle meant losing the state of the widgets inside, and cost a full
+      relayout of the panel each time.
+    * **The header keeps a fixed height whether open or closed**, so a column
+      of collapsed sections is an evenly spaced list rather than a ragged one.
     """
 
-    def __init__(self, master, title: str, **kwargs):
+    def __init__(self, master, title: str, expanded: bool = True,
+                 on_toggle: Optional[Callable[["StaticSection"], None]] = None,
+                 collapsible: bool = True, **kwargs):
         super().__init__(master, fg_color="transparent", height=1, **kwargs)
         self.title = title
-        ctk.CTkLabel(self, text=spaced(title), font=font("header"),
-                     text_color=col("fg_muted"), anchor="w").pack(fill="x")
+        self.on_toggle = on_toggle
+        self.collapsible = collapsible
+        self._expanded = True
+
+        header = ctk.CTkFrame(self, fg_color="transparent", height=18)
+        header.pack(fill="x")
+        header.pack_propagate(False)
+
+        self._caret = ctk.CTkLabel(header, text="", width=12, font=font("small"),
+                                   text_color=col("fg_faint"))
+        self._title = ctk.CTkLabel(header, text=spaced(title), font=font("header"),
+                                   text_color=col("fg_muted"), anchor="w")
+        if collapsible:
+            self._caret.pack(side="left")
+            self._title.pack(side="left", fill="x", expand=True)
+            for widget in (header, self._caret, self._title):
+                widget.bind("<Button-1>", lambda _e: self.toggle())
+                _hand(widget)
+        else:
+            self._title.pack(side="left", fill="x", expand=True)
+
         Rule(self).pack(fill="x", pady=(4, 0))
         self.body = ctk.CTkFrame(self, fg_color="transparent", height=1)
         self.body.pack(fill="x", pady=(8, 4))
+        if not expanded:
+            self.collapse()
+        self._sync_caret()
+
+    @property
+    def expanded(self) -> bool:
+        return self._expanded
+
+    def _sync_caret(self) -> None:
+        if not self.collapsible:
+            return
+        self._caret.configure(text="\u25be" if self._expanded else "\u25b8")
+        self._title.configure(
+            text_color=col("fg_muted") if self._expanded else col("fg_faint"))
+
+    def toggle(self) -> None:
+        self.collapse() if self._expanded else self.expand()
+        if self.on_toggle is not None:
+            self.on_toggle(self)
+
+    def expand(self) -> None:
+        if self._expanded:
+            return
+        self._expanded = True
+        self.body.pack(fill="x", pady=(8, 4))
+        self._sync_caret()
+
+    def collapse(self) -> None:
+        if not self._expanded:
+            return
+        self._expanded = False
+        self.body.pack_forget()   # unmapped, never destroyed: state survives
+        self._sync_caret()
+
+
+class SectionGroup:
+    """
+    Registry of the sections in one panel, so their open/closed state can be
+    saved with the session and driven together by a "minimise all" control.
+    It enforces no policy about how many may be open at once.
+    """
+
+    def __init__(self):
+        self.sections: list[StaticSection] = []
+
+    def add(self, section: StaticSection) -> StaticSection:
+        self.sections.append(section)
+        return section
+
+    def state(self) -> dict[str, bool]:
+        return {s.title: s.expanded for s in self.sections}
+
+    def restore(self, state: dict) -> None:
+        for section in self.sections:
+            wanted = state.get(section.title)
+            if wanted is not None:
+                section.expand() if wanted else section.collapse()
+
+    def set_all(self, expanded: bool) -> None:
+        for section in self.sections:
+            section.expand() if expanded else section.collapse()
+
+    def any_expanded(self) -> bool:
+        return any(s.expanded for s in self.sections)
 
 
 # --------------------------------------------------------------------------- #
@@ -401,7 +520,9 @@ class TraceRow(ctk.CTkFrame):
                  visible: bool = True,
                  on_select: Optional[Callable[[], None]] = None,
                  on_toggle: Optional[Callable[[bool], None]] = None,
-                 on_color: Optional[Callable[[], None]] = None, **kwargs):
+                 on_color: Optional[Callable[[], None]] = None,
+                 on_move_up: Optional[Callable[[], None]] = None,
+                 on_move_down: Optional[Callable[[], None]] = None, **kwargs):
         super().__init__(master, fg_color="transparent", corner_radius=RADIUS,
                          height=ROW_HEIGHT, **kwargs)
         # The row is a fixed-height strip: a list of traces reads as a list,
@@ -438,6 +559,23 @@ class TraceRow(ctk.CTkFrame):
                                       text_color=col("fg_faint"), cursor="hand2")
         self.tag_label.pack(side="right", padx=(4, 8))
 
+        # Reorder within the list -- this is also the plot/legend draw
+        # order (see `App._gather_curves`), so moving a trace here is how
+        # its position in the legend is changed, without a separate control.
+        if on_move_up is not None or on_move_down is not None:
+            moves = ctk.CTkFrame(self, fg_color="transparent")
+            moves.pack(side="right", padx=(0, 2))
+            up = ctk.CTkLabel(moves, text="▲", font=font("mono", 8),
+                              text_color=col("fg_faint"), cursor="hand2")
+            up.pack(side="left")
+            down = ctk.CTkLabel(moves, text="▼", font=font("mono", 8),
+                                text_color=col("fg_faint"), cursor="hand2")
+            down.pack(side="left", padx=(3, 0))
+            if on_move_up is not None:
+                up.bind("<Button-1>", lambda _e: on_move_up())
+            if on_move_down is not None:
+                down.bind("<Button-1>", lambda _e: on_move_down())
+
         if on_select is not None:
             for widget in (self, self.name_label, self.tag_label):
                 widget.bind("<Button-1>", lambda _e: on_select())
@@ -455,13 +593,14 @@ class MeasurementsCard(ctk.CTkFrame):
     instead of in a separate window.
     """
 
-    def __init__(self, master, title: str = "Mediciones", **kwargs):
+    def __init__(self, master, title: str = "", **kwargs):
         super().__init__(master, corner_radius=RADIUS, border_width=BORDER,
                          border_color=col("border_str"), fg_color=col("surface"),
                          **kwargs)
         head = ctk.CTkFrame(self, fg_color="transparent")
         head.pack(fill="x", padx=10, pady=(7, 4))
-        ctk.CTkLabel(head, text=spaced(title), font=font("header"),
+        ctk.CTkLabel(head, text=spaced(title or t("Mediciones")),
+                     font=font("header"),
                      text_color=col("fg_muted")).pack(side="left")
         self._close = ctk.CTkLabel(head, text="✕", font=font("small"),
                                    text_color=col("fg_faint"), cursor="hand2")
@@ -470,7 +609,7 @@ class MeasurementsCard(ctk.CTkFrame):
         self.body = ctk.CTkFrame(self, fg_color="transparent",
                                  width=1, height=1)
         self.body.pack(fill="both", expand=True, padx=10, pady=(6, 8))
-        self._empty = "Sin cursores en el gráfico."
+        self._empty = t("Sin cursores en el gráfico.")
 
     def bind_close(self, command: Callable[[], None]) -> None:
         self._close.bind("<Button-1>", lambda _e: command())
@@ -519,6 +658,98 @@ def hint(master, text: str, **kwargs) -> ctk.CTkLabel:
     return ctk.CTkLabel(master, text=text, font=font("hint"),
                         text_color=col("fg_faint"), anchor="w",
                         justify="left", **kwargs)
+
+
+class SliderField(ctk.CTkFrame):
+    """
+    Slider and numeric entry over one value, kept in sync both ways.
+
+    Sliders were removed from this application once already because dragging
+    one fired a full re-layout per pixel of travel. That is fixed here rather
+    than by dropping the control: `on_change` is debounced, so a drag updates
+    the number continuously but only commits when the pointer settles. Typing
+    an exact value stays available for the cases a drag cannot hit.
+    """
+
+    def __init__(self, master, label: str, variable, minimum: float = 0.0,
+                 maximum: float = 1.0, steps: int = 200,
+                 on_change: Optional[Callable[[], None]] = None,
+                 decimals: int = 3, label_width: int = 132,
+                 debounce_ms: int = 90, **kwargs):
+        super().__init__(master, fg_color="transparent", width=1, height=1,
+                         **kwargs)
+        self.variable = variable
+        self.on_change = on_change
+        self.minimum, self.maximum = minimum, maximum
+        self.decimals = decimals
+        self.debounce_ms = debounce_ms
+        self._job = None
+        self._syncing = False
+
+        row = ctk.CTkFrame(self, fg_color="transparent", width=1, height=1)
+        row.pack(fill="x")
+        ctk.CTkLabel(row, text=label, font=font("label"),
+                     text_color=col("fg_muted"), width=label_width,
+                     anchor="w").pack(side="left")
+        self.entry = ctk.CTkEntry(row, textvariable=variable, width=68,
+                                  height=26, font=font("mono"), justify="right")
+        self.entry.pack(side="right")
+        self.entry.bind("<Return>", lambda _e: self._from_entry())
+        self.entry.bind("<FocusOut>", lambda _e: self._from_entry())
+
+        self.slider = ctk.CTkSlider(self, from_=minimum, to=maximum,
+                                    number_of_steps=steps,
+                                    command=self._from_slider, height=14)
+        self.slider.pack(fill="x", pady=(4, 0))
+        Rule(self).pack(fill="x", pady=(6, 0))
+        self._sync_slider()
+
+    def _value(self) -> float:
+        try:
+            return float(str(self.variable.get()).strip().replace(",", "."))
+        except (ValueError, AttributeError):
+            return self.minimum
+
+    def _sync_slider(self) -> None:
+        self._syncing = True
+        try:
+            self.slider.set(min(self.maximum, max(self.minimum, self._value())))
+        except Exception:
+            pass
+        finally:
+            self._syncing = False
+
+    def _from_slider(self, value: float) -> None:
+        if self._syncing:
+            return
+        self.variable.set(f"{float(value):.{self.decimals}f}")
+        self._schedule()
+
+    def _from_entry(self) -> None:
+        value = min(self.maximum, max(self.minimum, self._value()))
+        self.variable.set(f"{value:.{self.decimals}f}")
+        self._sync_slider()
+        self._commit()
+
+    def _schedule(self) -> None:
+        if self._job is not None:
+            try:
+                self.after_cancel(self._job)
+            except Exception:
+                pass
+        self._job = self.after(self.debounce_ms, self._commit)
+
+    def _commit(self) -> None:
+        self._job = None
+        if self.on_change is not None:
+            try:
+                self.on_change()
+            except Exception:
+                pass
+
+    def set_value(self, value: float) -> None:
+        self.variable.set(f"{float(value):.{self.decimals}f}")
+        self._sync_slider()
 
 
 def stacked_entry(master, label: str, variable, width: int = 0,
@@ -655,9 +886,9 @@ class TextPrompt(ctk.CTkToplevel):
 
         actions = ctk.CTkFrame(body, fg_color="transparent")
         actions.pack(fill="x")
-        primary_button(actions, "Guardar", self._submit, height=28, width=100
+        primary_button(actions, t("Guardar"), self._submit, height=28, width=100
                        ).pack(side="right")
-        ghost_button(actions, "Cancelar", self.destroy, width=90
+        ghost_button(actions, t("Cancelar"), self.destroy, width=90
                     ).pack(side="right", padx=(0, 8))
 
         self.transient(master)
@@ -680,13 +911,13 @@ class ShortcutsWindow(ctk.CTkToplevel):
 
     def __init__(self, master, groups: Sequence[tuple[str, Sequence[tuple[str, str]]]]):
         super().__init__(master)
-        self.title("Atajos")
+        self.title(t("Atajos"))
         self.geometry("420x520")
         self.minsize(360, 360)
 
         header = ctk.CTkFrame(self, fg_color="transparent")
         header.pack(fill="x", padx=20, pady=(18, 6))
-        ctk.CTkLabel(header, text=spaced("Atajos"), font=font("header"),
+        ctk.CTkLabel(header, text=spaced(t("Atajos")), font=font("header"),
                     text_color=col("fg_muted")).pack(side="left")
         Rule(self).pack(fill="x", padx=20)
 
@@ -774,8 +1005,8 @@ class CodeDialog(ctk.CTkToplevel):
         self._status = ctk.CTkLabel(actions, text="", font=font("small"),
                                     text_color=col("fg_faint"))
         self._status.pack(side="left")
-        ghost_button(actions, "Cerrar", self.destroy, width=90).pack(side="right")
-        primary_button(actions, "Copiar", self._copy, height=28,
+        ghost_button(actions, t("Cerrar"), self.destroy, width=90).pack(side="right")
+        primary_button(actions, t("Copiar"), self._copy, height=28,
                        width=110).pack(side="right", padx=(0, 8))
 
         self.transient(master)
@@ -802,6 +1033,89 @@ class CodeDialog(ctk.CTkToplevel):
             self.clipboard_append(text)
             self.update_idletasks()   # make the selection stick on Windows
         except Exception:
-            self._status.configure(text="No se pudo acceder al portapapeles.")
+            self._status.configure(text=t("No se pudo acceder al portapapeles."))
             return
-        self._status.configure(text="Copiado al portapapeles.")
+        self._status.configure(text=t("Copiado al portapapeles."))
+
+
+class LabeledCombo(ctk.CTkFrame):
+    """
+    Dropdown that displays translated labels while its variable holds a
+    stable internal identifier.
+
+    A plain `CTkComboBox` bound straight to a StringVar stores whatever text
+    is on screen, which means the stored value changes when the interface
+    language changes -- and any code comparing against it breaks. This keeps
+    the two apart: `variable` is the identifier, the visible text is only a
+    presentation detail.
+    """
+
+    def __init__(self, master, values: Sequence[str], variable,
+                 labels: Optional[dict] = None,
+                 command: Optional[Callable[[str], None]] = None,
+                 width: int = 0, height: int = 26, **kwargs):
+        super().__init__(master, fg_color="transparent", width=1, height=1,
+                         **kwargs)
+        self.values = list(values)
+        self.labels = dict(labels or {})
+        self.variable = variable
+        self.command = command
+        self._syncing = False
+
+        self._display = ctk.StringVar(value=self._label_for(variable.get()))
+        self._combo = ctk.CTkComboBox(
+            self, values=[self._label_for(v) for v in self.values],
+            variable=self._display, height=height, font=font("body"),
+            dropdown_font=font("body"), command=self._on_pick)
+        if width:
+            self._combo.configure(width=width)
+        self._combo.pack(fill="x")
+
+        variable.trace_add("write", lambda *_: self._sync_from_variable())
+
+    def _label_for(self, value: str) -> str:
+        return self.labels.get(value, value)
+
+    def _value_for(self, label: str) -> str:
+        for value in self.values:
+            if self._label_for(value) == label:
+                return value
+        return label
+
+    def _on_pick(self, label: str) -> None:
+        if self._syncing:
+            return
+        value = self._value_for(label)
+        self.variable.set(value)
+        if self.command is not None:
+            self.command(value)
+
+    def _sync_from_variable(self) -> None:
+        self._syncing = True
+        try:
+            self._display.set(self._label_for(self.variable.get()))
+        finally:
+            self._syncing = False
+
+    def configure_values(self, values: Sequence[str],
+                         labels: Optional[dict] = None) -> None:
+        self.values = list(values)
+        if labels is not None:
+            self.labels = dict(labels)
+        self._combo.configure(values=[self._label_for(v) for v in self.values])
+        self._sync_from_variable()
+
+    def configure(self, **kwargs):
+        if "state" in kwargs:
+            try:
+                self._combo.configure(state=kwargs.pop("state"))
+            except Exception:
+                kwargs.pop("state", None)
+        if not kwargs:
+            return None
+        try:
+            return super().configure(**kwargs)
+        except (ValueError, TypeError, tk.TclError):
+            return None
+
+    # `pack_forget`/`pack` are used by the X/Y mode switch on this widget.

@@ -16,10 +16,11 @@ from __future__ import annotations
 
 import os
 import re
-from typing import Iterable, Optional, Sequence
+from typing import Optional, Sequence
 
 import matplotlib as mpl
 import numpy as np
+from matplotlib import font_manager
 
 from .data_io import x_units_for_domain, y_units_for_kind
 
@@ -31,11 +32,24 @@ from .data_io import x_units_for_domain, y_units_for_kind
 #
 # "LaTeX (Computer Modern)" targets reports written with `\usepackage{lmodern}`
 # (Latin Modern, the standard drop-in replacement/extension of Computer
-# Modern): it tries "Latin Modern Roman" first (present on most systems that
-# have a TeX distribution installed, e.g. MiKTeX/TeX Live on Windows), then
-# "CMU Serif" (another common Computer Modern Unicode port), and finally
-# "cmr10" -- a Computer Modern font Matplotlib ships internally, so this
-# preset always renders correctly even with no TeX/system fonts installed.
+# Modern). Its mathtext fontset is "custom" rather than Matplotlib's built-in
+# "cm": "cm" always renders math -- including `\text{...}` inside it -- with
+# Matplotlib's own BUNDLED cmr10/cmmi10 files, which only cover the original
+# 1980s 8-bit Computer Modern glyph set. That set is missing ordinary
+# lowercase accented Latin letters (á é í ó ú ñ and their uppercase forms
+# except Á), so ANY Spanish word inside `\text{...}`, or in plain (non-math)
+# text if this preset's regular font also resolved to that same bundled
+# cmr10, silently drew as a missing-glyph box -- e.g. "Medición" came out as
+# "Medici[]n". A previous version of this preset put "cmr10" first in
+# `fonts` specifically to make plain text and `$...$` text pixel-identical;
+# that traded away Spanish rendering entirely to fix a font-matching nuance,
+# which is the wrong trade for reports written in Spanish. "custom" instead
+# points mathtext at `mathtext.rm`/`it`/`bf`, set in `set_publication_style`
+# below to whichever font in `fonts` Matplotlib actually resolves on this
+# machine -- typically "Latin Modern Roman" from a MiKTeX/TeX Live install,
+# which (unlike cmr10) has full accented-Latin coverage and still reads as
+# Computer Modern. Math and plain text end up using the exact same font file
+# again, but one that can actually render "Medición", "según", "año", etc.
 FONT_PRESETS: dict[str, dict] = {
     "sans-serif": {
         "generic": "sans-serif",
@@ -54,26 +68,37 @@ FONT_PRESETS: dict[str, dict] = {
     },
     "LaTeX (Computer Modern)": {
         "generic": "serif",
-        "fonts": ["Latin Modern Roman", "CMU Serif", "cmr10", "DejaVu Serif"],
-        "mathtext": "cm",
+        # "DejaVu Serif" last: it ships with Matplotlib itself, so it is
+        # always resolvable and this preset can never fail outright. It is
+        # not Computer-Modern-styled, but it does have full accent coverage.
+        "fonts": ["Latin Modern Roman", "CMU Serif", "DejaVu Serif"],
+        "mathtext": "custom",
     },
 }
+
+
+def _resolve_font(candidates: list[str]) -> str:
+    """
+    First font NAME in `candidates` Matplotlib can actually find installed
+    on this machine, falling back to the last entry (by convention always a
+    font bundled with Matplotlib, e.g. "DejaVu Serif" -- guaranteed present)
+    if none of the earlier, more specific choices are available.
+    """
+    for name in candidates[:-1]:
+        try:
+            font_manager.findfont(name, fallback_to_default=False)
+            return name
+        except Exception:
+            continue
+    return candidates[-1]
 
 # Backward-compatible alias: other modules only need the preset names to
 # populate the GUI dropdown (`FONT_FAMILIES.keys()`).
 FONT_FAMILIES = FONT_PRESETS
 
-# Legend position labels shown in the GUI. "outside center right" is not a
-# native Matplotlib loc; it is resolved via bbox_to_anchor in legend_kwargs().
-LEGEND_POSITIONS: list[str] = [
-    "upper right", "upper left", "lower right", "lower left",
-    "center right", "outside center right",
-]
 
-_OUTSIDE_PREFIX = "outside "
-
-
-def set_publication_style(font_family: str = "sans-serif", base_fontsize: int = 10) -> None:
+def set_publication_style(font_family: str = "sans-serif", base_fontsize: int = 10,
+                          legend_fontsize: Optional[float] = None) -> None:
     """
     Apply a clean publication-oriented Matplotlib style.
 
@@ -81,21 +106,42 @@ def set_publication_style(font_family: str = "sans-serif", base_fontsize: int = 
     expressions internally, avoiding a LaTeX subprocess on every draw and on
     every PDF save. Both the interactive preview and the exported figure go
     through the exact same rcParams, so what is shown is what is exported.
+
+    `legend_fontsize` is independent from `base_fontsize` so the legend can
+    be enlarged (e.g. for a projector, or a dense legend with many entries)
+    without also blowing up the axis labels and ticks; `None` keeps the
+    previous behaviour of one point smaller than the base size.
     """
     family = font_family if font_family in FONT_PRESETS else "sans-serif"
     preset = FONT_PRESETS[family]
     generic = preset["generic"]           # always a valid font.family bucket
+    legend_size = base_fontsize - 1 if legend_fontsize is None else legend_fontsize
+
+    mathtext_rc = {"mathtext.fontset": preset["mathtext"]}
+    if preset["mathtext"] == "custom":
+        # Point mathtext at whichever font in `fonts` is actually installed
+        # (see the FONT_PRESETS comment above), instead of Matplotlib's
+        # built-in "cm" fontset -- so `$...$` math keeps using the exact
+        # same font file as the surrounding plain text, one that can render
+        # accented Spanish letters.
+        resolved = _resolve_font(preset["fonts"])
+        mathtext_rc.update({
+            "mathtext.rm": resolved,
+            "mathtext.it": f"{resolved}:italic",
+            "mathtext.bf": f"{resolved}:bold",
+        })
+
     mpl.rcParams.update({
         "font.family": generic,
         f"font.{generic}": preset["fonts"],
-        "mathtext.fontset": preset["mathtext"],
+        **mathtext_rc,
         "mathtext.default": "regular",
         "text.usetex": False,          # never invoke an external TeX engine
         "axes.labelsize": base_fontsize,
         "axes.titlesize": base_fontsize + 1,
         "xtick.labelsize": base_fontsize - 1,
         "ytick.labelsize": base_fontsize - 1,
-        "legend.fontsize": base_fontsize - 1,
+        "legend.fontsize": legend_size,
         "legend.framealpha": 0.9,
         "legend.edgecolor": "0.6",
         "lines.linewidth": 1.2,
@@ -110,23 +156,6 @@ def set_publication_style(font_family: str = "sans-serif", base_fontsize: int = 
         "pdf.fonttype": 42,            # embed TrueType, keep text selectable
         "ps.fonttype": 42,
     })
-
-
-def legend_kwargs(position: str) -> dict:
-    """
-    Translate a GUI legend position into Matplotlib legend keyword arguments.
-
-    Positions prefixed with "outside " are placed beyond the axes area using
-    bbox_to_anchor, which requires the caller to leave room (tight bbox on
-    save, or a constrained layout on screen).
-    """
-    if position.startswith(_OUTSIDE_PREFIX):
-        base = position[len(_OUTSIDE_PREFIX):]
-        if base == "center right":
-            return {"loc": "center left", "bbox_to_anchor": (1.02, 0.5),
-                    "borderaxespad": 0.0}
-        return {"loc": base, "bbox_to_anchor": (1.02, 1.0), "borderaxespad": 0.0}
-    return {"loc": position}
 
 
 def _sanitize_filename(name: str) -> str:

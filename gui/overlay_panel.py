@@ -25,6 +25,7 @@ from typing import Callable, Optional
 
 import customtkinter as ctk
 
+from core.i18n import t
 from core.units import parse_eng
 
 from .overlays import (
@@ -40,7 +41,12 @@ from .widgets import (
     stacked_entry, stacked_label,
 )
 
-PANES = ["Cursores", "Anotaciones"]
+# Internal pane ids; the visible text comes from `_pane_labels()`.
+PANES = ["cursors", "annotations"]
+
+
+def _pane_labels() -> dict:
+    return {"cursors": t("Cursores"), "annotations": t("Anotaciones")}
 
 # Fields each annotation kind actually uses. Keeping the layout fixed and
 # greying out the rest avoids the dialog reflowing on every kind change,
@@ -83,7 +89,7 @@ class OverlayPanel(ctk.CTkFrame):
                  annotations: AnnotationManager,
                  on_refresh: Callable[[], None],
                  unit_provider: Optional[Callable[[], tuple[str, str]]] = None,
-                 initial_pane: str = "Cursores", **kwargs):
+                 initial_pane: str = "cursors", **kwargs):
         super().__init__(master, fg_color="transparent", **kwargs)
         self.cursors = cursors
         self.annotations = annotations
@@ -96,23 +102,26 @@ class OverlayPanel(ctk.CTkFrame):
 
         header = ctk.CTkFrame(self, fg_color="transparent")
         header.pack(fill="x", padx=18, pady=(16, 0))
-        ctk.CTkLabel(header, text=spaced("Superposiciones"), font=font("header"),
+        ctk.CTkLabel(header, text=spaced(t("Cursores y anotaciones")), font=font("header"),
                      text_color=col("fg_muted")).pack(side="left")
         Rule(self, strong=True).pack(fill="x", padx=18, pady=(8, 12))
 
         self.pane_var = ctk.StringVar(value=initial_pane if initial_pane in PANES
                                       else PANES[0])
-        Segmented(self, PANES, self.pane_var, command=lambda _v: self._show_pane(),
+        Segmented(self, PANES, self.pane_var, labels=_pane_labels(),
+                  command=lambda _v: self._show_pane(),
                   width=132).pack(padx=18, anchor="w")
 
         self.panes: dict[str, ctk.CTkFrame] = {}
         holder = ctk.CTkFrame(self, fg_color="transparent")
         holder.pack(fill="both", expand=True, padx=18, pady=(14, 16))
         for name in PANES:
-            self.panes[name] = ctk.CTkFrame(holder, fg_color="transparent",
-                                            width=1, height=1)
-        self._build_cursor_pane(self.panes["Cursores"])
-        self._build_annotation_pane(self.panes["Anotaciones"])
+            # Scrollable: the annotation editor is taller than the palette,
+            # and the cursor pane grows with every cursor placed.
+            self.panes[name] = ctk.CTkScrollableFrame(
+                holder, fg_color="transparent", corner_radius=0)
+        self._build_cursor_pane(self.panes["cursors"])
+        self._build_annotation_pane(self.panes["annotations"])
         self._show_pane()
 
         self.refresh_all()
@@ -141,7 +150,7 @@ class OverlayPanel(ctk.CTkFrame):
         try:
             self.on_refresh()
         except Exception as exc:
-            messagebox.showerror("Error al redibujar", str(exc), parent=self)
+            messagebox.showerror(t("Error al redibujar"), str(exc), parent=self)
 
     def _units(self) -> tuple[str, str]:
         if self.unit_provider is None:
@@ -157,15 +166,16 @@ class OverlayPanel(ctk.CTkFrame):
     def _build_cursor_pane(self, parent) -> None:
         actions = ctk.CTkFrame(parent, fg_color="transparent")
         actions.pack(fill="x")
-        primary_button(actions, "+ Vertical", lambda: self._arm_cursor("v"),
+        primary_button(actions, t("+ Vertical"), lambda: self._arm_cursor("v"),
                        height=28, width=104).pack(side="left")
-        ghost_button(actions, "+ Horizontal", lambda: self._arm_cursor("h"),
+        ghost_button(actions, t("+ Horizontal"), lambda: self._arm_cursor("h"),
                      width=112).pack(side="left", padx=6)
-        ghost_button(actions, "Quitar", self._remove_cursor,
+        ghost_button(actions, t("Quitar"), self._remove_cursor,
                      width=76).pack(side="left")
 
-        self.cursor_hint = hint(parent, "Clic sobre el gráfico para colocarlo; "
-                                        "arrastralos para medir.", wraplength=390)
+        self.cursor_hint = hint(parent,
+                                t("Clic sobre el gráfico para colocarlo; "
+                                  "arrastralos para medir."), wraplength=390)
         self.cursor_hint.pack(fill="x", pady=(8, 12))
 
         self.cursor_list = ctk.CTkFrame(parent, fg_color="transparent",
@@ -174,26 +184,26 @@ class OverlayPanel(ctk.CTkFrame):
 
         Rule(parent).pack(fill="x", pady=12)
 
-        self.cursor_readout = MeasurementsCard(parent, title="Lectura")
+        self.cursor_readout = MeasurementsCard(parent, title=t("Lectura"))
         self.cursor_readout.bind_close(self._clear_cursors)
-        self.cursor_readout.pack(fill="both", expand=True)
+        self.cursor_readout.pack(fill="x")
 
-        section = StaticSection(parent, "Opciones de cursor")
+        section = StaticSection(parent, t("Opciones de cursor"))
         section.pack(fill="x", pady=(12, 0))
         box = section.body
 
         self.snap_var = ctk.BooleanVar(value=self.cursors.snap_to_data)
-        check_field(box, "Ajustar a muestras", self.snap_var,
+        check_field(box, t("Pegar a las muestras"), self.snap_var,
                     command=self._apply_cursor_options)
         self.tags_var = ctk.BooleanVar(value=self.cursors.show_tags)
-        check_field(box, "Etiquetas sobre el gráfico", self.tags_var,
+        check_field(box, t("Etiquetas en el gráfico"), self.tags_var,
                     command=self._apply_cursor_options)
         self.tag_value_var = ctk.BooleanVar(value=self.cursors.tag_with_value)
-        check_field(box, "Valor en la etiqueta", self.tag_value_var,
+        check_field(box, t("Mostrar el valor"), self.tag_value_var,
                     command=self._apply_cursor_options)
 
         self.cursor_pos_var = ctk.StringVar(value="")
-        entry_field(box, "Posición exacta", self.cursor_pos_var, width=110,
+        entry_field(box, t("Posición exacta (X o Y)"), self.cursor_pos_var, width=110,
                     on_enter=self._apply_cursor_position, rule=False,
                     label_width=124)
 
@@ -201,7 +211,7 @@ class OverlayPanel(ctk.CTkFrame):
         self.annotations.disarm()
         self.cursors.arm(orientation)
         self.cursor_hint.configure(
-            text="Cursor armado: hacé clic sobre el gráfico para colocarlo.")
+            text=t("Cursor armado: hacé clic sobre el gráfico para colocarlo."))
 
     def _apply_cursor_options(self) -> None:
         self.cursors.snap_to_data = bool(self.snap_var.get())
@@ -244,15 +254,26 @@ class OverlayPanel(ctk.CTkFrame):
     def refresh_cursor_ui(self) -> None:
         self._render_cursor_list()
         self._render_readout()
+        # Keep "Posición exacta" tracking the SELECTED cursor's actual
+        # position. This used to only ever get set in `_select_cursor`, so
+        # dragging the selected cursor directly on the canvas (which calls
+        # this via `App._on_cursor_change`) moved it and refreshed the list
+        # readout, but left the exact-position field showing the value from
+        # before the drag -- pressing Enter there afterwards silently
+        # snapped the cursor back to that stale position, undoing the drag.
+        if self._sel_cursor is not None:
+            spec = self.cursors.get(self._sel_cursor)
+            if spec is not None:
+                self.cursor_pos_var.set(f"{spec.position:.6g}")
         if not self.cursors.armed:
             self.cursor_hint.configure(
-                text="Clic sobre el gráfico para colocarlo; arrastralos para medir.")
+                text=t(t("Clic sobre el gráfico para colocarlo; arrastralos para medir.")))
 
     def _render_cursor_list(self) -> None:
         for widget in self.cursor_list.winfo_children():
             widget.destroy()
         if not self.cursors.cursors:
-            hint(self.cursor_list, "Sin cursores.").pack(fill="x")
+            hint(self.cursor_list, t("Sin cursores.")).pack(fill="x")
             return
         x_unit, y_unit = self._units()
         for spec in self.cursors.cursors:
@@ -294,7 +315,7 @@ class OverlayPanel(ctk.CTkFrame):
                 else:
                     crossings = item.get("crossings") or []
                     text = ", ".join(format_eng(c, x_unit) for c in crossings[:2])
-                    rows.append((f"   {label}", text or "sin cruce"))
+                    rows.append((f"   {label}", text or t("sin cruce")))
         deltas = self.cursors.deltas()
         if deltas:
             rows.append(("--", ""))
@@ -313,16 +334,17 @@ class OverlayPanel(ctk.CTkFrame):
     # Annotations
     # ================================================================== #
     def _build_annotation_pane(self, parent) -> None:
-        stacked_label(parent, "Tipo")
-        self.kind_var = ctk.StringVar(value=list(ANNOTATION_KINDS)[0])
-        ctk.CTkComboBox(parent, values=list(ANNOTATION_KINDS), variable=self.kind_var,
+        stacked_label(parent, t("Tipo"))
+        self.kind_var = ctk.StringVar(value=t(list(ANNOTATION_KINDS)[0]))
+        ctk.CTkComboBox(parent, values=[t(k) for k in ANNOTATION_KINDS],
+                        variable=self.kind_var,
                         height=28, font=font("body"), dropdown_font=font("body"),
                         command=lambda _=None: self._on_kind_change()
                         ).pack(fill="x", pady=(0, 12))
 
         self.text_var = ctk.StringVar(value="")
-        stacked_entry(parent, "Texto", self.text_var)
-        hint(parent, "Admite mathtext: $f_0 = 9{,}61\\,$kHz",
+        stacked_entry(parent, t("Texto"), self.text_var)
+        hint(parent, t("Admite mathtext: $f_0 = 9{,}61\\,$kHz"),
              wraplength=390).pack(fill="x", pady=(0, 12))
 
         # Coordinates: the two things you always set, kept in the open.
@@ -349,28 +371,29 @@ class OverlayPanel(ctk.CTkFrame):
 
         capture = ctk.CTkFrame(parent, fg_color="transparent")
         capture.pack(fill="x", pady=(10, 4))
-        ghost_button(capture, "Capturar X/Y", lambda: self._capture(False),
+        ghost_button(capture, t("Capturar X/Y"), lambda: self._capture(False),
                      width=136).pack(side="left")
-        ghost_button(capture, "Capturar X₂/Y₂", lambda: self._capture(True),
+        ghost_button(capture, t("Capturar X₂/Y₂"), lambda: self._capture(True),
                      width=136).pack(side="left", padx=6)
         self.annotation_hint = hint(parent, "", wraplength=390)
         self.annotation_hint.pack(fill="x", pady=(2, 10))
 
         # Everything else is style, and style has a sensible default.
-        appearance = StaticSection(parent, "Estilo")
+        appearance = StaticSection(parent, t("Estilo"))
         appearance.pack(fill="x", pady=(0, 8))
         box = appearance.body
 
-        stacked_label(box, "Preset")
-        self.preset_var = ctk.StringVar(value=list(STYLE_PRESETS)[0])
-        ctk.CTkComboBox(box, values=list(STYLE_PRESETS), variable=self.preset_var,
+        stacked_label(box, t("Preset"))
+        self.preset_var = ctk.StringVar(value=t(list(STYLE_PRESETS)[0]))
+        ctk.CTkComboBox(box, values=[t(k) for k in STYLE_PRESETS],
+                        variable=self.preset_var,
                         height=28, font=font("body"), dropdown_font=font("body")
                         ).pack(fill="x", pady=(0, 6))
-        ghost_button(box, "Aplicar preset", self._apply_preset).pack(fill="x", pady=(0, 12))
+        ghost_button(box, t("Aplicar preset"), self._apply_preset).pack(fill="x", pady=(0, 12))
 
         color_row = ctk.CTkFrame(box, fg_color="transparent")
         color_row.pack(fill="x", pady=(0, 10))
-        ctk.CTkLabel(color_row, text="Color", font=font("label"),
+        ctk.CTkLabel(color_row, text=t("Color"), font=font("label"),
                      text_color=col("fg_muted"), width=60, anchor="w").pack(side="left")
         color_button = ctk.CTkButton(color_row, text="", width=22, height=26,
                                       corner_radius=0, border_width=1,
@@ -393,58 +416,67 @@ class OverlayPanel(ctk.CTkFrame):
 
         self.vars["color"].trace_add("write", _sync_color)
 
-        self.widgets["linestyle"] = [combo_field(box, "Línea", self.linestyle_var,
+        self.widgets["linestyle"] = [combo_field(box, t("Línea"), self.linestyle_var,
                                                   LINESTYLES, width=90)]
-        self.widgets["arrow"] = [combo_field(box, "Flecha", self.arrow_var,
+        self.widgets["arrow"] = [combo_field(box, t("Flecha"), self.arrow_var,
                                               ARROW_STYLES, width=90)]
-        self.widgets["linewidth"] = [entry_field(box, "Grosor", self.vars["linewidth"],
+        self.widgets["linewidth"] = [entry_field(box, t("Grosor de línea"), self.vars["linewidth"],
                                                   width=64)]
-        self.widgets["fontsize"] = [entry_field(box, "Cuerpo", self.vars["fontsize"],
+        self.widgets["fontsize"] = [entry_field(box, t("Tamaño de texto"), self.vars["fontsize"],
                                                  width=64)]
-        self.widgets["boxed"] = [check_field(box, "Recuadro", self.boxed_var)]
+        self.widgets["boxed"] = [check_field(box, t("Recuadro"), self.boxed_var)]
 
-        placement = StaticSection(parent, "Posición de la etiqueta")
+        placement = StaticSection(parent, t("Posición de la etiqueta"))
         placement.pack(fill="x", pady=(0, 12))
         box = placement.body
-        self.widgets["dx"] = [entry_field(box, "Offset X", self.vars["dx"], suffix="pt")]
-        self.widgets["dy"] = [entry_field(box, "Offset Y", self.vars["dy"], suffix="pt")]
-        self.widgets["rotation"] = [entry_field(box, "Rotación", self.vars["rotation"],
+        self.widgets["dx"] = [entry_field(box, t("Offset X"), self.vars["dx"], suffix="pt")]
+        self.widgets["dy"] = [entry_field(box, t("Offset Y"), self.vars["dy"], suffix="pt")]
+        self.widgets["rotation"] = [entry_field(box, t("Rotación"), self.vars["rotation"],
                                                  suffix="°")]
-        self.widgets["label_pos"] = [entry_field(box, "Sobre la línea",
+        self.widgets["label_pos"] = [entry_field(box, t("Posición en la línea"),
                                                   self.vars["label_pos"])]
-        self.widgets["alpha"] = [entry_field(box, "Opacidad", self.vars["alpha"],
+        self.widgets["alpha"] = [entry_field(box, t("Opacidad"), self.vars["alpha"],
                                               rule=False)]
         self.widgets["text"] = []
 
         actions = ctk.CTkFrame(parent, fg_color="transparent")
         actions.pack(fill="x")
-        primary_button(actions, "Agregar", self._add_annotation,
+        primary_button(actions, t("Agregar"), self._add_annotation,
                        height=28, width=96).pack(side="left")
-        ghost_button(actions, "Actualizar", self._update_annotation,
+        ghost_button(actions, t("Actualizar"), self._update_annotation,
                      width=100).pack(side="left", padx=6)
-        ghost_button(actions, "Quitar", self._remove_annotation,
+        ghost_button(actions, t("Quitar"), self._remove_annotation,
                      width=84).pack(side="left")
 
         Rule(parent).pack(fill="x", pady=12)
-        SectionHeader(parent, "Anotaciones", action="Limpiar todo",
+        SectionHeader(parent, t("Anotaciones"), action=t("Limpiar todo"),
                       command=self._clear_annotations).pack(fill="x", pady=(0, 6))
-        self.annotation_list = ctk.CTkScrollableFrame(parent, height=130,
-                                                       fg_color="transparent",
-                                                       corner_radius=0)
-        self.annotation_list.pack(fill="both", expand=True)
+        # A plain frame, not a scroll region: the pane around it already
+        # scrolls, and nesting two of them drives the configure/resize
+        # feedback loop that had to be removed from the main window.
+        self.annotation_list = ctk.CTkFrame(parent, fg_color="transparent",
+                                            width=1, height=1)
+        self.annotation_list.pack(fill="x")
 
         io_bar = ctk.CTkFrame(parent, fg_color="transparent")
         io_bar.pack(fill="x", pady=(10, 0))
-        ghost_button(io_bar, "Guardar...", self._save_overlays,
+        ghost_button(io_bar, t("Guardar..."), self._save_overlays,
                      width=132).pack(side="left")
-        ghost_button(io_bar, "Cargar...", self._load_overlays,
+        ghost_button(io_bar, t("Cargar..."), self._load_overlays,
                      width=132).pack(side="left", padx=6)
 
         self._on_kind_change()
 
     # ------------------------------ form --------------------------------- #
     def _kind(self) -> str:
-        return ANNOTATION_KINDS.get(self.kind_var.get(), "point")
+        """Map the (possibly translated) visible label back to its kind id."""
+        label = self.kind_var.get()
+        if label in ANNOTATION_KINDS:
+            return ANNOTATION_KINDS[label]
+        for spanish, kind in ANNOTATION_KINDS.items():
+            if t(spanish) == label:
+                return kind
+        return "point"
 
     def _set_field_states(self, kind: str) -> None:
         active = _KIND_FIELDS.get(kind, set())
@@ -467,8 +499,16 @@ class OverlayPanel(ctk.CTkFrame):
             elif key in self.vars:
                 self.vars[key].set(f"{value:g}")
 
+    def _preset_key(self) -> str:
+        """Visible (possibly translated) preset label back to its key."""
+        label = self.preset_var.get()
+        if label in STYLE_PRESETS:
+            return label
+        return next((k for k in STYLE_PRESETS if t(k) == label),
+                    list(STYLE_PRESETS)[0])
+
     def _apply_preset(self) -> None:
-        for key, value in STYLE_PRESETS.get(self.preset_var.get(), {}).items():
+        for key, value in STYLE_PRESETS.get(self._preset_key(), {}).items():
             if key == "boxed":
                 self.boxed_var.set(bool(value))
             elif key == "arrow":
@@ -504,7 +544,7 @@ class OverlayPanel(ctk.CTkFrame):
 
         self.annotations.arm_pick(_done)
         self.annotation_hint.configure(
-            text="Hacé clic sobre el punto deseado del gráfico.")
+            text=t("Hacé clic sobre el punto deseado del gráfico."))
 
     def _form_values(self) -> dict:
         return {
@@ -531,7 +571,7 @@ class OverlayPanel(ctk.CTkFrame):
     def _load_form(self, spec: AnnotationSpec) -> None:
         label = next((k for k, v in ANNOTATION_KINDS.items() if v == spec.kind),
                      list(ANNOTATION_KINDS)[0])
-        self.kind_var.set(label)
+        self.kind_var.set(t(label))
         self._set_field_states(spec.kind)
         for key in ("x", "y", "x2", "y2", "dx", "dy", "fontsize", "linewidth",
                     "rotation", "label_pos", "alpha"):
@@ -551,8 +591,8 @@ class OverlayPanel(ctk.CTkFrame):
 
     def _update_annotation(self) -> None:
         if self._sel_annotation is None:
-            messagebox.showinfo("Sin selección",
-                                "Seleccioná una anotación de la lista.", parent=self)
+            messagebox.showinfo(t("Sin selección"),
+                                t("Seleccioná una anotación de la lista."), parent=self)
             return
         self.annotations.update(self._sel_annotation, **self._form_values())
         self._refresh_canvas()
@@ -569,7 +609,7 @@ class OverlayPanel(ctk.CTkFrame):
     def _clear_annotations(self) -> None:
         if not self.annotations.items:
             return
-        if not messagebox.askyesno("Limpiar anotaciones",
+        if not messagebox.askyesno(t("Limpiar anotaciones"),
                                    f"¿Eliminar las {len(self.annotations.items)} "
                                    "anotaciones del gráfico?", parent=self):
             return
@@ -590,12 +630,12 @@ class OverlayPanel(ctk.CTkFrame):
         for widget in self.annotation_list.winfo_children():
             widget.destroy()
         if not self.annotations.items:
-            hint(self.annotation_list, "Sin anotaciones.").pack(fill="x")
+            hint(self.annotation_list, t("Sin anotaciones.")).pack(fill="x")
             return
         for index, spec in enumerate(self.annotations.items, start=1):
-            label = next((k for k, v in ANNOTATION_KINDS.items() if v == spec.kind),
-                         spec.kind)
-            caption = _clean(spec.text) or "(sin texto)"
+            label = t(next((k for k, v in ANNOTATION_KINDS.items()
+                            if v == spec.kind), spec.kind))
+            caption = _clean(spec.text) or t("(sin texto)")
             selected = spec.aid == self._sel_annotation
             row = ctk.CTkFrame(self.annotation_list, corner_radius=0,
                                height=ROW_HEIGHT,
@@ -617,30 +657,30 @@ class OverlayPanel(ctk.CTkFrame):
     # ----------------------------- overlay I/O --------------------------- #
     def _save_overlays(self) -> None:
         path = filedialog.asksaveasfilename(
-            title="Guardar cursores y anotaciones", defaultextension=".json",
+            title=t("Guardar cursores y anotaciones"), defaultextension=".json",
             filetypes=[("JSON", "*.json")], parent=self)
         if not path:
             return
         try:
             save_overlays(path, self.cursors, self.annotations)
         except OSError as exc:
-            messagebox.showerror("Error al guardar", str(exc), parent=self)
+            messagebox.showerror(t("Error al guardar"), str(exc), parent=self)
             return
-        messagebox.showinfo("Guardado", f"Overlays guardados en:\n{path}", parent=self)
+        messagebox.showinfo(t("Guardado"), f"{t('Overlays guardados en')}:\n{path}", parent=self)
 
     def _load_overlays(self) -> None:
         path = filedialog.askopenfilename(
-            title="Cargar cursores y anotaciones",
+            title=t("Cargar cursores y anotaciones"),
             filetypes=[("JSON", "*.json")], parent=self)
         if not path:
             return
         try:
             load_overlays(path, self.cursors, self.annotations)
         except (OSError, ValueError) as exc:
-            messagebox.showerror("Error al cargar", str(exc), parent=self)
+            messagebox.showerror(t("Error al cargar"), str(exc), parent=self)
             return
         except Exception as exc:
-            messagebox.showerror("Archivo inválido", str(exc), parent=self)
+            messagebox.showerror(t("Archivo inválido"), str(exc), parent=self)
             return
         self._sel_cursor = None
         self._sel_annotation = None
@@ -665,9 +705,9 @@ class OverlayWindow(ctk.CTkToplevel):
                  on_refresh: Callable[[], None],
                  unit_provider: Optional[Callable[[], tuple[str, str]]] = None,
                  on_close: Optional[Callable[[], None]] = None,
-                 initial_pane: str = "Cursores"):
+                 initial_pane: str = "cursors"):
         super().__init__(master)
-        self.title("Cursores y anotaciones")
+        self.title(f'{t("Cursores")} / {t("Anotaciones")}')
         self.geometry("440x760")
         self.minsize(420, 600)
         self._on_close = on_close

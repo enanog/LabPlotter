@@ -6,8 +6,10 @@ needed when the legend is anchored outside the axes area.
 
 This module deliberately lives outside `core/export.py`: exporting data and
 placing a legend are different responsibilities, and keeping the geometry here
-means the export path stays untouched. `core.export.legend_kwargs()` is kept
-as-is for backward compatibility; the GUI imports the richer version from here.
+means the export path stays untouched. An older, narrower `legend_kwargs()`
+used to live in `core/export.py` too (no "outside left/bottom/top" support,
+no `frameon`); it was unused dead code -- the GUI has only ever imported the
+richer version from here -- and was removed rather than kept in sync by hand.
 
 All positions are resolved to plain Matplotlib `Axes.legend()` keyword
 arguments, so nothing here depends on the GUI toolkit and the same placement

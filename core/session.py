@@ -128,3 +128,48 @@ def delete_profile(name: str) -> dict[str, dict[str, Any]]:
     profiles.pop(name, None)
     save_profiles(profiles)
     return profiles
+
+
+# ========================================================================== #
+# Figure sidecars ("import this exported figure back with its settings")
+# ========================================================================== #
+# Unlike the session above (one fixed file under `config_dir()`), one of
+# these is written next to EVERY exported figure -- so re-opening an old
+# export later means picking that file, not hunting through a single
+# ever-growing "last session" blob. It carries exactly the shape
+# `App._gather_plot_state()` / `App._apply_plot_state()` already use for one
+# plot tab (settings + signals + manual margins): the same replay mechanism
+# that already restores a signal from its original data file on disk, by
+# `source_path`, is reused here rather than re-solving the same problem.
+FIGURE_STATE_SUFFIX = ".labplotter.json"
+FIGURE_STATE_VERSION = 1
+
+
+def figure_state_path(fig_path: str) -> Path:
+    """
+    Sidecar path for one exported figure's settings, sitting right beside
+    the figure itself (not under `config_dir()`) so it travels with the
+    figure if the folder is moved or zipped up, and is easy to spot in the
+    export folder by name alone.
+    """
+    base, _ext = os.path.splitext(fig_path)
+    return Path(base + FIGURE_STATE_SUFFIX)
+
+
+def save_figure_state(fig_path: str, state: dict) -> bool:
+    """Write the sidecar for `fig_path`. Best-effort: a failure here must
+    never undo an export that already succeeded."""
+    payload = {"version": FIGURE_STATE_VERSION, **state}
+    return _write_json(figure_state_path(fig_path), payload)
+
+
+def load_figure_state(path: str) -> Optional[dict]:
+    """
+    Read a figure sidecar from the path the user picked directly (via a
+    file dialog) -- as opposed to `figure_state_path`, which derives the
+    sidecar path FROM a figure path for writing.
+    """
+    data = _read_json(Path(path))
+    if data is None or data.get("version") != FIGURE_STATE_VERSION:
+        return None
+    return data

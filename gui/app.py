@@ -21,6 +21,7 @@ import customtkinter as ctk
 import numpy as np
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.figure import Figure
+from matplotlib.lines import Line2D
 from matplotlib.ticker import AutoMinorLocator, FuncFormatter, LogLocator, NullFormatter
 
 # Optional: enables dropping .csv/.txt files onto the window. Not part of
@@ -45,7 +46,9 @@ from core.layout import (
     CUSTOM_ANCHOR_CORNERS, CUSTOM_POSITION, LEGEND_POSITIONS,
     legend_kwargs, reserve_legend_space,
 )
-from core import latex, session
+from core import board, latex, session, tabs
+from core.history import History, apply_snapshot
+from core.i18n import LANGUAGES, get_language, set_language, t
 from core.processing import crop, decimate, decimate_to_target
 from core.units import parse_eng
 from gui.overlays import AnnotationManager, CursorManager, format_eng
@@ -56,11 +59,13 @@ from gui.theme import (
 )
 from gui.widgets import (
     Chip, LINE_GLYPHS, MeasurementsCard, Rule, SectionHeader,
-    CodeDialog, Segmented, Splitter, StaticSection, TextPrompt, ShortcutsWindow,
+    CodeDialog, LabeledCombo, Segmented, SectionGroup, Splitter, StaticSection,
+    SliderField, TextPrompt, ShortcutsWindow,
     ToolButton, TraceRow, VRule, check_field, combo_field, entry_field,
     ghost_button, hint, primary_button, repaint_plain_widgets, segmented_field,
     stacked_entry, stacked_label,
 )
+from gui.board_window import BoardWindow
 
 # Window width at which the type scale is exactly as designed (1.0). Matches
 # the default geometry, so the app opens at native size. Clamping lives in
@@ -71,19 +76,48 @@ _REFERENCE_WIDTH = 1480
 _LEFT_MIN, _LEFT_MAX = 220, 480
 _RIGHT_MIN, _RIGHT_MAX = 260, 520
 
-PLOT_MODES = ["Tiempo / Frecuencia", "Modo X/Y", "Diagrama de Bode"]
-# Short labels for the mode strip; the internal identifiers above are what the
-# drawing code and `_read_settings` keep using, so nothing downstream changes.
-MODE_LABELS = {
-    "Tiempo / Frecuencia": "Tiempo",
-    "Modo X/Y": "X / Y",
-    "Diagrama de Bode": "Bode",
-}
-BODE_LAYOUTS = ["Juntos (superpuestos, Y1/Y2)", "Separados (independientes)"]
-BODE_LABELS = {BODE_LAYOUTS[0]: "Juntos", BODE_LAYOUTS[1]: "Separados"}
-LINESTYLES = ["-", "--", "-.", ":"]
-DEC_MODES = {"Ninguno": "none", "Factor N": "factor", "Máx. puntos": "target"}
-SCALE_LABELS = {"linear": "lineal", "log": "log"}
+PLOT_MODES = ["Tiempo / Frecuencia", "Modo X/Y", "Diagrama de Bode", "Pizarra en blanco"]
+# Internal identifiers, never shown. Display text lives in `*_LABELS` and goes
+# through `t()`; an earlier version compared translated strings directly
+# (`startswith("Separados")`), which would silently break the moment the
+# interface language changed.
+BODE_LAYOUTS = ["shared", "separate"]
+LINESTYLES = ["-", "--", "-.", ":", "None"]
+# Matplotlib recognises the literal string "None" as its own no-line alias
+# (equivalent to `linestyle="none"`), so a trace with this style and any
+# marker set draws only its data points -- no segment connecting one sample
+# to the next, i.e. no visual interpolation between them.
+# Matplotlib marker codes offered per trace. "None" (the string) means no
+# marker at all -- Matplotlib's own sentinel for "not set" is the object
+# `None`, but a StringVar cannot hold that, so this string is translated to
+# the real `None` in `_marker_kwargs` below.
+MARKERS = ["None", "o", "x", "+", "s", "^", "v", "D", "*"]
+DEC_MODES = ["none", "factor", "target"]
+CSV_MODES = ["individual", "combined"]
+SCALES = ["linear", "log"]
+THEMES = ["light", "dark"]
+AXIS_SIDES = ["primary", "secondary"]
+
+
+def _labels() -> dict:
+    """Display labels for every internal identifier, in the active language."""
+    return {
+        "modes": {"Tiempo / Frecuencia": t("Tiempo"), "Modo X/Y": t("X / Y"),
+                  "Diagrama de Bode": t("Bode"), "Pizarra en blanco": t("Pizarra")},
+        "bode": {"shared": t("Juntos"), "separate": t("Separados")},
+        "dec": {"none": t("Ninguno"), "factor": t("Factor N"),
+                "target": t("Máx. puntos")},
+        "csv": {"individual": t("Individual (1 archivo por señal)"),
+                "combined": t("Combinado (grilla común)")},
+        "scale": {"linear": t("lineal"), "log": t("log")},
+        "theme": {"light": t("Claro"), "dark": t("Oscuro")},
+        "side": {"primary": t("Izq"), "secondary": t("Der")},
+        "marker": {"None": t("Ninguno"), "o": "○ " + t("Círculo"),
+                   "x": "✕ " + t("Cruz (x)"), "+": "+ " + t("Cruz (+)"),
+                   "s": "□ " + t("Cuadrado"), "^": "△ " + t("Triángulo"),
+                   "v": "▽ " + t("Triángulo invertido"), "D": "◇ " + t("Rombo"),
+                   "*": "✶ " + t("Estrella")},
+    }
 
 
 def _parse_float(text: str, fallback: float = 0.0) -> float:
@@ -192,24 +226,25 @@ class SubplotConfigDialog(ctk.CTkToplevel):
                 "top": 0.88, "wspace": 0.2, "hspace": 0.2}
     # Ready-made margin sets for the two situations that actually come up.
     PRESETS = {
-        "Compacto": {"left": 0.09, "right": 0.97, "bottom": 0.10,
+        "compact": {"left": 0.09, "right": 0.97, "bottom": 0.10,
                      "top": 0.95, "wspace": 0.18, "hspace": 0.28},
-        "Leyenda externa": {"left": 0.10, "right": 0.78, "bottom": 0.12,
+        "external_legend": {"left": 0.10, "right": 0.78, "bottom": 0.12,
                             "top": 0.92, "wspace": 0.20, "hspace": 0.30},
     }
 
-    def __init__(self, master, fig):
+    def __init__(self, master, fig, on_apply=None):
         super().__init__(master)
         self.fig = fig
-        self.title("Márgenes del gráfico")
-        self.geometry("380x430")
-        self.minsize(340, 400)
+        self.on_apply = on_apply
+        self.title(t("Márgenes del gráfico"))
+        self.geometry("400x620")
+        self.minsize(360, 520)
         self.resizable(True, True)
         self.transient(master)
 
         head = ctk.CTkFrame(self, fg_color="transparent")
         head.pack(fill="x", padx=20, pady=(18, 6))
-        ctk.CTkLabel(head, text=spaced("Márgenes"), font=font("header"),
+        ctk.CTkLabel(head, text=spaced(t("Márgenes")), font=font("header"),
                      text_color=col("fg_muted")).pack(side="left")
         Rule(self).pack(fill="x", padx=20)
 
@@ -218,82 +253,103 @@ class SubplotConfigDialog(ctk.CTkToplevel):
 
         pars = fig.subplotpars
         self.vars: dict[str, ctk.StringVar] = {}
+        self.sliders: dict[str, SliderField] = {}
         for name, label in self.FIELDS:
             var = ctk.StringVar(value=f"{getattr(pars, name):.3f}")
             self.vars[name] = var
-            entry_field(body, label, var, width=76, on_enter=self._apply,
-                        label_width=132, rule=(name != "hspace"))
+            field = SliderField(body, label, var, minimum=0.0, maximum=1.0,
+                                on_change=self._apply_live)
+            field.pack(fill="x", pady=(0, 8))
+            self.sliders[name] = field
 
-        hint(body, "Fracciones de 0 a 1. Enter aplica el valor.",
-             wraplength=300).pack(fill="x", pady=(10, 0))
+        hint(body, t("Arrastrá el slider o escribí el valor y Enter."),
+             wraplength=300).pack(fill="x", pady=(6, 0))
 
         presets = ctk.CTkFrame(body, fg_color="transparent")
         presets.pack(fill="x", pady=(12, 0))
+        preset_labels = {"compact": t("Compacto"),
+                         "external_legend": t("Leyenda externa")}
         for name in self.PRESETS:
-            ghost_button(presets, name, lambda n=name: self._preset(n),
+            ghost_button(presets, preset_labels.get(name, name),
+                         lambda n=name: self._preset(n),
                          width=132).pack(side="left", padx=(0, 8))
 
         actions = ctk.CTkFrame(self, fg_color="transparent")
         actions.pack(fill="x", padx=20, pady=16)
-        primary_button(actions, "Aplicar", self._apply, height=28,
+        primary_button(actions, t("Aplicar"), self._apply, height=28,
                        width=104).pack(side="right")
-        ghost_button(actions, "Restablecer", self._reset,
+        ghost_button(actions, t("Restablecer"), self._reset,
                      width=112).pack(side="right", padx=(0, 8))
-        ghost_button(actions, "Cerrar", self.destroy,
+        ghost_button(actions, t("Cerrar"), self.destroy,
                      width=88).pack(side="left")
 
         self.protocol("WM_DELETE_WINDOW", self.destroy)
 
-    def _values(self) -> Optional[dict]:
+    def _values(self, silent: bool = False) -> Optional[dict]:
         values = {}
         for name, _label in self.FIELDS:
             value = parse_eng(self.vars[name].get(), None)
             if value is None:
-                messagebox.showerror("Valor inválido",
-                                     "Todos los márgenes deben ser números "
-                                     "entre 0 y 1.", parent=self)
+                if not silent:
+                    messagebox.showerror(
+                        t("Valor inválido"),
+                        t("Todos los márgenes deben ser números entre 0 y 1."),
+                        parent=self)
                 return None
             values[name] = min(1.0, max(0.0, value))
         # Matplotlib rejects a left margin at or past the right one (and the
         # same vertically); catching it here gives a readable message instead
         # of a traceback from deep inside the layout engine.
         if values["left"] >= values["right"] or values["bottom"] >= values["top"]:
-            messagebox.showerror(
-                "Márgenes inconsistentes",
-                "El margen izquierdo debe ser menor que el derecho, y el "
-                "inferior menor que el superior.", parent=self)
+            if not silent:
+                messagebox.showerror(
+                    t("Márgenes inconsistentes"),
+                    t("El margen izquierdo debe ser menor que el derecho, y "
+                      "el inferior menor que el superior."), parent=self)
             return None
         return values
 
-    def _apply(self) -> None:
-        values = self._values()
+    def _apply_live(self) -> None:
+        """Slider-driven apply: silent, so a drag through an invalid
+        intermediate state (left past right) does not raise a dialog."""
+        self._apply(silent=True)
+
+    def _apply(self, silent: bool = False) -> None:
+        values = self._values(silent=silent)
         if values is None:
             return
         for name, value in values.items():
-            self.vars[name].set(f"{value:.3f}")
+            field = self.sliders.get(name)
+            field.set_value(value) if field else self.vars[name].set(f"{value:.3f}")
         try:
             self.fig.subplots_adjust(**values)
         except (ValueError, AttributeError) as exc:
-            messagebox.showerror("Error", str(exc), parent=self)
+            messagebox.showerror(t("Error"), str(exc), parent=self)
             return
         self.fig.canvas.draw_idle()
+        if self.on_apply is not None:
+            # Hand the values back so replots stop discarding them.
+            self.on_apply(dict(values))
 
     def _preset(self, name: str) -> None:
         for key, value in self.PRESETS[name].items():
-            self.vars[key].set(f"{value:.3f}")
+            self.sliders[key].set_value(value)
         self._apply()
 
     def _reset(self) -> None:
         for key, value in self.DEFAULTS.items():
-            self.vars[key].set(f"{value:.3f}")
+            self.sliders[key].set_value(value)
         self._apply()
+        if self.on_apply is not None:
+            self.on_apply(None)   # back to automatic layout
 
 
 class EditableNavigationToolbar(NavigationToolbar2Tk):
     """Matplotlib toolbar whose 'Configure subplots' button opens `SubplotConfigDialog`."""
 
     def configure_subplots(self) -> None:  # noqa: D102 - overrides base class
-        SubplotConfigDialog(self.canvas.get_tk_widget(), self.canvas.figure)
+        SubplotConfigDialog(self.canvas.get_tk_widget(), self.canvas.figure,
+                            on_apply=getattr(self, "on_margins_applied", None))
 
 
 # ========================================================================== #
@@ -309,7 +365,7 @@ class ColumnSelectDialog(ctk.CTkToplevel):
 
     def __init__(self, master, columns: list[str], col_kind: dict[str, str], filename: str):
         super().__init__(master)
-        self.title(f"Seleccionar columnas — {filename}")
+        self.title(f'{t("Seleccionar columnas")} — {filename}')
         self.geometry("420x520")
         self.minsize(380, 420)
         self.resizable(True, True)
@@ -323,8 +379,8 @@ class ColumnSelectDialog(ctk.CTkToplevel):
         # pushed off-window by tall content or Windows DPI scaling.
         btns = ctk.CTkFrame(self, fg_color="transparent")
         btns.pack(side="bottom", pady=12)
-        ctk.CTkButton(btns, text="Aceptar", command=self._accept).pack(side="left", padx=6)
-        ctk.CTkButton(btns, text="Cancelar", command=self._cancel,
+        ctk.CTkButton(btns, text=t("Aceptar"), command=self._accept).pack(side="left", padx=6)
+        ctk.CTkButton(btns, text=t("Cancelar"), command=self._cancel,
                       fg_color="gray40").pack(side="left", padx=6)
 
         ctk.CTkLabel(self, text=filename, font=ctk.CTkFont(weight="bold")
@@ -344,7 +400,7 @@ class ColumnSelectDialog(ctk.CTkToplevel):
                                         corner_radius=0)
         scroll.pack(fill="both", expand=True, padx=12, pady=(0, 6))
 
-        ctk.CTkLabel(scroll, text="Columna de eje X:", anchor="w"
+        ctk.CTkLabel(scroll, text=t("Columna de eje X:"), anchor="w"
                      ).pack(fill="x", anchor="w")
         self.x_var = ctk.StringVar(value=default_x)
         x_frame = ctk.CTkFrame(scroll, fg_color="transparent")
@@ -354,7 +410,7 @@ class ColumnSelectDialog(ctk.CTkToplevel):
                 x_frame, text=f"{col}  ({kind_label.get(col_kind.get(col, ''), '—')})",
                 variable=self.x_var, value=col).pack(anchor="w", pady=1)
 
-        ctk.CTkLabel(scroll, text="Columnas de valor (una señal por columna marcada):",
+        ctk.CTkLabel(scroll, text=t("Columnas de valor (una señal por columna marcada):"),
                      anchor="w").pack(fill="x", anchor="w", pady=(6, 2))
 
         y_frame = ctk.CTkFrame(scroll, fg_color="transparent")
@@ -380,8 +436,8 @@ class ColumnSelectDialog(ctk.CTkToplevel):
         y_cols = [c for c, v in self.y_vars.items() if v.get() and c != x_col]
         if not y_cols:
             messagebox.showwarning(
-                "Selección inválida",
-                "Seleccioná al menos una columna de valor distinta de la del eje X.",
+                t("Selección inválida"),
+                t("Seleccioná al menos una columna de valor distinta de la del eje X."),
                 parent=self)
             return
         self.result = (x_col, y_cols)
@@ -422,10 +478,38 @@ class App(ctk.CTk):
         self.overlay_window = None        # floating cursor/annotation palette
         self._shortcuts_window = None
 
+        # Multi-figure board: a list of rows, each a list of `board.BoardPanel`
+        # (see core/board.py). Panels are added from the export section with
+        # the plot currently on screen; the board window itself only
+        # arranges/retitles/exports them, so this list is the single source
+        # of truth for both surfaces. Not part of `_persisted_vars` / the
+        # saved session -- it is scratch space for the current run, exactly
+        # like `_last_export_path`.
+        self.board_rows: list = [board.new_row()]
+        self._board_window: Optional[BoardWindow] = None
+        self._board_export_dir: Optional[str] = None
+
+        # Plot tabs: several independent plots (own signals + settings) held
+        # in memory at once, so building the next figure for the tablero
+        # never means losing the previous one. `active_tab` is the index
+        # into `plot_tabs` currently shown on screen; everything else in
+        # `self.signals`/`self.signal_order`/the settings StringVars IS that
+        # tab's live state -- switching tabs snapshots it out via
+        # `_gather_plot_state()` and restores the target tab via
+        # `_apply_plot_state()`. Not part of `_persisted_vars()`; the whole
+        # list (plus which tab is active) is saved/restored as its own
+        # top-level session key instead (see `_gather_state`/`_apply_state`).
+        self.plot_tabs: list[tabs.PlotTab] = [tabs.PlotTab(name=t("Gráfico 1"))]
+        self.active_tab: int = 0
+
         # (x_col, y_col) used to build each loaded Signal, keyed by uid.
         # Only used to replay `read_table` + `build_signal` when restoring a
         # saved session; signals added any other way simply aren't persisted.
         self._signal_columns: dict[str, tuple[str, str]] = {}
+        # Per-trace line weight. Held here rather than on the Signal model,
+        # which this module does not own -- setting an attribute on a class
+        # that may define __slots__ would fail at runtime.
+        self.line_widths: dict[str, float] = {}
         self._export_profiles: dict[str, dict] = {}
 
         # Panel widths and layout state, all mutable at runtime via the
@@ -446,15 +530,44 @@ class App(ctk.CTk):
         # individual field.
         self._plot_suspended = False
 
+        # Undo/redo over the trace set. Snapshot-based: see core/history.py.
+        self.history = History()
+        # Margins set by hand in the margins dialog. While this is set,
+        # `update_plot` skips tight_layout -- otherwise every replot silently
+        # threw the manual layout away, which is what made adjusting margins
+        # feel like it never stuck.
+        self._manual_margins: Optional[dict] = None
+
         self.decimal_comma_var = ctk.BooleanVar(value=False)
         # Default font matches a typical LaTeX report (lmodern / Computer
         # Modern), so exported figures blend in with the document out of
         # the box. Selectable in the GUI like any other font.
         self.font_family_var = ctk.StringVar(value="LaTeX (Computer Modern)")
+        # Base font size in points, applied to axis labels/ticks/legend by
+        # `set_publication_style` (the title itself is drawn one point
+        # larger -- see that function). 10pt matches the previous hardcoded
+        # default, so existing sessions look identical until changed.
+        self.font_size_var = ctk.StringVar(value="10")
 
-        set_publication_style(font_family=self.font_family_var.get())
+        set_publication_style(font_family=self.font_family_var.get(),
+                              base_fontsize=_parse_float(self.font_size_var.get(), 10.0))
 
         self._build_layout()
+
+        # Snapshot of every persisted setting's startup value, taken right
+        # after the widgets that own them exist and before any session/tab
+        # restore touches them. A tab created empty (`_add_tab`) has no
+        # "settings" of its own yet -- without this, switching to it would
+        # leave every field showing whatever the previously active tab last
+        # set, since `_apply_plot_state` only ever *sets* variables, it
+        # never clears one just because the new state doesn't mention it.
+        self._default_settings: dict = {}
+        for key, var in self._persisted_vars().items():
+            try:
+                self._default_settings[key] = var.get()
+            except Exception:
+                pass
+
         self._enable_drag_and_drop()   # needs self.canvas and both panels
         self.bind("<Configure>", self._on_root_configure)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -483,6 +596,9 @@ class App(ctk.CTk):
         self.bind_all("<Delete>", self._on_delete_key)
         self.bind_all("<BackSpace>", self._on_delete_key)
         self.bind_all("<Control-o>", lambda _e: self._load_files())
+        self.bind_all("<Control-z>", lambda _e: self._undo())
+        self.bind_all("<Control-y>", lambda _e: self._redo())
+        self.bind_all("<Control-Shift-Z>", lambda _e: self._redo())
         self.bind_all("<Control-e>", lambda _e: self._export_figure())
         self.bind_all("<Control-s>", lambda _e: self._export_csv())
         self.bind_all("<F1>", lambda _e: self._open_shortcuts())
@@ -562,7 +678,7 @@ class App(ctk.CTk):
         dependency is visible instead of silently doing nothing.
         """
         self._dnd_enabled = False
-        self._dnd_status = "no disponible"
+        self._dnd_status = t("no disponible")
 
         if TkinterDnD is None:
             self._dnd_status = ("requiere  pip install tkinterdnd2  "
@@ -598,7 +714,7 @@ class App(ctk.CTk):
 
         if registered:
             self._dnd_enabled = True
-            self._dnd_status = "activo"
+            self._dnd_status = t("activo")
         else:
             self._dnd_status = "ningún widget aceptó registrarse como destino"
 
@@ -639,11 +755,11 @@ class App(ctk.CTk):
                 rejected.append(os.path.basename(path))
 
         if not paths:
-            detail = (f"\n\nIgnorado: {', '.join(rejected[:5])}"
+            detail = (f"\n\n{t('Ignorado')}: {', '.join(rejected[:5])}"
                       if rejected else "")
             messagebox.showinfo(
-                "Sin archivos válidos",
-                f"Soltá archivos .csv o .txt para cargarlos.{detail}")
+                t("Sin archivos válidos"),
+                t("Soltá archivos .csv o .txt para cargarlos.") + detail)
             return
         self._ingest_files(paths)
 
@@ -653,31 +769,33 @@ class App(ctk.CTk):
             self._shortcuts_window.focus()
             return
         groups = [
-            ("General", [
-                ("Ctrl+O", "Abrir archivo(s)"),
-                ("Ctrl+E", "Exportar figura (y obtener el bloque LaTeX)"),
-                ("Ctrl+S", "Exportar CSV para PGFPlots"),
-                ("Supr / Backspace", "Quitar la traza seleccionada"),
-                ("Enter", "Aplicar el campo activo"),
-                ("F1", "Mostrar esta ventana"),
+            (t("General"), [
+                ("Ctrl+O", t("Abrir archivo(s)")),
+                ("Ctrl+Z", t("Deshacer")),
+                ("Ctrl+Y", t("Rehacer")),
+                ("Ctrl+E", t("Exportar figura (y obtener el bloque LaTeX)")),
+                ("Ctrl+S", t("Exportar CSV para PGFPlots")),
+                ("Supr / Backspace", t("Quitar la traza seleccionada")),
+                ("Enter", t("Aplicar el campo activo")),
+                ("F1", t("Mostrar esta ventana")),
             ]),
-            ("Gráfico", [
-                ("Cursor + clic", "Colocar un cursor de medición"),
-                ("Arrastre", "Mover un cursor, o zoom/paneo según la herramienta activa"),
-                ("Anotar + clic", "Capturar coordenadas para una anotación"),
+            (t("Gráfico"), [
+                (t("Cursor + clic"), t("Colocar un cursor de medición")),
+                (t("Arrastre"), "Mover un cursor, o zoom/paneo según la herramienta activa"),
+                (t("Anotar + clic"), t("Capturar coordenadas para una anotación")),
             ]),
-            ("Campos numéricos", [
+            (t("Campos numéricos"), [
                 ("2.2k", "2200"),
                 ("4u7", "4,7 µ  (notación R: el prefijo hace de coma)"),
                 ("470p / 10M", "prefijos T G M k m u n p f"),
-                ("10 kHz", "la unidad al final se ignora"),
+                ("10 kHz", t("la unidad al final se ignora")),
             ]),
-            ("Arrastrar y soltar", [
-                (self._dnd_status, "Soltá archivos .csv o .txt sobre la ventana"),
+            (t("Arrastrar y soltar"), [
+                (self._dnd_status, t("Soltá archivos .csv o .txt sobre la ventana")),
             ]),
-            ("Ventana", [
-                ("Arrastrar el borde", "Redimensionar los paneles laterales a mano"),
-                ("Modo compacto", "Ocultar los paneles y usar todo el ancho para el gráfico"),
+            (t("Ventana"), [
+                (t("Arrastrar el borde"), t("Redimensionar los paneles laterales a mano")),
+                (t("Modo compacto"), "Ocultar los paneles y usar todo el ancho para el gráfico"),
                 ("Redimensionar ventana", "La tipografía y los controles escalan proporcionalmente"),
             ]),
         ]
@@ -696,10 +814,13 @@ class App(ctk.CTk):
             "grid": self.grid_var, "minor_grid": self.minor_grid_var,
             "title": self.title_var, "xlabel": self.xlabel_var,
             "ylabel": self.ylabel_var, "ylabel2": self.ylabel2_var,
-            "font_family": self.font_family_var, "theme_mode": self.theme_mode_var,
+            "font_family": self.font_family_var, "font_size": self.font_size_var,
+            "legend_font_size": self.legend_font_size_var,
+            "theme_mode": self.theme_mode_var,
             "legend": self.legend_var, "legend_pos": self.legend_pos_var,
             "legend_x": self.legend_x_var, "legend_y": self.legend_y_var,
             "legend_corner": self.legend_corner_var, "legend_ncol": self.legend_ncol_var,
+            "legend_frameon": self.legend_frameon_var,
             "dec_mode": self.dec_mode_var, "dec_value": self.dec_value_var,
             "decimal_comma": self.decimal_comma_var,
             "plot_mode": self.plot_mode_var, "bode_layout": self.bode_layout_var,
@@ -710,36 +831,25 @@ class App(ctk.CTk):
         }
 
     def _gather_state(self) -> dict:
-        settings = {}
-        for key, var in self._persisted_vars().items():
-            try:
-                settings[key] = var.get()
-            except Exception:
-                pass   # a widget torn down mid-close: skip that one field
-
-        signals = []
-        for uid in self.signal_order:
-            cols = self._signal_columns.get(uid)
-            sig = self.signals.get(uid)
-            if cols is None or sig is None:
-                continue   # no known source columns: nothing to replay later
-            signals.append({
-                "source_path": sig.source_path, "x_col": cols[0], "y_col": cols[1],
-                "name": sig.name, "legend_label": sig.legend_label,
-                "domain": sig.domain, "y_kind": sig.y_kind,
-                "unit_t_in": sig.unit_t_in, "unit_v_in": sig.unit_v_in,
-                "t_offset": sig.t_offset, "v_offset": sig.v_offset,
-                "gain": sig.gain, "invert": sig.invert, "linestyle": sig.linestyle,
-                "color": sig.color, "secondary_y": sig.secondary_y,
-                "visible": sig.visible,
-            })
+        # Snapshot the tab currently on screen before reading it back out,
+        # so `plot_tabs` is never stale relative to what is actually loaded.
+        plot_state = self._gather_plot_state()
+        self.plot_tabs[self.active_tab].state = plot_state
 
         return {
             "geometry": self.geometry(),
             "left_width": self._left_width, "right_width": self._right_width,
             "compact": self._compact,
-            "settings": settings,
-            "signals": signals,
+            "sections": self.settings.state(),
+            "manual_margins": plot_state["manual_margins"],
+            "language": get_language(),
+            # Kept at the top level too (not just inside "tabs") so a session
+            # file from before plot tabs existed, and any code that still
+            # expects "the" settings/signals, both keep working.
+            "settings": plot_state["settings"],
+            "signals": plot_state["signals"],
+            "tabs": [{"name": tab.name, "state": tab.state} for tab in self.plot_tabs],
+            "active_tab": self.active_tab,
         }
 
     def _restore_signal(self, record: dict) -> bool:
@@ -757,11 +867,15 @@ class App(ctk.CTk):
             return False   # file moved/changed/corrupted: skip, don't crash
 
         for attr in ("unit_t_in", "unit_v_in", "t_offset", "v_offset", "gain",
-                    "invert", "linestyle", "secondary_y"):
+                    "invert", "linestyle", "marker", "marker_size",
+                    "marker_hollow", "secondary_y"):
             if attr in record:
                 setattr(sig, attr, record[attr])
         sig.legend_label = record.get("legend_label")
+        sig.display_name = record.get("display_name")
         sig.visible = record.get("visible", True)
+        self.line_widths[sig.uid] = float(
+            record.get("line_width", self.DEFAULT_LINE_WIDTH))
 
         self.signals[sig.uid] = sig
         self.signal_order.append(sig.uid)
@@ -769,14 +883,6 @@ class App(ctk.CTk):
         return True
 
     def _apply_state(self, data: dict) -> None:
-        settings = data.get("settings", {}) or {}
-        for key, var in self._persisted_vars().items():
-            if key in settings:
-                try:
-                    var.set(settings[key])
-                except Exception:
-                    pass
-
         geometry = data.get("geometry")
         if geometry:
             try:
@@ -792,26 +898,35 @@ class App(ctk.CTk):
         self.right_panel.configure(width=self._right_width)
         if data.get("compact"):
             self._set_compact(True)
+        sections = data.get("sections")
+        if isinstance(sections, dict):
+            self.settings.restore(sections)
 
-        restored = sum(self._restore_signal(r) for r in data.get("signals", []))
-        if restored:
-            self._sync_unit_options()
-            self._refresh_signal_list()
-            self._refresh_xy_combos()
+        # Tabs: prefer the new "tabs"/"active_tab" keys. A session saved
+        # before plot tabs existed only has the old top-level
+        # "settings"/"signals", which becomes a single tab -- nothing from
+        # an older session is lost, it just now lives in "Gráfico 1".
+        raw_tabs = data.get("tabs")
+        if raw_tabs:
+            self.plot_tabs = [
+                tabs.PlotTab(name=raw.get("name") or t("Gráfico {n}").format(n=i + 1),
+                            state=raw.get("state") or {})
+                for i, raw in enumerate(raw_tabs)]
+            self.active_tab = max(0, min(int(data.get("active_tab", 0)),
+                                        len(self.plot_tabs) - 1))
+        else:
+            self.plot_tabs = [tabs.PlotTab(
+                name=t("Gráfico 1"),
+                state={"settings": data.get("settings", {}),
+                       "signals": data.get("signals", []),
+                       "manual_margins": data.get("manual_margins")})]
+            self.active_tab = 0
 
-        # These three have effects beyond their own variable (rcParams,
-        # appearance mode, contextual-row visibility), so re-trigger them
-        # explicitly instead of relying on the trace-based widgets alone.
-        self._plot_suspended = True
-        try:
-            if "theme_mode" in settings:
-                self._on_theme_change(settings["theme_mode"])
-            if "font_family" in settings:
-                self._on_font_change()
-            self._on_mode_change()
-        finally:
-            self._plot_suspended = False
-        self.update_plot()   # single render for the whole restored state
+        self._refresh_tab_strip()
+        # Restoring a whole session (as opposed to switching tabs) is the one
+        # case with no "previous tab" to keep the app-wide theme from, so it
+        # is the one caller that restores `theme_mode` too.
+        self._apply_plot_state(self.plot_tabs[self.active_tab].state, restore_theme=True)
 
     def _restore_session_if_any(self) -> bool:
         data = session.load_session()
@@ -868,7 +983,7 @@ class App(ctk.CTk):
                                      width=1, height=1)
         self.chip_bar.pack(side="left", pady=9)
 
-        primary_button(content, "+  Abrir archivo", self._load_files,
+        primary_button(content, t("+  Abrir archivo"), self._load_files,
                        height=28, width=140).pack(side="left", padx=10, pady=9)
 
     def _refresh_chips(self) -> None:
@@ -889,7 +1004,10 @@ class App(ctk.CTk):
             Chip(self.chip_bar, tag, name, f"{points:,}".replace(",", "\u2009")
                  ).pack(side="left", padx=(0 if index == 0 else 6, 0))
         if len(items) > 4:
-            hint(self.chip_bar, f"+{len(items) - 4} más").pack(side="left", padx=8)
+            # "más" already has an _EN entry ("more") but this line built the
+            # chip text as a raw f-string bypassing t() entirely, so English
+            # mode always showed "+N más" instead of "+N more".
+            hint(self.chip_bar, f"+{len(items) - 4} {t('más')}").pack(side="left", padx=8)
 
     def _build_left_panel(self) -> None:
         left = ctk.CTkFrame(self, width=self._left_width, corner_radius=0,
@@ -902,9 +1020,9 @@ class App(ctk.CTk):
         # scroll region below, so they can never be pushed off-window.
         footer = ctk.CTkFrame(left, fg_color="transparent")
         footer.pack(side="bottom", fill="x", padx=16, pady=12)
-        ghost_button(footer, "Quitar", self._remove_selected_signal,
+        ghost_button(footer, t("Quitar"), self._remove_selected_signal,
                      width=90).pack(side="left")
-        ghost_button(footer, "Quitar todas", self._remove_all_signals,
+        ghost_button(footer, t("Quitar todas"), self._remove_all_signals,
                      width=118).pack(side="left", padx=6)
 
         # ONE scroll region for the whole column. This previously held two
@@ -921,7 +1039,7 @@ class App(ctk.CTk):
                                         corner_radius=0)
         scroll.pack(fill="both", expand=True, padx=(16, 8), pady=(14, 0))
 
-        SectionHeader(scroll, "Trazas").pack(fill="x")
+        SectionHeader(scroll, t("Trazas")).pack(fill="x")
         Rule(scroll).pack(fill="x", pady=(6, 4))
 
         # Plain containers now, not scroll regions of their own.
@@ -944,18 +1062,20 @@ class App(ctk.CTk):
     def _build_param_placeholder(self) -> None:
         for w in self.param_frame.winfo_children():
             w.destroy()
-        hint(self.param_frame, "Seleccioná una traza de la lista para ver "
-                               "sus ajustes.", wraplength=250).pack(fill="x", pady=20)
+        hint(self.param_frame, t("Seleccioná una traza de la lista para ver sus ajustes."), wraplength=250).pack(fill="x", pady=20)
 
     def _build_center_panel(self) -> None:
         center = ctk.CTkFrame(self, corner_radius=0, fg_color=col("app"))
         center.grid(row=1, column=2, sticky="nsew")
-        center.grid_rowconfigure(2, weight=1)
+        center.grid_rowconfigure(3, weight=1)
         center.grid_columnconfigure(0, weight=1)
+
+        # ------------------------- plot tabs ---------------------------- #
+        self._build_tab_strip(center)
 
         # ------------------------- tool strip ------------------------- #
         strip = ctk.CTkFrame(center, height=44, corner_radius=0, fg_color=col("bar"))
-        strip.grid(row=0, column=0, sticky="ew")
+        strip.grid(row=1, column=0, sticky="ew")
         strip.pack_propagate(False)   # children are packed; see _build_topbar
         Rule(strip).pack(side="bottom", fill="x")
 
@@ -963,23 +1083,24 @@ class App(ctk.CTk):
         tools.pack(fill="both", expand=True, padx=16)
 
         self.plot_mode_var = ctk.StringVar(value=PLOT_MODES[0])
-        Segmented(tools, PLOT_MODES, self.plot_mode_var, labels=MODE_LABELS,
+        Segmented(tools, PLOT_MODES, self.plot_mode_var,
+                  labels=_labels()["modes"],
                   command=lambda _v: self._on_mode_change(), width=76
                   ).pack(side="left", pady=9)
         VRule(tools, height=20).pack(side="left", padx=14, pady=12)
 
         self._active_tool: Optional[str] = None
         self.tool_buttons: dict[str, ToolButton] = {}
-        for key, label in (("cursor", "Cursor"), ("annotate", "Anotar"),
-                           ("zoom", "Zoom"), ("pan", "Mover")):
+        for key, label in (("cursor", t("Cursor")), ("annotate", t("Anotar")),
+                           ("zoom", t("Zoom")), ("pan", t("Mover"))):
             button = ToolButton(tools, label, width=72,
                                 command=lambda k=key: self._select_tool(k))
             button.pack(side="left", padx=(0, 5), pady=9)
             self.tool_buttons[key] = button
-        ghost_button(tools, "Ajustar a los datos", self._fit_to_data,
+        ghost_button(tools, t("Encuadrar"), self._fit_to_data,
                      width=142).pack(side="left", padx=(8, 0), pady=9)
 
-        self.compact_button = ToolButton(tools, "Compacto", width=88,
+        self.compact_button = ToolButton(tools, t("Compacto"), width=88,
                                          command=self._toggle_compact)
         self.compact_button.pack(side="left", padx=(6, 0), pady=9)
 
@@ -993,16 +1114,16 @@ class App(ctk.CTk):
         self.tool_hint.pack(side="right", padx=16, pady=9)
 
         # ---------------- mode-specific contextual row ---------------- #
-        # Both live directly in row 1 of `center` and only one is ever shown.
+        # Both live directly in row 2 of `center` and only one is ever shown.
         # They used to sit inside a wrapper frame, which stayed on screen even
         # when both children were hidden -- and an empty CTkFrame holds a
         # 200x200 request, so it reserved a blank band above the plot in the
         # default (Tiempo) mode, which shows neither of them.
-        center.grid_rowconfigure(1, weight=0)
+        center.grid_rowconfigure(2, weight=0)
 
         self.xy_frame = ctk.CTkFrame(center, corner_radius=0, fg_color=col("bar"),
                                      height=1)
-        self.xy_frame.grid(row=1, column=0, sticky="ew")
+        self.xy_frame.grid(row=2, column=0, sticky="ew")
         xy_inner = ctk.CTkFrame(self.xy_frame, fg_color="transparent", height=1)
         xy_inner.pack(fill="x", padx=16, pady=8)
         self._build_xy_controls(xy_inner)
@@ -1010,20 +1131,20 @@ class App(ctk.CTk):
 
         self.bode_frame = ctk.CTkFrame(center, corner_radius=0, fg_color=col("bar"),
                                        height=1)
-        self.bode_frame.grid(row=1, column=0, sticky="ew")
+        self.bode_frame.grid(row=2, column=0, sticky="ew")
         bode_inner = ctk.CTkFrame(self.bode_frame, fg_color="transparent", height=1)
         bode_inner.pack(fill="x", padx=16, pady=8)
-        ctk.CTkLabel(bode_inner, text="Disposición", font=font("label"),
+        ctk.CTkLabel(bode_inner, text=t("Disposición"), font=font("label"),
                      text_color=col("fg_muted")).pack(side="left", padx=(0, 10))
-        self.bode_layout_var = ctk.StringVar(value=BODE_LAYOUTS[0])
+        self.bode_layout_var = ctk.StringVar(value="shared")
         Segmented(bode_inner, BODE_LAYOUTS, self.bode_layout_var,
-                  labels=BODE_LABELS, width=94,
+                  labels=_labels()["bode"], width=94,
                   command=lambda _v: self.update_plot()).pack(side="left")
         self.bode_frame.grid_remove()
 
         # ---------------------------- canvas -------------------------- #
         plot_container = ctk.CTkFrame(center, corner_radius=0, fg_color=col("app"))
-        plot_container.grid(row=2, column=0, sticky="nsew", padx=20, pady=18)
+        plot_container.grid(row=3, column=0, sticky="nsew", padx=20, pady=18)
 
         self.fig = Figure(figsize=(7.6, 5.2), dpi=100)
         self.axes: list = [self.fig.add_subplot(111)]
@@ -1039,6 +1160,7 @@ class App(ctk.CTk):
         # keeps a single visual language instead of two.
         self._toolbar_host = tk.Frame(plot_container)
         self.mpl_toolbar = EditableNavigationToolbar(self.canvas, self._toolbar_host)
+        self.mpl_toolbar.on_margins_applied = self._on_margins_applied
         self.mpl_toolbar.update()
 
         self.measurements = MeasurementsCard(plot_container, width=230)
@@ -1052,6 +1174,212 @@ class App(ctk.CTk):
         self.annotations = AnnotationManager(self.canvas)
         self.cursors.attach(self.axes)
         self.annotations.attach(self.axes)
+
+    # ------------------------------------------------------------------ #
+    # Plot tabs -- several independent plots held in memory at once
+    # ------------------------------------------------------------------ #
+    def _build_tab_strip(self, parent) -> None:
+        strip = ctk.CTkFrame(parent, height=36, corner_radius=0, fg_color=col("panel"))
+        strip.grid(row=0, column=0, sticky="ew")
+        strip.pack_propagate(False)   # children are packed; see _build_topbar
+        Rule(strip).pack(side="bottom", fill="x")
+
+        self.tab_strip_row = ctk.CTkFrame(strip, fg_color="transparent")
+        self.tab_strip_row.pack(side="left", fill="both", expand=True, padx=(12, 0))
+
+        ghost_button(strip, "+", self._add_tab, width=30, height=26
+                     ).pack(side="left", padx=8, pady=5)
+
+        self._refresh_tab_strip()
+
+    def _refresh_tab_strip(self) -> None:
+        """Rebuild the tab chips from `self.plot_tabs`/`self.active_tab`."""
+        for child in self.tab_strip_row.winfo_children():
+            child.destroy()
+
+        for i, tab in enumerate(self.plot_tabs):
+            active = i == self.active_tab
+            chip = ctk.CTkFrame(self.tab_strip_row, corner_radius=0, border_width=1,
+                                fg_color=col("accent") if active else "transparent",
+                                border_color=col("accent") if active else col("border"))
+            chip.pack(side="left", padx=(0, 4), pady=5)
+
+            label = ctk.CTkLabel(
+                chip, text=tab.name, font=font("label"), cursor="hand2",
+                text_color=col("on_accent") if active else col("fg_muted"))
+            label.pack(side="left", padx=(10, 6), pady=4)
+            label.bind("<Button-1>", lambda _e, idx=i: self._switch_tab(idx))
+            label.bind("<Double-Button-1>", lambda _e, idx=i: self._rename_tab(idx))
+            chip.bind("<Button-1>", lambda _e, idx=i: self._switch_tab(idx))
+
+            if len(self.plot_tabs) > 1:
+                close = ctk.CTkLabel(
+                    chip, text="✕", font=font("label"), cursor="hand2",
+                    text_color=col("on_accent") if active else col("fg_faint"))
+                close.pack(side="left", padx=(0, 8))
+                close.bind("<Button-1>", lambda _e, idx=i: self._close_tab(idx))
+
+    def _gather_plot_state(self) -> dict:
+        """
+        Everything that belongs to ONE plot: its settings plus its loaded
+        signals -- exactly the shape a whole saved session used to carry at
+        its top level. Used both to build the session file (`_gather_state`)
+        and to snapshot a tab before switching away from it.
+        """
+        settings = {}
+        for key, var in self._persisted_vars().items():
+            try:
+                settings[key] = var.get()
+            except Exception:
+                pass   # a widget torn down mid-close: skip that one field
+
+        signals = []
+        for uid in self.signal_order:
+            cols = self._signal_columns.get(uid)
+            sig = self.signals.get(uid)
+            if cols is None or sig is None:
+                continue   # no known source columns: nothing to replay later
+            signals.append({
+                "source_path": sig.source_path, "x_col": cols[0], "y_col": cols[1],
+                "name": sig.name, "display_name": sig.display_name,
+                "legend_label": sig.legend_label,
+                "domain": sig.domain, "y_kind": sig.y_kind,
+                "unit_t_in": sig.unit_t_in, "unit_v_in": sig.unit_v_in,
+                "t_offset": sig.t_offset, "v_offset": sig.v_offset,
+                "gain": sig.gain, "invert": sig.invert, "linestyle": sig.linestyle,
+                "marker": sig.marker, "marker_size": sig.marker_size,
+                "marker_hollow": sig.marker_hollow,
+                "color": sig.color, "secondary_y": sig.secondary_y,
+                "visible": sig.visible,
+                "line_width": self._lw(uid),
+            })
+
+        return {"settings": settings, "signals": signals,
+                "manual_margins": self._manual_margins}
+
+    def _tab_persisted_vars(self) -> dict[str, "ctk.Variable"]:
+        """
+        Same as `_persisted_vars()`, minus settings that are app-wide rather
+        than tied to one particular plot -- currently just the light/dark
+        theme, which would be jarring to flip every time the user switches
+        tabs. (A tab's stored `settings` dict still happens to carry a
+        `theme_mode` value from whenever it was last gathered; it is simply
+        never read back out through this map.)
+        """
+        return {k: v for k, v in self._persisted_vars().items() if k != "theme_mode"}
+
+    def _apply_plot_state(self, data: dict, restore_theme: bool = False,
+                          history: Optional[History] = None) -> None:
+        """
+        Load ONE plot's settings + signals as the live state, replacing
+        whatever was previously on screen. Shared by whole-session restore
+        (`restore_theme=True`, since there is no "previous tab" to keep the
+        app-wide theme from) and by tab switching (`restore_theme=False`).
+
+        `history` lets a caller hand back a tab's OWN previously-saved undo
+        stack (see `PlotTab.history`) instead of always starting fresh: this
+        used to unconditionally do `self.history = History()` here, which
+        meant switching tabs (or closing the active one, which switches to
+        its neighbour) silently wiped that tab's undo/redo every time --
+        Ctrl+Z right after switching back to a tab you had just been editing
+        did nothing, because its history was gone. `None` (a genuinely new
+        or restored-from-session tab, which has no meaningful prior history)
+        still gets a fresh `History()`.
+        """
+        settings = data.get("settings", {}) or {}
+        varmap = self._persisted_vars() if restore_theme else self._tab_persisted_vars()
+        for key, var in varmap.items():
+            if key in settings:
+                value = settings[key]
+            elif key in self._default_settings:
+                # Not part of this state (e.g. a freshly-created empty tab,
+                # or an older session predating some field): fall back to
+                # the startup default instead of leaving whatever the
+                # previously active tab last set.
+                value = self._default_settings[key]
+            else:
+                continue
+            try:
+                var.set(value)
+            except Exception:
+                pass
+
+        margins = data.get("manual_margins")
+        self._manual_margins = margins if isinstance(margins, dict) else None
+
+        self.signals = {}
+        self.signal_order = []
+        self._signal_columns = {}
+        self.line_widths = {}
+        self.selected_uid = None
+        for record in data.get("signals", []):
+            self._restore_signal(record)
+
+        self._sync_unit_options()
+        self._refresh_signal_list()
+        self._refresh_xy_combos()
+        self._build_param_placeholder()
+
+        self._plot_suspended = True
+        try:
+            if restore_theme and "theme_mode" in settings:
+                self._on_theme_change(settings["theme_mode"])
+            if ("font_family" in settings or "font_size" in settings
+                    or "legend_font_size" in settings):
+                self._on_font_change()
+            self._on_mode_change()
+        finally:
+            self._plot_suspended = False
+
+        self.history = history if history is not None else History()
+        self.update_plot()
+
+    def _switch_tab(self, index: int) -> None:
+        if not (0 <= index < len(self.plot_tabs)) or index == self.active_tab:
+            return
+        self.plot_tabs[self.active_tab].state = self._gather_plot_state()
+        self.plot_tabs[self.active_tab].history = self.history
+        self.active_tab = index
+        self._apply_plot_state(self.plot_tabs[index].state,
+                               history=self.plot_tabs[index].history)
+        self._refresh_tab_strip()
+
+    def _add_tab(self) -> None:
+        self.plot_tabs[self.active_tab].state = self._gather_plot_state()
+        self.plot_tabs[self.active_tab].history = self.history
+        name = t("Gráfico {n}").format(n=len(self.plot_tabs) + 1)
+        self.plot_tabs.append(tabs.PlotTab(name=name))
+        self.active_tab = len(self.plot_tabs) - 1
+        self._apply_plot_state(self.plot_tabs[self.active_tab].state)
+        self._refresh_tab_strip()
+
+    def _close_tab(self, index: int) -> None:
+        if len(self.plot_tabs) <= 1 or not (0 <= index < len(self.plot_tabs)):
+            return
+        name = self.plot_tabs[index].name
+        if not messagebox.askyesno(
+                t("Cerrar pestaña"),
+                t("¿Cerrar «{name}»? Se pierden sus señales y ajustes.").format(name=name)):
+            return
+
+        was_active = index == self.active_tab
+        del self.plot_tabs[index]
+        if index < self.active_tab:
+            self.active_tab -= 1
+        self.active_tab = max(0, min(self.active_tab, len(self.plot_tabs) - 1))
+
+        if was_active:
+            self._apply_plot_state(self.plot_tabs[self.active_tab].state,
+                                   history=self.plot_tabs[self.active_tab].history)
+        self._refresh_tab_strip()
+
+    def _rename_tab(self, index: int) -> None:
+        def _submit(name: str) -> None:
+            self.plot_tabs[index].name = name
+            self._refresh_tab_strip()
+
+        TextPrompt(self, t("Renombrar pestaña"), t("Nombre de la pestaña:"),
+                  initial=self.plot_tabs[index].name, on_submit=_submit)
 
     def _build_xy_controls(self, parent) -> None:
         ctk.CTkLabel(parent, text="Eje X", font=font("label"),
@@ -1070,7 +1398,7 @@ class App(ctk.CTk):
                                            dropdown_font=font("body"))
         self.xy_y_combo.pack(side="left")
 
-        ctk.CTkLabel(parent, text="Leyenda", font=font("label"),
+        ctk.CTkLabel(parent, text=t("Leyenda"), font=font("label"),
                      text_color=col("fg_muted")).pack(side="left", padx=(16, 8))
         self.xy_legend_var = ctk.StringVar(value="")
         legend_entry = ctk.CTkEntry(parent, textvariable=self.xy_legend_var,
@@ -1143,11 +1471,31 @@ class App(ctk.CTk):
                 text="Clic sobre el gráfico para colocar un cursor; arrastralo para medir.")
         elif key == "annotate":
             self.cursors.disarm()
-            self._open_overlay_window(tab="Anotaciones")
+            self._open_overlay_window(tab="annotations")
             self.tool_hint.configure(
                 text="Definí la anotación en el panel y capturá el punto.")
         else:
             self.tool_hint.configure(text="")
+
+    def _on_margins_applied(self, margins: Optional[dict]) -> None:
+        """
+        Remember margins chosen by hand, or return to automatic layout when
+        the dialog is reset. Stored rather than applied once, because
+        `update_plot` has to reassert them after every redraw.
+        """
+        self._manual_margins = margins
+        self._save_session_soon()
+
+    def _apply_settings(self) -> None:
+        """
+        Redraw with the current settings, leaving the manual margins alone.
+
+        Separate from the per-trace "Aplicar cambios" button on purpose: that
+        one commits edits to a trace, this one only re-renders, so neither
+        can surprise you by doing the other's job.
+        """
+        self.update_plot()
+        self.status_label.configure(text=t("Ajustes aplicados."))
 
     def _fit_to_data(self) -> None:
         """Rescale every axes to the data currently plotted."""
@@ -1189,7 +1537,7 @@ class App(ctk.CTk):
                 else:
                     crossings = item.get("crossings") or []
                     text = ", ".join(format_eng(c, x_unit) for c in crossings[:2])
-                    rows.append((f"   {label[:16]}", text or "sin cruce"))
+                    rows.append((f"   {label[:16]}", text or t("sin cruce")))
         deltas = self.cursors.deltas()
         if deltas:
             rows.append(("--", ""))
@@ -1221,8 +1569,14 @@ class App(ctk.CTk):
         body = ctk.CTkScrollableFrame(right, fg_color="transparent", corner_radius=0)
         body.pack(fill="both", expand=True, padx=16, pady=(14, 12))
 
-        SectionHeader(body, "Ajustes").pack(fill="x")
+        self.settings = SectionGroup()
+        self._sections_header = SectionHeader(
+            body, t("Ajustes"), action=t("Minimizar todo"),
+            command=self._toggle_all_sections)
+        self._sections_header.pack(fill="x")
         Rule(body, strong=True).pack(fill="x", pady=(6, 12))
+        ghost_button(body, t("Aplicar ajustes"), self._apply_settings,
+                     height=28).pack(fill="x", pady=(0, 14))
         self._build_axes_section(body)
         self._build_labels_section(body)
         self._build_legend_section(body)
@@ -1230,132 +1584,195 @@ class App(ctk.CTk):
         self._build_export_section(body)
 
     def _section(self, parent, title: str, expanded: bool = True):
-        """
-        One settings group, always visible.
+        """One settings group, foldable from the caret in its header."""
+        def _on_toggle(_s) -> None:
+            self._save_session_soon()
+            self._refresh_toggle_all_label()
 
-        `expanded` is accepted and ignored: it is left in the signature so the
-        call sites read the same, but collapsing was removed -- see
-        `widgets.StaticSection` for why.
-        """
-        section = StaticSection(parent, title)
+        section = StaticSection(parent, title, expanded=expanded, on_toggle=_on_toggle)
         section.pack(fill="x", pady=(0, 12))
+        self.settings.add(section)
         return section.body
 
+    def _toggle_all_sections(self) -> None:
+        self.settings.set_all(not self.settings.any_expanded())
+        self._refresh_toggle_all_label()
+        self._save_session_soon()
+
+    def _refresh_toggle_all_label(self) -> None:
+        """
+        "Minimizar todo"/"Expandir todo": an `_EN` entry for "Expandir todo"
+        already existed but nothing ever showed it -- the header's action
+        label was set once at build time and never touched again, so the
+        the "collapse everything" link never flipped to "expand everything"
+        once every section was actually collapsed (whether via this link or
+        by folding sections one by one).
+        """
+        label = t("Minimizar todo") if self.settings.any_expanded() else t("Expandir todo")
+        self._sections_header.action_label.configure(text=label)
+
     def _build_axes_section(self, parent) -> None:
-        box = self._section(parent, "Ejes y escalas", expanded=True)
+        box = self._section(parent, t("Ejes y escalas"), expanded=True)
 
         self.unit_x_var = ctk.StringVar(value="us")
-        self.unit_x_combo = combo_field(box, "Unidad X", self.unit_x_var,
+        self.unit_x_combo = combo_field(box, t("Unidad X"), self.unit_x_var,
                                          ["s", "ms", "us", "ns"], width=110)
         self.unit_y_var = ctk.StringVar(value="V")
-        self.unit_y_combo = combo_field(box, "Unidad Y", self.unit_y_var,
+        self.unit_y_combo = combo_field(box, t("Unidad Y1"), self.unit_y_var,
                                          ["V", "mV"], width=110)
+        # Y2 carries its own unit: the secondary axis usually holds a
+        # different quantity altogether (phase in degrees against magnitude
+        # in dB), so forcing both to share one unit was simply wrong.
+        self.unit_y2_var = ctk.StringVar(value="V")
+        self.unit_y2_combo = combo_field(box, t("Unidad Y2"), self.unit_y2_var,
+                                          ["V", "mV"], width=110)
 
         self.xscale_var = ctk.StringVar(value="linear")
-        segmented_field(box, "Escala X", ["linear", "log"], self.xscale_var,
-                        labels=SCALE_LABELS, command=lambda _v: self.update_plot())
+        segmented_field(box, t("Escala X"), SCALES, self.xscale_var,
+                        labels=_labels()["scale"],
+                        command=lambda _v: self.update_plot())
         self.yscale_var = ctk.StringVar(value="linear")
-        self.yscale_seg = segmented_field(box, "Escala Y", ["linear", "log"],
-                                           self.yscale_var, labels=SCALE_LABELS,
+        self.yscale_seg = segmented_field(box, t("Escala Y"), SCALES,
+                                           self.yscale_var,
+                                           labels=_labels()["scale"],
                                            command=lambda _v: self.update_plot())
 
         self.xmin_var = ctk.StringVar(value="")
-        entry_field(box, "X mín", self.xmin_var, on_enter=self.update_plot)
+        entry_field(box, t("X mín"), self.xmin_var, on_enter=self.update_plot)
         self.xmax_var = ctk.StringVar(value="")
-        entry_field(box, "X máx", self.xmax_var, on_enter=self.update_plot)
-        hint(box, "Vacío = sin límite, en la unidad X elegida.",
+        entry_field(box, t("X máx"), self.xmax_var, on_enter=self.update_plot)
+        hint(box, t("Vacío = sin límite, en la unidad X elegida."),
              wraplength=280).pack(fill="x", pady=(0, 10))
 
         self.engineering_ticks_var = ctk.BooleanVar(value=True)
-        check_field(box, "Notación de ingeniería", self.engineering_ticks_var,
+        check_field(box, t("Notación de ingeniería"), self.engineering_ticks_var,
                     command=self.update_plot)
         self.grid_var = ctk.BooleanVar(value=True)
-        check_field(box, "Grilla", self.grid_var, command=self.update_plot)
+        check_field(box, t("Grilla"), self.grid_var, command=self.update_plot)
         self.minor_grid_var = ctk.BooleanVar(value=False)
-        check_field(box, "Grilla menor", self.minor_grid_var,
+        check_field(box, t("Grilla menor"), self.minor_grid_var,
                     command=self.update_plot, rule=False)
 
     def _build_labels_section(self, parent) -> None:
-        box = self._section(parent, "Rótulos y tipografía", expanded=False)
+        box = self._section(parent, t("Textos y fuente"), expanded=False)
 
         self.title_var = ctk.StringVar(value="")
-        stacked_entry(box, "Título", self.title_var, on_enter=self.update_plot)
+        stacked_entry(box, t("Título"), self.title_var, on_enter=self.update_plot)
         self.xlabel_var = ctk.StringVar(value="")
-        entry = stacked_entry(box, "Etiqueta X", self.xlabel_var,
+        entry = stacked_entry(box, t("Etiqueta X"), self.xlabel_var,
                               on_enter=self.update_plot)
         entry.bind("<KeyRelease>", lambda _e: self._mark_labels_dirty())
         self.ylabel_var = ctk.StringVar(value="")
-        entry = stacked_entry(box, "Etiqueta Y", self.ylabel_var,
+        entry = stacked_entry(box, t("Etiqueta Y"), self.ylabel_var,
                               on_enter=self.update_plot)
         entry.bind("<KeyRelease>", lambda _e: self._mark_labels_dirty())
         self.ylabel2_var = ctk.StringVar(value="Fase [$^\\circ$]")
-        stacked_entry(box, "Etiqueta Y2", self.ylabel2_var, on_enter=self.update_plot)
-        hint(box, "Aceptan mathtext: $V_{out}$, $^\\circ$.",
+        stacked_entry(box, t("Etiqueta Y2"), self.ylabel2_var, on_enter=self.update_plot)
+        hint(box, t("Aceptan mathtext: $V_{out}$, $^\\circ$."),
              wraplength=280).pack(fill="x", pady=(0, 12))
 
-        combo_field(box, "Fuente", self.font_family_var,
+        combo_field(box, t("Fuente"), self.font_family_var,
                     list(FONT_FAMILIES.keys()), width=150,
                     command=lambda _=None: self._on_font_change())
+        entry_field(box, t("Tamaño de fuente"), self.font_size_var, suffix="pt",
+                    on_enter=self._on_font_change)
+        hint(box, t("Afecta ejes y ticks; el título usa un punto más. La leyenda "
+                    "usa un punto menos salvo que se le fije un tamaño propio "
+                    "en la sección «Leyenda»."),
+             wraplength=280).pack(fill="x", pady=(0, 12))
 
-        self.theme_mode_var = ctk.StringVar(value="Claro")
-        segmented_field(box, "Tema", ["Claro", "Oscuro"], self.theme_mode_var,
+        self.theme_mode_var = ctk.StringVar(value="light")
+        segmented_field(box, t("Tema"), THEMES, self.theme_mode_var,
+                        labels=_labels()["theme"],
                         command=self._on_theme_change, width=64)
-        ghost_button(box, "Márgenes del gráfico...",
+
+        self.language_var = ctk.StringVar(value=get_language())
+        segmented_field(box, t("Idioma"), list(LANGUAGES), self.language_var,
+                        labels=LANGUAGES, command=self._on_language_change,
+                        width=76)
+        ghost_button(box, t("Márgenes del gráfico..."),
                      self.mpl_toolbar.configure_subplots).pack(fill="x", pady=(4, 0))
 
     def _build_legend_section(self, parent) -> None:
-        box = self._section(parent, "Leyenda", expanded=False)
+        box = self._section(parent, t("Leyenda"), expanded=False)
 
         self.legend_var = ctk.BooleanVar(value=True)
-        check_field(box, "Mostrar leyenda", self.legend_var, command=self.update_plot)
+        check_field(box, t("Mostrar leyenda"), self.legend_var, command=self.update_plot)
 
         self.legend_pos_var = ctk.StringVar(value="upper right")
-        combo_field(box, "Posición", self.legend_pos_var, LEGEND_POSITIONS,
+        combo_field(box, t("Posición"), self.legend_pos_var, LEGEND_POSITIONS,
                     width=170, command=lambda _=None: self.update_plot())
 
         self.legend_x_var = ctk.StringVar(value="1.02")
-        entry_field(box, "X (fracción)", self.legend_x_var, on_enter=self.update_plot)
+        entry_field(box, t("X (fracción)"), self.legend_x_var, on_enter=self.update_plot)
         self.legend_y_var = ctk.StringVar(value="1.00")
-        entry_field(box, "Y (fracción)", self.legend_y_var, on_enter=self.update_plot)
+        entry_field(box, t("Y (fracción)"), self.legend_y_var, on_enter=self.update_plot)
 
         self.legend_corner_var = ctk.StringVar(value="upper left")
-        combo_field(box, "Anclaje", self.legend_corner_var, CUSTOM_ANCHOR_CORNERS,
+        combo_field(box, t("Punto de anclaje"), self.legend_corner_var, CUSTOM_ANCHOR_CORNERS,
                     width=150, command=lambda _=None: self.update_plot())
 
         self.legend_ncol_var = ctk.StringVar(value="1")
-        entry_field(box, "Columnas", self.legend_ncol_var, width=56,
-                    on_enter=self.update_plot, rule=False)
-        hint(box, "X/Y y anclaje sólo aplican con «personalizada (x, y)». "
-                  "Fuera de [0, 1] la leyenda sale del área del gráfico.",
+        entry_field(box, t("Columnas"), self.legend_ncol_var, width=56,
+                    on_enter=self.update_plot)
+
+        self.legend_frameon_var = ctk.BooleanVar(value=True)
+        check_field(box, t("Marco de la leyenda"), self.legend_frameon_var,
+                    command=self.update_plot)
+
+        self.legend_title_var = ctk.StringVar(value="")
+        stacked_entry(box, t("Título de la leyenda"), self.legend_title_var,
+                      on_enter=self.update_plot)
+
+        self.legend_font_size_var = ctk.StringVar(value="")
+        entry_field(box, t("Tamaño de fuente"), self.legend_font_size_var, suffix="pt",
+                    on_enter=self._on_font_change)
+        hint(box, t("Vacío = un punto menos que el tamaño de fuente general."),
+             wraplength=280).pack(fill="x", pady=(0, 8))
+
+        # Free-text rows appended to the legend with no curve behind them --
+        # for the component values and test conditions that belong in the
+        # legend box of a report figure but are not a plotted series.
+        stacked_label(box, t("Líneas de texto extra"))
+        self.legend_extra_box = ctk.CTkTextbox(box, height=64, font=font("body"),
+                                               wrap="none")
+        self.legend_extra_box.pack(fill="x", pady=(0, 4))
+        self.legend_extra_box.bind(
+            "<FocusOut>", lambda _e: self.update_plot())
+        hint(box, t("Una por línea. Se agregan al final de la leyenda sin "
+                    "curva asociada."), wraplength=280).pack(fill="x", pady=(0, 8))
+        hint(box, t("X/Y y anclaje sólo aplican con «personalizada (x, y)». "
+                  "Fuera de [0, 1] la leyenda sale del área del gráfico."),
              wraplength=280).pack(fill="x", pady=(8, 0))
 
     def _build_data_section(self, parent) -> None:
-        box = self._section(parent, "Datos", expanded=False)
+        box = self._section(parent, t("Datos"), expanded=False)
 
-        self.dec_mode_var = ctk.StringVar(value="Ninguno")
-        combo_field(box, "Diezmado", self.dec_mode_var, list(DEC_MODES.keys()),
-                    width=150, command=lambda _=None: self.update_plot())
+        self.dec_mode_var = ctk.StringVar(value="none")
+        self.dec_mode_combo = combo_field(
+            box, t("Reducir puntos"), self.dec_mode_var, DEC_MODES, width=150,
+            labels=_labels()["dec"], command=lambda _=None: self.update_plot())
         self.dec_value_var = ctk.StringVar(value="1000")
-        entry_field(box, "Valor", self.dec_value_var, on_enter=self.update_plot)
-        hint(box, "«Factor N» conserva 1 de cada N muestras; «Máx. puntos» "
-                  "reduce hasta esa cantidad.", wraplength=280).pack(fill="x", pady=(8, 10))
+        entry_field(box, t("Valor"), self.dec_value_var, on_enter=self.update_plot)
+        hint(box, t("«Factor N» conserva 1 de cada N muestras; «Máx. puntos» "
+                  "reduce hasta esa cantidad."), wraplength=280).pack(fill="x", pady=(8, 10))
 
         # Display-only cap: keeps redraws fast on multi-million-sample
         # captures without ever touching what gets exported.
         self.max_points_var = ctk.StringVar(value="20k")
-        entry_field(box, "Máx. en pantalla", self.max_points_var,
+        entry_field(box, t("Máx. puntos en pantalla"), self.max_points_var,
                     on_enter=self.update_plot, rule=False, label_width=132)
-        hint(box, "Sólo afecta el dibujo en pantalla; la exportación siempre "
-                  "usa todos los puntos. 0 = sin límite.",
+        hint(box, t("Sólo afecta el dibujo en pantalla; la exportación siempre "
+                  "usa todos los puntos. 0 = sin límite."),
              wraplength=280).pack(fill="x", pady=(8, 0))
 
         self.decimal_comma_check = check_field(
-            box, "Archivos con coma decimal", self.decimal_comma_var, rule=False)
+            box, t("Archivos con coma decimal"), self.decimal_comma_var, rule=False)
 
     def _build_export_section(self, parent) -> None:
-        box = self._section(parent, "Exportar", expanded=True)
+        box = self._section(parent, t("Exportar"), expanded=True)
 
-        stacked_label(box, "Perfil de exportación")
+        stacked_label(box, t("Perfil de exportación"))
         profile_row = ctk.CTkFrame(box, fg_color="transparent")
         profile_row.pack(fill="x", pady=(0, 6))
         self.profile_var = ctk.StringVar(value="")
@@ -1366,40 +1783,58 @@ class App(ctk.CTk):
         self.profile_combo.pack(fill="x")
         profile_actions = ctk.CTkFrame(box, fg_color="transparent")
         profile_actions.pack(fill="x", pady=(0, 14))
-        ghost_button(profile_actions, "Guardar como...", self._save_export_profile,
+        ghost_button(profile_actions, t("Guardar como..."), self._save_export_profile,
                      width=140).pack(side="left")
-        ghost_button(profile_actions, "Eliminar", self._delete_export_profile,
+        ghost_button(profile_actions, t("Eliminar"), self._delete_export_profile,
                      width=90).pack(side="left", padx=6)
         self._refresh_export_profiles()
         Rule(box).pack(fill="x", pady=(0, 12))
 
         self.csv_mode_container = ctk.CTkFrame(box, fg_color="transparent")
         self.csv_mode_container.pack(fill="x", pady=(0, 8))
-        stacked_label(self.csv_mode_container, "Datos para PGFPlots")
-        self.csv_mode_var = ctk.StringVar(value="Individual (1 archivo por señal)")
-        self.csv_mode_combo = ctk.CTkComboBox(
-            self.csv_mode_container,
-            values=["Individual (1 archivo por señal)", "Combinado (grilla común)"],
-            variable=self.csv_mode_var, height=28, font=font("body"),
-            dropdown_font=font("body"))
+        stacked_label(self.csv_mode_container, t("Datos para PGFPlots"))
+        self.csv_mode_var = ctk.StringVar(value="individual")
+        self.csv_mode_combo = LabeledCombo(
+            self.csv_mode_container, CSV_MODES, self.csv_mode_var,
+            labels=_labels()["csv"], height=28)
         self.csv_xy_note = hint(self.csv_mode_container,
-                                 "Modo X/Y: se exporta la curva actual.",
+                                 t("Modo X/Y: se exporta la curva actual."),
                                  wraplength=280)
         self.csv_mode_combo.pack(fill="x")   # default (non-XY) state
-        ghost_button(box, "Exportar CSV...", self._export_csv,
+        ghost_button(box, t("Exportar CSV..."), self._export_csv,
                      height=30).pack(fill="x", pady=(8, 14))
 
         Rule(box).pack(fill="x", pady=(0, 12))
 
         self.fig_format_var = ctk.StringVar(value="pdf")
-        combo_field(box, "Formato", self.fig_format_var,
+        combo_field(box, t("Formato"), self.fig_format_var,
                     ["pdf", "png", "svg", "pgf"], width=110)
         self.dpi_var = ctk.StringVar(value="300")
         entry_field(box, "DPI", self.dpi_var, rule=False)
-        hint(box, "PDF, SVG y PGF son vectoriales; el DPI sólo afecta al PNG.",
+        hint(box, t("PDF, SVG y PGF son vectoriales; el DPI sólo afecta al PNG."),
              wraplength=280).pack(fill="x", pady=(6, 10))
-        primary_button(box, "Exportar figura...", self._export_figure,
+        primary_button(box, t("Exportar figura..."), self._export_figure,
                        height=32).pack(fill="x")
+        ghost_button(box, t("Importar figura..."), self._import_figure,
+                    height=28).pack(fill="x", pady=(6, 0))
+        hint(box, t("Recupera una figura exportada antes con TODOS sus ajustes "
+                    "y señales, en una pestaña nueva. Necesita el archivo "
+                    "«.labplotter.json» que se guarda junto a la figura."),
+             wraplength=280).pack(fill="x", pady=(4, 0))
+
+        Rule(box).pack(fill="x", pady=(14, 12))
+
+        stacked_label(box, t("Tablero (varias figuras en un mismo layout)"))
+        self.board_title_var = ctk.StringVar(value="")
+        stacked_entry(box, t("Título del panel"), self.board_title_var)
+        board_actions = ctk.CTkFrame(box, fg_color="transparent")
+        board_actions.pack(fill="x", pady=(0, 8))
+        ghost_button(board_actions, t("+ Agregar gráfico actual"), self._add_current_to_board,
+                    width=170).pack(side="left")
+        ghost_button(board_actions, t("Ver tablero..."), self._open_board_window,
+                    width=100).pack(side="left", padx=(6, 0))
+        self.board_status_label = hint(box, t("Tablero vacío."), wraplength=280)
+        self.board_status_label.pack(fill="x")
 
     def _refresh_export_profiles(self) -> None:
         self._export_profiles = session.load_profiles()
@@ -1429,15 +1864,15 @@ class App(ctk.CTk):
             self._refresh_export_profiles()
             self.profile_var.set(name)
 
-        TextPrompt(self, "Guardar perfil",
-                  "Nombre del perfil (formato, DPI y modo CSV actuales):",
+        TextPrompt(self, t("Guardar perfil"),
+                  t("Nombre del perfil (formato, DPI y modo CSV actuales):"),
                   on_submit=_submit)
 
     def _delete_export_profile(self) -> None:
         name = self.profile_var.get()
         if not name:
             return
-        if not messagebox.askyesno("Eliminar perfil",
+        if not messagebox.askyesno(t("Eliminar perfil"),
                                    f"¿Eliminar el perfil «{name}»?"):
             return
         self._export_profiles = session.delete_profile(name)
@@ -1457,8 +1892,8 @@ class App(ctk.CTk):
 
     def _load_files(self) -> None:
         paths = filedialog.askopenfilenames(
-            title="Seleccionar archivos de datos",
-            filetypes=[("CSV/TXT", "*.csv *.txt"), ("Todos los archivos", "*.*")])
+            title=t("Seleccionar archivos de datos"),
+            filetypes=[("CSV/TXT", "*.csv *.txt"), (t("Todos los archivos"), "*.*")])
         if not paths:
             return
         self._ingest_files(paths)
@@ -1469,12 +1904,13 @@ class App(ctk.CTk):
         onto the window: everything from here down used to live directly in
         `_load_files`, which only ever supplied paths from the file dialog.
         """
+        self._record(t("Abrir archivo(s)"))
         loaded = 0
         for path in paths:
             try:
                 df, col_kind = read_table(path, decimal_comma=self.decimal_comma_var.get())
             except Exception as exc:
-                messagebox.showerror("Error al leer archivo",
+                messagebox.showerror(t("Error al leer archivo"),
                                       f"{os.path.basename(path)}:\n{exc}")
                 continue
 
@@ -1498,11 +1934,11 @@ class App(ctk.CTk):
                                         domain=domain, y_kind=y_kind,
                                         color=self._next_color())
                 except Exception as exc:
-                    messagebox.showerror("Error al procesar columna", f"{name}:\n{exc}")
+                    messagebox.showerror(t("Error al procesar columna"), f"{name}:\n{exc}")
                     continue
                 if sig.t_raw.size == 0:
                     messagebox.showwarning(
-                        "Columna vacía",
+                        t("Columna vacía"),
                         f"La columna '{y_col}' no contiene datos numéricos válidos.")
                     continue
                 self.signals[sig.uid] = sig
@@ -1523,10 +1959,20 @@ class App(ctk.CTk):
 
     def _remove_selected_signal(self) -> None:
         if self.selected_uid is None:
-            messagebox.showinfo("Sin selección", "Seleccioná primero una señal de la lista.")
+            messagebox.showinfo(t("Sin selección"),
+                                t("Seleccioná primero una señal de la lista."))
             return
+        signal = self.signals.get(self.selected_uid)
+        name = signal.name if signal is not None else ""
+        if not messagebox.askyesno(
+                t("Quitar traza"),
+                f"{t('¿Quitar la traza')} «{name}»?\n\n"
+                f"{t('Esta acción se puede deshacer con Ctrl+Z.')}"):
+            return
+        self._record(f"{t('Quitar traza')} «{name}»")
         self.signals.pop(self.selected_uid, None)
         self._signal_columns.pop(self.selected_uid, None)
+        self.line_widths.pop(self.selected_uid, None)
         if self.selected_uid in self.signal_order:
             self.signal_order.remove(self.selected_uid)
         self.selected_uid = None
@@ -1539,12 +1985,15 @@ class App(ctk.CTk):
         if not self.signals:
             return
         if not messagebox.askyesno(
-                "Quitar todas las señales",
-                f"¿Eliminar las {len(self.signals)} señales cargadas? Esta acción no se puede deshacer."):
+                t("Quitar todas las trazas"),
+                f"{t('¿Eliminar las')} {len(self.signals)} {t('trazas cargadas?')}\n\n"
+                f"{t('Esta acción se puede deshacer con Ctrl+Z.')}"):
             return
+        self._record(t("Quitar todas las trazas"))
         self.signals.clear()
         self.signal_order.clear()
         self._signal_columns.clear()
+        self.line_widths.clear()
         self.selected_uid = None
         self._refresh_signal_list()
         self._refresh_xy_combos()
@@ -1571,7 +2020,7 @@ class App(ctk.CTk):
 
         if not self.signal_order:
             hint(self.signal_list_frame,
-                 "Sin trazas. Abrí un archivo para empezar.",
+                 t("Sin trazas. Abrí un archivo para empezar."),
                  wraplength=240).pack(fill="x", pady=14)
             self._refresh_chips()
             return
@@ -1580,21 +2029,41 @@ class App(ctk.CTk):
             sig = self.signals[uid]
             tag = {"dB": "dB", "deg": "fase"}.get(sig.y_kind, "V")
             row = TraceRow(
-                self.signal_list_frame, name=sig.name,
+                self.signal_list_frame, name=sig.display_name or sig.name,
                 color=sig.color or "#8A8A8A", tag=tag, visible=sig.visible,
                 on_select=lambda u=uid: self._select_signal(u),
                 on_toggle=lambda value, u=uid: self._toggle_signal(u, value),
-                on_color=lambda u=uid: self._pick_row_color(u))
+                on_color=lambda u=uid: self._pick_row_color(u),
+                on_move_up=lambda u=uid: self._move_signal(u, -1),
+                on_move_down=lambda u=uid: self._move_signal(u, 1))
             row.pack(fill="x", pady=1)
             self.row_widgets[uid] = {"row": row}
 
         self._highlight_selected()
         self._refresh_chips()
 
+    def _move_signal(self, uid: str, delta: int) -> None:
+        """
+        Move a trace up/down in `signal_order` -- this is also the order
+        curves are plotted in (see `_gather_curves`), so it is what
+        actually reorders the legend entries, not just the list on screen.
+        """
+        if uid not in self.signal_order:
+            return
+        i = self.signal_order.index(uid)
+        j = i + delta
+        if not (0 <= j < len(self.signal_order)):
+            return
+        self._record(t("Reordenar traza"))
+        self.signal_order[i], self.signal_order[j] = self.signal_order[j], self.signal_order[i]
+        self._refresh_signal_list()   # also re-highlights the selected row
+        self.update_plot()
+
     def _toggle_signal(self, uid: str, visible: bool) -> None:
         signal = self.signals.get(uid)
         if signal is None:
             return
+        self._record(t("Mostrar/ocultar traza"))
         signal.visible = bool(visible)
         self.update_plot()
 
@@ -1606,11 +2075,12 @@ class App(ctk.CTk):
         initial = sig.color or TRACE_CYCLE[0]
         try:
             _rgb, hex_color = colorchooser.askcolor(color=initial, parent=self,
-                                                     title=f"Color de {sig.name}")
+                                                     title=f"Color de {sig.display_name or sig.name}")
         except tk.TclError:
-            _rgb, hex_color = colorchooser.askcolor(parent=self, title=f"Color de {sig.name}")
+            _rgb, hex_color = colorchooser.askcolor(parent=self, title=f"Color de {sig.display_name or sig.name}")
         if not hex_color:
             return
+        self._record(t("Cambiar color"))
         sig.color = hex_color
         self._refresh_signal_list()
         if self.selected_uid == uid:
@@ -1666,11 +2136,25 @@ class App(ctk.CTk):
         if self.unit_x_var.get() not in x_values:
             self.unit_x_var.set("Hz" if domain == "freq" else "us")
 
-        y_kind = kinds.pop() if len(kinds) == 1 else "voltage"
+        # `next(iter(...))`, not `.pop()`: `kinds` is a set and `.pop()`
+        # mutates it in place, removing the very element it returns -- when
+        # every loaded signal shared one kind (e.g. all "dB" in a Bode
+        # session), `kinds` was already empty two lines below at
+        # `(kinds or {"voltage"})`, so Y2's unit list silently fell back to
+        # voltage-only units instead of the dB/deg units actually in use.
+        y_kind = next(iter(kinds)) if len(kinds) == 1 else "voltage"
         y_values = list(y_units_for_kind(y_kind).keys())
         self.unit_y_combo.configure(values=y_values)
         if self.unit_y_var.get() not in y_values:
             self.unit_y_var.set(y_values[0])
+
+        # Y2 offers every unit any loaded signal could need, since the
+        # secondary axis often holds a different quantity from Y1.
+        y2_values = sorted({u for kind in (kinds or {"voltage"})
+                            for u in y_units_for_kind(kind)} | set(y_values))
+        self.unit_y2_combo.configure(values=y2_values)
+        if self.unit_y2_var.get() not in y2_values:
+            self.unit_y2_var.set(y2_values[0])
 
         # Frequency sweeps default to a log X axis, the standard for filters.
         # One-directional on purpose: this runs after routine file loads and
@@ -1694,14 +2178,14 @@ class App(ctk.CTk):
         for w in self.param_frame.winfo_children():
             w.destroy()
 
-        SectionHeader(self.param_frame, "Ajustes de la traza").pack(fill="x")
+        SectionHeader(self.param_frame, t("Ajustes de la traza")).pack(fill="x")
         Rule(self.param_frame).pack(fill="x", pady=(6, 12))
 
         legend_var = ctk.StringVar(value=sig.legend_label or "")
-        stacked_entry(self.param_frame, "Nombre en la leyenda", legend_var)
+        stacked_entry(self.param_frame, t("Cómo aparece en la leyenda"), legend_var)
 
         # --- colour ---------------------------------------------------- #
-        stacked_label(self.param_frame, "Color")
+        stacked_label(self.param_frame, t("Color"))
         color_row = ctk.CTkFrame(self.param_frame, fg_color="transparent")
         color_row.pack(fill="x", pady=(0, 12))
         color_var = ctk.StringVar(value=sig.color or TRACE_CYCLE[0])
@@ -1735,58 +2219,117 @@ class App(ctk.CTk):
         swatch.configure(command=_pick_color)
 
         # --- stroke ---------------------------------------------------- #
-        stacked_label(self.param_frame, "Trazo")
+        stacked_label(self.param_frame, t("Estilo de línea"))
         style_var = ctk.StringVar(value=sig.linestyle)
+
+        def _on_style_change(value: str) -> None:
+            # Turning the line off with no marker set would just make the
+            # trace disappear -- pick a visible marker automatically so
+            # "sin línea" always shows the data points, with nothing to
+            # add by hand.
+            if value == "None" and marker_var.get() == "None":
+                marker_var.set("o")
+
         Segmented(self.param_frame, LINESTYLES, style_var, labels=LINE_GLYPHS,
-                  width=56).pack(fill="x", pady=(0, 12))
+                  command=_on_style_change, width=56).pack(fill="x", pady=(0, 12))
+        hint(self.param_frame, t("«Sin línea» (el último botón) grafica sólo "
+                                 "los puntos, sin interpolar entre ellos."),
+             wraplength=240).pack(fill="x", pady=(0, 12))
+
+        # --- marker ------------------------------------------------------ #
+        marker_var = ctk.StringVar(value=sig.marker or "None")
+        combo_field(self.param_frame, t("Marcador"), marker_var, MARKERS,
+                    width=170, labels=_labels()["marker"])
+        marker_size_var = ctk.StringVar(value=f"{sig.marker_size:g}")
+        entry_field(self.param_frame, t("Tamaño de marcador"), marker_size_var,
+                    suffix="pt", label_width=140)
+        marker_hollow_var = ctk.BooleanVar(value=sig.marker_hollow)
+        check_field(self.param_frame, t("Marcador hueco"), marker_hollow_var)
+        hint(self.param_frame, t("Hueco = sólo el borde, con el color de la traza; "
+                                 "sin relleno."),
+             wraplength=240).pack(fill="x", pady=(0, 12))
+
+        # --- line weight ------------------------------------------------ #
+        width_var = ctk.StringVar(value=f"{self._lw(uid):.1f}")
+        SliderField(self.param_frame, t("Grosor de traza"), width_var,
+                    minimum=0.4, maximum=5.0, steps=46, decimals=1,
+                    label_width=112,
+                    on_change=lambda u=uid, v=width_var: self._preview_width(u, v)
+                    ).pack(fill="x", pady=(0, 10))
 
         # --- which Y axis ---------------------------------------------- #
-        stacked_label(self.param_frame, "Dibujar contra")
-        axis_var = ctk.StringVar(value="Der" if sig.secondary_y else "Izq")
-        Segmented(self.param_frame, ["Izq", "Der"], axis_var, width=56
-                  ).pack(fill="x", pady=(0, 4))
-        hint(self.param_frame, "«Der» usa un eje Y2 con escala propia.",
+        stacked_label(self.param_frame, t("Eje vertical"))
+        axis_var = ctk.StringVar(value="secondary" if sig.secondary_y
+                                 else "primary")
+        Segmented(self.param_frame, AXIS_SIDES, axis_var,
+                  labels=_labels()["side"], width=56).pack(fill="x", pady=(0, 4))
+        hint(self.param_frame, t("«Der» usa un eje Y2 con escala propia."),
              wraplength=240).pack(fill="x", pady=(0, 12))
 
         # --- corrections ------------------------------------------------ #
-        corrections = StaticSection(self.param_frame, "Corregir los datos")
+        corrections = StaticSection(self.param_frame, t("Correcciones"))
         corrections.pack(fill="x", pady=(4, 8))
         box = corrections.body
 
         x_unit_now, y_unit_now = sig.unit_t_in, sig.unit_v_in
+        # The suffix next to each offset field must track the "Unidad X/Y"
+        # combo below (`unit_x_in_var`/`unit_y_in_var`) live: a static suffix
+        # kept showing the unit that was active when the panel was built, so
+        # changing the unit combo *without* retouching the offset field
+        # silently reinterpreted the same typed number in the new unit at
+        # "Aplicar cambios" time (e.g. "5" meant as 5 ms became 5 s). See the
+        # `_on_unit_x_change`/`_on_unit_y_change` traces below, which keep
+        # both the suffix and the numeric value in sync with the combo.
+        xoff_suffix_var = ctk.StringVar(value=x_unit_now)
         xoff_var = ctk.StringVar(
             value=f"{sig.t_offset / x_units_for_domain(sig.domain)[x_unit_now]:g}")
-        entry_field(box, "Desplazar en X", xoff_var, suffix=x_unit_now, label_width=104)
+        entry_field(box, t("Desplazar en X"), xoff_var, suffix_var=xoff_suffix_var,
+                    label_width=104)
+        yoff_suffix_var = ctk.StringVar(value=y_unit_now)
         yoff_var = ctk.StringVar(
             value=f"{sig.v_offset / y_units_for_kind(sig.y_kind)[y_unit_now]:g}")
-        entry_field(box, "Desplazar en Y", yoff_var, suffix=y_unit_now, label_width=104)
+        entry_field(box, t("Desplazar en Y"), yoff_var, suffix_var=yoff_suffix_var,
+                    label_width=104)
         gain_var = ctk.StringVar(value=f"{sig.gain:g}")
-        entry_field(box, "Multiplicar por", gain_var, suffix="×", label_width=104)
+        entry_field(box, t("Ganancia"), gain_var, suffix="×", label_width=104)
+        hint(box, t("Sólo tiene efecto en señales de tipo «voltage»: escalar "
+                    "el valor de una traza en dB o fase no tiene sentido "
+                    "físico (para eso está «Desplazar en Y»)."),
+             wraplength=240).pack(fill="x", pady=(0, 8))
         invert_var = ctk.BooleanVar(value=sig.invert)
-        check_field(box, "Invertir (×−1)", invert_var, rule=False)
+        check_field(box, t("Invertir (×−1)"), invert_var, rule=False)
 
         # --- source metadata --------------------------------------------- #
-        source = StaticSection(self.param_frame, "Origen de los datos")
+        source = StaticSection(self.param_frame, t("De dónde salen los datos"))
         source.pack(fill="x", pady=(0, 8))
         box = source.body
 
         name_var = ctk.StringVar(value=sig.name)
-        stacked_entry(box, "Nombre", name_var)
+        stacked_entry(box, t("Nombre"), name_var)
+        hint(box, t("Se usa en la leyenda y en los ejes por defecto "
+                    "si no hay etiqueta de leyenda propia."),
+             wraplength=240).pack(fill="x", pady=(0, 10))
+
+        alias_var = ctk.StringVar(value=sig.display_name or "")
+        stacked_entry(box, t("Alias en la lista"), alias_var)
+        hint(box, t("Solo cambia cómo se ve en la lista de trazas; nunca "
+                    "aparece en el gráfico ni en la leyenda."),
+             wraplength=240).pack(fill="x", pady=(0, 10))
 
         domain_var = ctk.StringVar(value=sig.domain)
-        combo_field(box, "Dominio", domain_var, ["time", "freq"], width=110)
+        combo_field(box, t("Dominio"), domain_var, ["time", "freq"], width=110)
         ykind_var = ctk.StringVar(value=sig.y_kind)
-        combo_field(box, "Magnitud", ykind_var, ["voltage", "dB", "deg"], width=110)
+        combo_field(box, t("Magnitud"), ykind_var, ["voltage", "dB", "deg"], width=110)
 
         unit_x_in_var = ctk.StringVar(value=sig.unit_t_in)
-        unit_x_combo = combo_field(box, "Unidad X", unit_x_in_var,
+        unit_x_combo = combo_field(box, t("Unidad X"), unit_x_in_var,
                                     list(x_units_for_domain(sig.domain).keys()),
                                     width=110)
         unit_y_in_var = ctk.StringVar(value=sig.unit_v_in)
-        unit_y_combo = combo_field(box, "Unidad Y", unit_y_in_var,
+        unit_y_combo = combo_field(box, t("Unidad Y"), unit_y_in_var,
                                     list(y_units_for_kind(sig.y_kind).keys()),
                                     width=110, rule=False)
-        hint(box, "Unidad en la que vienen los datos del archivo.",
+        hint(box, t("Unidad en la que vienen los datos del archivo."),
              wraplength=240).pack(fill="x", pady=(6, 0))
 
         def _sync_source_units(_=None):
@@ -1802,6 +2345,39 @@ class App(ctk.CTk):
         domain_var.trace_add("write", lambda *_: _sync_source_units())
         ykind_var.trace_add("write", lambda *_: _sync_source_units())
 
+        # Keep the offset fields' displayed number and suffix meaning the
+        # same physical shift when "Unidad X"/"Unidad Y" changes -- without
+        # this, the value typed while the combo showed e.g. "ms" would be
+        # silently re-read as "s" (or whatever unit is selected at "Aplicar
+        # cambios" time), a 1000x error the field's frozen suffix used to hide.
+        _prev_x_unit = {"value": x_unit_now}
+        _prev_y_unit = {"value": y_unit_now}
+
+        def _on_unit_x_change(*_a):
+            new_unit = unit_x_in_var.get()
+            old_unit = _prev_x_unit["value"]
+            if new_unit != old_unit:
+                units = x_units_for_domain(domain_var.get())
+                if old_unit in units and new_unit in units:
+                    current = _parse_float(xoff_var.get(), 0.0)
+                    xoff_var.set(f"{current * units[old_unit] / units[new_unit]:g}")
+                xoff_suffix_var.set(new_unit)
+            _prev_x_unit["value"] = new_unit
+
+        def _on_unit_y_change(*_a):
+            new_unit = unit_y_in_var.get()
+            old_unit = _prev_y_unit["value"]
+            if new_unit != old_unit:
+                units = y_units_for_kind(ykind_var.get())
+                if old_unit in units and new_unit in units:
+                    current = _parse_float(yoff_var.get(), 0.0)
+                    yoff_var.set(f"{current * units[old_unit] / units[new_unit]:g}")
+                yoff_suffix_var.set(new_unit)
+            _prev_y_unit["value"] = new_unit
+
+        unit_x_in_var.trace_add("write", _on_unit_x_change)
+        unit_y_in_var.trace_add("write", _on_unit_y_change)
+
         # --- apply ------------------------------------------------------ #
         def apply_changes():
             new_domain = domain_var.get()
@@ -1816,12 +2392,14 @@ class App(ctk.CTk):
                 swatch.configure(fg_color=color)
             except (tk.TclError, ValueError):
                 messagebox.showerror(
-                    "Color inválido",
-                    f"'{color}' no es un color válido. Usá formato hex (#RRGGBB) "
-                    "o el selector gráfico.")
+                    t("Color inválido"),
+                    t("'{color}' no es un color válido. Usá formato hex (#RRGGBB) "
+                      "o el selector gráfico.").format(color=color))
                 return
 
+            self._record(t("Aplicar cambios"))
             sig.name = name_var.get().strip() or sig.name
+            sig.display_name = alias_var.get().strip() or None
             sig.legend_label = legend_var.get().strip() or None
             sig.domain = new_domain
             sig.y_kind = new_kind
@@ -1829,11 +2407,25 @@ class App(ctk.CTk):
             sig.unit_v_in = new_uy
             sig.t_offset = _parse_float(xoff_var.get(), 0.0) * x_units[new_ux]
             sig.v_offset = _parse_float(yoff_var.get(), 0.0) * y_units[new_uy]
-            sig.gain = _parse_float(gain_var.get(), 1.0)
+            # `gain` multiplies the raw value (see Signal.processed() in
+            # core/data_io.py) -- physically correct for a "voltage" trace
+            # (amplitude scaling / probe attenuation), but meaningless for
+            # "dB" or "deg": multiplying a decibel or a phase-degree number
+            # by a factor is not the same as scaling the underlying transfer
+            # function (that would mean ADDING to the dB value, which is
+            # exactly what "Desplazar en Y" already does for a dB trace).
+            # Force it to a no-op for those two kinds so a stray value here
+            # can't silently corrupt a Bode magnitude/phase curve.
+            sig.gain = _parse_float(gain_var.get(), 1.0) if new_kind == "voltage" else 1.0
             sig.invert = invert_var.get()
             sig.linestyle = style_var.get()
+            sig.marker = marker_var.get()
+            sig.marker_size = max(1.0, _parse_float(marker_size_var.get(), sig.marker_size))
+            sig.marker_hollow = marker_hollow_var.get()
             sig.color = color
-            sig.secondary_y = axis_var.get() == "Der"
+            sig.secondary_y = axis_var.get() == "secondary"
+            self.line_widths[uid] = max(0.2, _parse_float(
+                width_var.get(), self.DEFAULT_LINE_WIDTH))
 
             self._sync_unit_options()
             self._refresh_signal_list()
@@ -1841,7 +2433,7 @@ class App(ctk.CTk):
             self._select_signal(uid)
             self.update_plot()
 
-        primary_button(self.param_frame, "Aplicar cambios", apply_changes
+        primary_button(self.param_frame, t("Aplicar cambios"), apply_changes
                        ).pack(fill="x", pady=(6, 14))
 
     # ------------------------------------------------------------------ #
@@ -1882,7 +2474,17 @@ class App(ctk.CTk):
         self.update_plot()
 
     def _on_font_change(self) -> None:
-        set_publication_style(font_family=self.font_family_var.get())
+        size = max(6.0, min(32.0, _parse_float(self.font_size_var.get(), 10.0)))
+        self.font_size_var.set(f"{size:g}")
+
+        legend_text = self.legend_font_size_var.get().strip()
+        legend_size: Optional[float] = None
+        if legend_text:
+            legend_size = max(6.0, min(48.0, _parse_float(legend_text, size - 1)))
+            self.legend_font_size_var.set(f"{legend_size:g}")
+
+        set_publication_style(font_family=self.font_family_var.get(),
+                              base_fontsize=size, legend_fontsize=legend_size)
         self.update_plot()
 
     def _on_theme_change(self, value: str) -> None:
@@ -1891,7 +2493,7 @@ class App(ctk.CTk):
         Both are stored as [light, dark] pairs in the theme dictionary, so the
         existing widget tree is restyled without being rebuilt.
         """
-        set_theme_mode("light" if value.lower().startswith("c") else "dark")
+        set_theme_mode(value if value in THEMES else "light")
         # Hairlines are plain Tk widgets (for rendering cost, see the note in
         # gui/widgets.py) and therefore opt out of CustomTkinter's automatic
         # appearance-mode switching -- they have to be repainted by hand.
@@ -1902,6 +2504,106 @@ class App(ctk.CTk):
                 highlightcolor=tk_color("border_str"))
         except tk.TclError:
             pass
+
+    def _on_language_change(self, code: str) -> None:
+        """
+        Switch interface language immediately, by rebuilding the panels.
+
+        Every widget resolves its label through `t()` when it is constructed,
+        so an already-built tree cannot be re-translated in place. Deferring
+        the change to the next launch was the previous approach and it left
+        the window in a mixed state whenever anything had been built before
+        the language was known. Rebuilding is the only way to guarantee that
+        what is on screen and the active language always agree.
+
+        Traces, overlays and every setting survive: the data lives in
+        `self.signals` and in the manager specs, none of which are owned by
+        the widgets being replaced.
+        """
+        if code == get_language():
+            return
+        set_language(code)
+        self._rebuild_ui()
+        self._save_session_soon()
+
+    def _rebuild_ui(self) -> None:
+        """Tear down and rebuild the panels, preserving all application state."""
+        settings = {}
+        for key, var in self._persisted_vars().items():
+            try:
+                settings[key] = var.get()
+            except Exception:
+                continue
+        extra_legend = self._legend_extra_entries()
+        cursors = self.cursors.to_dict()
+        annotations = self.annotations.to_dict()
+        selected, compact = self.selected_uid, self._compact
+
+        if self.overlay_window is not None and self.overlay_window.winfo_exists():
+            self.overlay_window.destroy()
+        self.overlay_window = None
+        if self._shortcuts_window is not None and self._shortcuts_window.winfo_exists():
+            self._shortcuts_window.destroy()
+        self._shortcuts_window = None
+        if self._board_window is not None and self._board_window.winfo_exists():
+            self._board_window.destroy()
+        self._board_window = None
+
+        self._plot_suspended = True
+        try:
+            for child in list(self.winfo_children()):
+                child.destroy()
+            self._build_layout()
+
+            for key, var in self._persisted_vars().items():
+                if key in settings:
+                    try:
+                        var.set(settings[key])
+                    except Exception:
+                        continue
+            if extra_legend:
+                self.legend_extra_box.insert("1.0", "\n".join(extra_legend))
+
+            self.cursors.from_dict(cursors)
+            self.annotations.from_dict(annotations)
+
+            self.selected_uid = selected if selected in self.signals else None
+            self._refresh_signal_list()
+            self._refresh_xy_combos()
+            if self.selected_uid is not None:
+                self._build_param_panel(self.selected_uid)
+            if compact:
+                self._set_compact(True)
+        finally:
+            self._plot_suspended = False
+        self.update_plot()
+
+    def _preview_width(self, uid: str, var) -> None:
+        """
+        Live preview while the weight slider moves.
+
+        Applied straight away rather than waiting for "Aplicar cambios",
+        because line weight is judged by eye: you need to see it on the plot
+        to know whether it is right. `SliderField` already debounces this to
+        one call per pause in the drag (not per pixel of motion), so a
+        `_record()` here doesn't spam the undo stack the way one per motion
+        event would -- it used to mutate `self.line_widths` with no snapshot
+        at all, which meant Ctrl+Z after adjusting a trace's width did
+        nothing (the width change silently rode along inside whatever the
+        NEXT recorded action happened to be, so undoing THAT reverted the
+        width too, as an unrelated side effect).
+        """
+        self._record(t("Ajustar grosor de traza"))
+        self.line_widths[uid] = max(0.2, _parse_float(var.get(),
+                                                      self.DEFAULT_LINE_WIDTH))
+        self.update_plot()
+
+    def _legend_extra_entries(self) -> list[str]:
+        try:
+            raw = self.legend_extra_box.get("1.0", "end")
+        except Exception:
+            return []
+        return [line.strip() for line in raw.splitlines() if line.strip()]
 
     def _legend_anchor(self) -> Optional[tuple[float, float]]:
         """(x, y) in axes fractions, only meaningful for the custom position."""
@@ -1922,7 +2624,9 @@ class App(ctk.CTk):
         x_min_disp = _parse_optional_float(self.xmin_var.get())
         x_max_disp = _parse_optional_float(self.xmax_var.get())
 
-        dec_mode = DEC_MODES.get(self.dec_mode_var.get(), "none")
+        dec_mode = self.dec_mode_var.get()
+        if dec_mode not in DEC_MODES:
+            dec_mode = "none"
         try:
             dec_value = int(float(self.dec_value_var.get().replace(",", ".")))
         except (ValueError, AttributeError):
@@ -1935,6 +2639,7 @@ class App(ctk.CTk):
             "domain": domain,
             "x_unit": x_unit,
             "y_unit": y_unit,
+            "y2_unit": self.unit_y2_var.get(),
             "x_min": x_min_disp * x_factor if x_min_disp is not None else None,
             "x_max": x_max_disp * x_factor if x_max_disp is not None else None,
             "dec_mode": dec_mode,
@@ -1954,7 +2659,10 @@ class App(ctk.CTk):
             "legend_anchor": self._legend_anchor(),
             "legend_corner": self.legend_corner_var.get(),
             "legend_ncol": max(1, int(_parse_float(self.legend_ncol_var.get(), 1.0))),
-            "bode_layout": "separate" if self.bode_layout_var.get().startswith("Separados") else "shared",
+            "legend_frameon": self.legend_frameon_var.get(),
+            "legend_title": self.legend_title_var.get().strip(),
+            "legend_extra": self._legend_extra_entries(),
+            "bode_layout": self.bode_layout_var.get(),
         }
 
     def _gather_curves(self, settings: dict, for_display: bool = True
@@ -2007,6 +2715,25 @@ class App(ctk.CTk):
     def _legend_label(self, sig: Signal) -> str:
         return sig.legend_label or sig.name
 
+    def _marker_kwargs(self, sig: Signal, color_override: Optional[str] = None) -> dict:
+        """
+        Matplotlib `plot()` kwargs for a trace's marker, or `{}` for "None".
+
+        A hollow marker keeps the trace's own colour on the edge but drops
+        the fill (`markerfacecolor="none"`) -- the "puntos vacíos" look, as
+        opposed to a solid dot/square/etc. `color_override` is for callers
+        (X/Y mode) that plot with a colour other than `sig.color`, so the
+        hollow edge still matches what is actually on screen.
+        """
+        marker = sig.marker or "None"
+        if marker == "None":
+            return {}
+        kwargs = {"marker": marker, "markersize": sig.marker_size}
+        if sig.marker_hollow:
+            kwargs["markerfacecolor"] = "none"
+            kwargs["markeredgecolor"] = color_override or sig.color
+        return kwargs
+
     def _apply_axis_cosmetics(self, ax, settings: dict, xlabel: str, ylabel: str) -> None:
         ax.set_xlabel(xlabel)
         ax.set_ylabel(ylabel)
@@ -2052,7 +2779,7 @@ class App(ctk.CTk):
         try:
             settings = self._read_settings()
         except Exception as exc:
-            messagebox.showerror("Error en ajustes", str(exc))
+            messagebox.showerror(t("Error en ajustes"), str(exc))
             return
 
         mode = settings["mode"]
@@ -2061,16 +2788,26 @@ class App(ctk.CTk):
                 n_points = self._draw_xy(settings)
             elif mode == "Diagrama de Bode":
                 n_points = self._draw_bode(settings)
+            elif mode == "Pizarra en blanco":
+                n_points = self._draw_blank(settings)
             else:
                 n_points = self._draw_standard(settings)
         except Exception as exc:
-            messagebox.showerror("Error al graficar", str(exc))
+            messagebox.showerror(t("Error al graficar"), str(exc))
             return
 
-        try:
-            self.fig.tight_layout()
-        except Exception:
-            pass   # tight_layout can fail with an outside legend; harmless
+        if self._manual_margins is None:
+            try:
+                self.fig.tight_layout()
+            except Exception:
+                pass   # tight_layout can fail with an outside legend; harmless
+        else:
+            # Manual margins win: tight_layout recomputes the layout from
+            # scratch and would discard them on every single redraw.
+            try:
+                self.fig.subplots_adjust(**self._manual_margins)
+            except (ValueError, AttributeError):
+                self._manual_margins = None
 
         # tight_layout ignores legends anchored outside the axes: reserve the
         # margin explicitly so the preview matches the exported figure.
@@ -2091,7 +2828,22 @@ class App(ctk.CTk):
             self.overlay_window.panel.refresh_all()
 
         self.canvas.draw_idle()
-        self.status_label.configure(text=f"{n_points} puntos en gráfico · modo: {mode}")
+        self.status_label.configure(text=f'{n_points} {t("puntos en gráfico")} · {t("modo")}: '
+                 f'{_labels()["modes"].get(mode, mode)}')
+
+    def _decorate_legend(self, handles: list, labels: list,
+                         settings: dict) -> tuple[list, list]:
+        """
+        Append the free-text entries to a legend's handles/labels.
+
+        Each one gets an invisible handle, which is how Matplotlib renders a
+        legend row with text but no line or marker.
+        """
+        extra = settings.get("legend_extra") or []
+        if not extra:
+            return handles, labels
+        blanks = [Line2D([], [], linestyle="none", marker="") for _ in extra]
+        return list(handles) + blanks, list(labels) + list(extra)
 
     def _finish_legend(self, ax, settings: dict, handles=None, labels=None) -> None:
         if not settings["show_legend"]:
@@ -2099,18 +2851,32 @@ class App(ctk.CTk):
         kwargs = legend_kwargs(settings["legend_pos"],
                                anchor=settings.get("legend_anchor"),
                                corner=settings.get("legend_corner", "upper left"),
-                               ncol=settings.get("legend_ncol", 1))
-        if handles is not None:
-            if handles:
-                ax.legend(handles, labels, **kwargs)
-        elif ax.get_legend_handles_labels()[0]:
-            ax.legend(**kwargs)
+                               ncol=settings.get("legend_ncol", 1),
+                               frameon=settings.get("legend_frameon", True))
+        if handles is None:
+            handles, labels = ax.get_legend_handles_labels()
+        handles, labels = self._decorate_legend(handles, labels, settings)
+        if not handles:
+            return
+        legend = ax.legend(handles, labels, **kwargs)
+        title = settings.get("legend_title")
+        if title and legend is not None:
+            legend.set_title(title)
 
     def _draw_standard(self, settings: dict) -> int:
         """
         Time / frequency mode: every visible signal on a single axes, except
         signals flagged `secondary_y` which are drawn on an independent
         right-hand Y2 axis (twinx) — a real second scale, not a gain hack.
+
+        Like `_draw_bode`'s "shared" layout, the legend is re-ordered to
+        match `signal_order` (i.e. the trace list) after drawing, instead of
+        using `ax.get_legend_handles_labels() + ax2.get_legend_handles_labels()`
+        directly: primary-axis and secondary-axis (Y2) traces are plotted in
+        two separate loops -- each internally in `signal_order`, but any Y2
+        trace interleaved with primary ones in the trace list would still
+        end up grouped as "all primary, then all Y2" in the legend, ignoring
+        where the user actually put it.
         """
         curves = self._gather_curves(settings)
         self._reset_figure(1)
@@ -2122,20 +2888,28 @@ class App(ctk.CTk):
         total = 0
         for uid, x, y in curves:
             sig = self.signals[uid]
-            y_factor = y_units_for_kind(sig.y_kind).get(settings["y_unit"], 1.0)
+            unit = settings["y2_unit"] if sig.secondary_y else settings["y_unit"]
+            y_factor = y_units_for_kind(sig.y_kind).get(unit, 1.0)
             x_disp, y_disp = x / x_factor, y / y_factor
             (secondary if sig.secondary_y else primary).append((sig, x_disp, y_disp))
             total += x.size
 
+        handle_by_uid: dict = {}
+
         for sig, xd, yd in primary:
-            ax.plot(xd, yd, linestyle=sig.linestyle, color=sig.color, label=self._legend_label(sig))
+            line, = ax.plot(xd, yd, linestyle=sig.linestyle, color=sig.color,
+                            linewidth=self._lw(sig.uid), label=self._legend_label(sig),
+                            **self._marker_kwargs(sig))
+            handle_by_uid[sig.uid] = line
 
         if secondary:
             ax2 = ax.twinx()
             self.axes = [ax, ax2]
             for sig, xd, yd in secondary:
-                ax2.plot(xd, yd, linestyle=sig.linestyle, color=sig.color,
-                         label=self._legend_label(sig))
+                line, = ax2.plot(xd, yd, linestyle=sig.linestyle, color=sig.color,
+                                 linewidth=self._lw(sig.uid),
+                                 label=self._legend_label(sig), **self._marker_kwargs(sig))
+                handle_by_uid[sig.uid] = line
 
         xlabel = settings["xlabel"] or self._default_xlabel(settings)
         ylabel = settings["ylabel"] or self._default_ylabel(
@@ -2150,14 +2924,37 @@ class App(ctk.CTk):
         if settings["title"]:
             ax.set_title(settings["title"])
 
-        h1, l1 = ax.get_legend_handles_labels()
-        h2, l2 = ax2.get_legend_handles_labels() if ax2 is not None else ([], [])
-        if settings["show_legend"] and (h1 or h2):
-            ax.legend(h1 + h2, l1 + l2, **legend_kwargs(settings["legend_pos"],
-                                                         anchor=settings.get("legend_anchor"),
-                                                         corner=settings.get("legend_corner", "upper left"),
-                                                         ncol=settings.get("legend_ncol", 1)))
+        ordered_handles = [handle_by_uid[uid] for uid, _x, _y in curves if uid in handle_by_uid]
+        ordered_labels = [self._legend_label(self.signals[uid]) for uid, _x, _y in curves
+                          if uid in handle_by_uid]
+        if settings["show_legend"] and ordered_handles:
+            self._finish_legend(ax, settings, ordered_handles, ordered_labels)
         return total
+
+    def _draw_blank(self, settings: dict) -> int:
+        """
+        "Pizarra en blanco": an empty canvas with no data, ticks or scale
+        semantics -- just a fixed 0-1 square the overlay tools (cursors and,
+        above all, the annotation set: arrows, text, boxes, reference lines)
+        can draw on freely, exactly like on top of any real signal plot.
+
+        No axis cosmetics, log scale or unit conversion apply here: those
+        are meaningless without data, so this bypasses `_apply_axis_cosmetics`
+        entirely rather than have half of the "Ejes y escalas" section do
+        nothing silently.
+        """
+        self._reset_figure(1)
+        ax = self.axes[0]
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        ax.set_aspect("auto")
+        for spine in ax.spines.values():
+            spine.set_color("0.6")
+        if settings["title"]:
+            ax.set_title(settings["title"])
+        return 0
 
     def _draw_bode(self, settings: dict) -> int:
         """
@@ -2165,14 +2962,26 @@ class App(ctk.CTk):
 
         `bode_layout == "shared"` ("Juntos") overlays both on ONE set of
         axes using a secondary Y axis (twinx): magnitude reads off the left
-        (Y1) scale, phase off the right (Y2) scale, phase always dashed and
-        colored to match its paired magnitude trace (same original signal,
-        matched via `_bode_base_key`). `"separate"` keeps two fully
-        independent stacked axes, each with its own X ticks/label and each
-        signal's own configured color/linestyle.
+        (Y1) scale, phase off the right (Y2) scale, phase drawn in its own
+        configured line style/marker but colored to match its paired
+        magnitude trace (same original signal, matched via
+        `_bode_base_key`). `"separate"` keeps two fully independent stacked
+        axes, each with its own X ticks/label and each signal's own
+        configured color/linestyle/marker.
 
         Voltage-kind signals are converted to dB on the fly so a linear AC
         sweep still renders as a proper Bode magnitude plot.
+
+        In "shared" layout the legend entries are re-assembled in
+        `signal_order` after drawing, instead of using
+        `ax.get_legend_handles_labels()` directly: drawing must plot a
+        magnitude trace right before its paired phase trace (for the
+        `_bode_base_key` match), which groups the legend into "all
+        magnitude, then all phase" if left as-is -- ignoring the order the
+        user set in the trace list. Re-ordering from `signal_order` after
+        the fact keeps the trace list's ▲/▼ controls (and the "Columnas"
+        column count) in direct control of what the legend shows and how
+        it's split into columns, in this layout too.
         """
         curves = self._gather_curves(settings)
         if not curves:
@@ -2197,10 +3006,14 @@ class App(ctk.CTk):
                 x_disp = x / x_factor
                 label = self._legend_label(sig)
                 if sig.y_kind == "deg":
-                    ax_ph.plot(x_disp, y, linestyle=sig.linestyle, color=sig.color, label=label)
+                    ax_ph.plot(x_disp, y, linestyle=sig.linestyle, color=sig.color,
+                               linewidth=self._lw(uid), label=label,
+                               **self._marker_kwargs(sig))
                 else:
                     y_db = y if sig.y_kind == "dB" else _voltage_to_db(y)
-                    ax_mag.plot(x_disp, y_db, linestyle=sig.linestyle, color=sig.color, label=label)
+                    ax_mag.plot(x_disp, y_db, linestyle=sig.linestyle,
+                                color=sig.color, linewidth=self._lw(uid),
+                                label=label, **self._marker_kwargs(sig))
                 total += x.size
 
             self._apply_axis_cosmetics(ax_mag, dict(settings, yscale="linear"), xlabel, mag_label)
@@ -2213,7 +3026,8 @@ class App(ctk.CTk):
                 ax_ph.legend(**legend_kwargs(settings["legend_pos"],
                                              anchor=settings.get("legend_anchor"),
                                              corner=settings.get("legend_corner", "upper left"),
-                                             ncol=settings.get("legend_ncol", 1)))
+                                             ncol=settings.get("legend_ncol", 1),
+                                             frameon=settings.get("legend_frameon", True)))
             return total
 
         # "Juntos": true overlay, one set of axes, dual Y scales (twinx).
@@ -2226,16 +3040,37 @@ class App(ctk.CTk):
         mag_curves = [(uid, x, y) for uid, x, y in curves if self.signals[uid].y_kind != "deg"]
         used_deg: set = set()
 
+        # Drawing has to plot every magnitude trace before its paired phase
+        # trace (so the pairing lookup below can match on `_bode_base_key`),
+        # but that draw order is NOT the order the user set in the trace
+        # list (`signal_order`): a magnitude/phase pair only ends up
+        # adjacent here when they happen to be adjacent there too. So the
+        # legend is NOT built from `ax.get_legend_handles_labels()` (which
+        # would silently reflect this draw-order grouping -- all magnitude
+        # entries, then all phase entries -- instead of what `signal_order`
+        # actually says). Instead every plotted handle is stashed by uid and
+        # the final handles/labels list is re-assembled by walking `curves`,
+        # i.e. `signal_order` itself, so reordering a trace with ▲/▼ always
+        # moves its legend entry (and, combined with "Columnas", which
+        # column it lands in) exactly where the user put it.
+        handle_by_uid: dict = {}
+
         for uid, x, y in mag_curves:
             sig = self.signals[uid]
             x_disp = x / x_factor
             y_db = y if sig.y_kind == "dB" else _voltage_to_db(y)
-            ax_mag.plot(x_disp, y_db, linestyle=sig.linestyle, color=sig.color,
-                        label=self._legend_label(sig))
+            line, = ax_mag.plot(x_disp, y_db, linestyle=sig.linestyle, color=sig.color,
+                                linewidth=self._lw(uid), label=self._legend_label(sig),
+                                **self._marker_kwargs(sig))
+            handle_by_uid[uid] = line
             total += x.size
 
             # Pair with the phase trace from the same original signal (if
-            # any): same color, always dashed, drawn on the Y2 axis.
+            # any): same color, drawn on the Y2 axis, in THAT trace's own
+            # line style -- it used to be forced dashed regardless of what
+            # was picked for it, which silently overrode a per-trace choice
+            # like "sin línea" the moment it was a phase trace paired with
+            # a magnitude one.
             key = _bode_base_key(sig.name)
             match = next((d for d in deg_curves if d[0] not in used_deg
                           and _bode_base_key(self.signals[d[0]].name) == key), None)
@@ -2243,16 +3078,20 @@ class App(ctk.CTk):
                 duid, dx, dy = match
                 used_deg.add(duid)
                 dsig = self.signals[duid]
-                ax_ph.plot(dx / x_factor, dy, linestyle="--", color=sig.color,
-                           label=self._legend_label(dsig))
+                pline, = ax_ph.plot(dx / x_factor, dy, linestyle=dsig.linestyle, color=sig.color,
+                                    linewidth=self._lw(duid),
+                                    label=self._legend_label(dsig), **self._marker_kwargs(dsig))
+                handle_by_uid[duid] = pline
                 total += dx.size
 
         for duid, dx, dy in deg_curves:
             if duid in used_deg:
                 continue
             dsig = self.signals[duid]
-            ax_ph.plot(dx / x_factor, dy, linestyle="--", color=dsig.color,
-                       label=self._legend_label(dsig))
+            line, = ax_ph.plot(dx / x_factor, dy, linestyle=dsig.linestyle, color=dsig.color,
+                               linewidth=self._lw(duid), label=self._legend_label(dsig),
+                               **self._marker_kwargs(dsig))
+            handle_by_uid[duid] = line
             total += dx.size
 
         self._apply_axis_cosmetics(ax_mag, dict(settings, yscale="linear"), xlabel, mag_label)
@@ -2261,13 +3100,11 @@ class App(ctk.CTk):
         if settings["title"]:
             ax_mag.set_title(settings["title"])
 
-        h1, l1 = ax_mag.get_legend_handles_labels()
-        h2, l2 = ax_ph.get_legend_handles_labels()
-        if settings["show_legend"] and (h1 or h2):
-            ax_mag.legend(h1 + h2, l1 + l2, **legend_kwargs(settings["legend_pos"],
-                                                             anchor=settings.get("legend_anchor"),
-                                                             corner=settings.get("legend_corner", "upper left"),
-                                                             ncol=settings.get("legend_ncol", 1)))
+        ordered_handles = [handle_by_uid[uid] for uid, _x, _y in curves if uid in handle_by_uid]
+        ordered_labels = [self._legend_label(self.signals[uid]) for uid, _x, _y in curves
+                          if uid in handle_by_uid]
+        if settings["show_legend"] and ordered_handles:
+            self._finish_legend(ax_mag, settings, ordered_handles, ordered_labels)
         return total
 
     def _draw_xy(self, settings: dict) -> int:
@@ -2312,7 +3149,8 @@ class App(ctk.CTk):
         xy_label = self.xy_legend_var.get().strip() or \
             f"{self._legend_label(sig_y)} vs {self._legend_label(sig_x)}"
         ax.plot(x_curve / fx, y_curve / fy, linestyle=sig_y.linestyle,
-                color=xy_color, label=xy_label)
+                color=xy_color, linewidth=self._lw(y_uid), label=xy_label,
+                **self._marker_kwargs(sig_y, color_override=xy_color))
 
         unit = settings["y_unit"]
         default_x = f"{self._legend_label(sig_x)} [{VOLT_UNIT_LATEX.get(unit, unit)}]"
@@ -2331,7 +3169,7 @@ class App(ctk.CTk):
     # ------------------------------------------------------------------ #
     def _export_csv(self) -> None:
         if not self.signals:
-            messagebox.showinfo("Sin señales", "Cargá al menos una señal antes de exportar.")
+            messagebox.showinfo(t("Sin señales"), t("Cargá al menos una señal antes de exportar."))
             return
 
         settings = self._read_settings()
@@ -2340,46 +3178,47 @@ class App(ctk.CTk):
         if settings["mode"] == "Modo X/Y":
             curve = getattr(self, "_xy_last_curve", None)
             if curve is None:
-                messagebox.showinfo("Sin curva X/Y",
-                                     "Generá primero una curva X/Y válida en el gráfico.")
+                messagebox.showinfo(t("Sin curva X/Y"),
+                                     t("Generá primero una curva X/Y válida en el gráfico."))
                 return
-            out_dir = filedialog.askdirectory(title="Carpeta de destino para el CSV X/Y")
+            out_dir = filedialog.askdirectory(title=t("Carpeta de destino para el CSV X/Y"))
             if not out_dir:
                 return
             try:
                 paths = export_xy_csv([curve], out_dir)
             except Exception as exc:
-                messagebox.showerror("Error al exportar", str(exc))
+                messagebox.showerror(t("Error al exportar"), str(exc))
                 return
-            messagebox.showinfo("Exportación completa",
-                                 f"Curva X/Y guardada en:\n{paths[0]}")
+            messagebox.showinfo(t("Exportación completa"),
+                                 f"{t('Curva X/Y guardada en')}:\n{paths[0]}")
             return
 
         curves = self._gather_curves(settings, for_display=False)
         if not curves:
-            messagebox.showinfo("Sin datos",
-                                 "No hay señales visibles con datos en el rango seleccionado.")
+            messagebox.showinfo(t("Sin datos"),
+                                 t("No hay señales visibles con datos en el rango seleccionado."))
             return
 
         payload = [(self.signals[uid].name, x, y,
                     self.signals[uid].domain, self.signals[uid].y_kind)
                    for uid, x, y in curves]
 
-        if self.csv_mode_var.get().startswith("Individual"):
-            out_dir = filedialog.askdirectory(title="Carpeta de destino para los CSV")
+        if self.csv_mode_var.get() == "individual":
+            out_dir = filedialog.askdirectory(title=t("Carpeta de destino para los CSV"))
             if not out_dir:
                 return
             try:
                 paths = export_csv_individual(payload, out_dir,
                                                settings["x_unit"], settings["y_unit"])
             except Exception as exc:
-                messagebox.showerror("Error al exportar", str(exc))
+                messagebox.showerror(t("Error al exportar"), str(exc))
                 return
-            messagebox.showinfo("Exportación completa",
-                                 f"Se generaron {len(paths)} archivo(s) en:\n{out_dir}")
+            messagebox.showinfo(
+                t("Exportación completa"),
+                t("Se generaron {n} archivo(s) en").format(n=len(paths)) + f":\n{out_dir}")
         else:
             out_path = filedialog.asksaveasfilename(
-                title="Guardar CSV combinado", defaultextension=".csv",
+                title=t("Guardar CSV combinado"), defaultextension=".csv",
                 filetypes=[("CSV", "*.csv")])
             if not out_path:
                 return
@@ -2387,20 +3226,21 @@ class App(ctk.CTk):
                 export_csv_combined(payload, out_path,
                                      settings["x_unit"], settings["y_unit"])
             except Exception as exc:
-                messagebox.showerror("Error al exportar", str(exc))
+                messagebox.showerror(t("Error al exportar"), str(exc))
                 return
-            messagebox.showinfo("Exportación completa", f"CSV combinado guardado en:\n{out_path}")
+            messagebox.showinfo(t("Exportación completa"),
+                                 f"{t('CSV combinado guardado en')}:\n{out_path}")
 
     def _export_figure(self) -> None:
         if not self.signals:
-            messagebox.showinfo("Sin señales", "Cargá al menos una señal antes de exportar.")
+            messagebox.showinfo(t("Sin señales"), t("Cargá al menos una señal antes de exportar."))
             return
 
         fmt = self.fig_format_var.get()
         dpi = max(50, int(_parse_float(self.dpi_var.get(), 300.0)))
 
         out_path = filedialog.asksaveasfilename(
-            title="Guardar figura", defaultextension=f".{fmt}",
+            title=t("Guardar figura"), defaultextension=f".{fmt}",
             filetypes=[(fmt.upper(), f"*.{fmt}")])
         if not out_path:
             return
@@ -2410,11 +3250,60 @@ class App(ctk.CTk):
         try:
             export_figure(self.fig, out_path, dpi=dpi)
         except Exception as exc:
-            messagebox.showerror("Error al exportar figura", str(exc))
+            messagebox.showerror(t("Error al exportar figura"), str(exc))
             return
 
         self._last_export_path = out_path
+        try:
+            session.save_figure_state(out_path, self._gather_plot_state())
+        except Exception:
+            pass   # the sidecar is a convenience: never undo a successful export
         self._show_latex_figure(out_path)
+
+    def _import_figure(self) -> None:
+        """
+        Reopen a figure exported earlier -- with every setting and signal it
+        had at export time -- from the `.labplotter.json` sidecar written
+        next to it by `_export_figure`. Restored into a NEW tab rather than
+        replacing the current one, same reasoning as `_add_tab`: importing
+        an old figure should never cost you whatever you already have on
+        screen.
+        """
+        path = filedialog.askopenfilename(
+            title=t("Importar figura..."),
+            filetypes=[(t("Ajustes de LabPlotter"), "*.labplotter.json"),
+                      (t("Todos los archivos"), "*.*")])
+        if not path:
+            return
+
+        data = session.load_figure_state(path)
+        if data is None:
+            messagebox.showerror(
+                t("No se pudo importar"),
+                t("«{name}» no es un archivo de ajustes de LabPlotter válido "
+                  "(o es de una versión incompatible).").format(
+                      name=os.path.basename(path)))
+            return
+
+        self.plot_tabs[self.active_tab].state = self._gather_plot_state()
+        name = os.path.basename(path)
+        if name.endswith(session.FIGURE_STATE_SUFFIX):
+            name = name[: -len(session.FIGURE_STATE_SUFFIX)]
+        name = name or t("Gráfico {n}").format(n=len(self.plot_tabs) + 1)
+        self.plot_tabs.append(tabs.PlotTab(name=name, state=data))
+        self.active_tab = len(self.plot_tabs) - 1
+        self._apply_plot_state(data)
+        self._refresh_tab_strip()
+
+        total = len(data.get("signals", []) or [])
+        missing = total - len(self.signal_order)
+        if missing > 0:
+            messagebox.showwarning(
+                t("Faltan archivos de origen"),
+                t("{missing} de {total} señal(es) no se pudieron recargar: "
+                  "el archivo de datos original ya no está en la misma ruta "
+                  "que cuando se exportó la figura.").format(
+                      missing=missing, total=total))
 
     def _show_latex_figure(self, out_path: str) -> None:
         r"""
@@ -2438,25 +3327,137 @@ class App(ctk.CTk):
                 out_path,
                 caption=values.get("Caption", ""),
                 label=values.get("Label", ""),
-                width=values.get("Ancho", "0.85\\linewidth"),
+                width=values.get(t("Ancho"), "0.85\\linewidth"),
                 relative_to=project_dir,
                 escape_caption=bool(values.get("__toggle__")))
 
         initial = build({"Caption": caption_var.get(), "Label": label_var.get(),
-                         "Ancho": width_var.get(), "__toggle__": False})
+                         t("Ancho"): width_var.get(), "__toggle__": False})
         CodeDialog(
-            self, "Incluir en LaTeX", initial,
+            self, t("Incluir en LaTeX"), initial,
             note=f"{latex.figure_requirements(out_path)}    ·    "
                  f"Archivo: {out_path}",
             fields=[("Caption", caption_var), ("Label", label_var),
-                    ("Ancho", width_var)],
+                    (t("Ancho"), width_var)],
             rebuild=build,
-            extra_toggle=("Escapar caracteres especiales del caption "
-                          "(desactivalo si escribís $matemática$)", False))
+            extra_toggle=(t("Escapar caracteres especiales del caption "
+                            "(desactivalo si escribís $matemática$)"), False))
+
+    # ------------------------------------------------------------------ #
+    # Multi-figure board
+    # ------------------------------------------------------------------ #
+    def _add_current_to_board(self) -> None:
+        """
+        Snapshot the figure currently on screen as one board panel: a real
+        vector PDF (what the generated LaTeX will embed) plus a lightweight
+        PNG (used only to draw the board's on-screen preview -- Matplotlib
+        cannot rasterize a PDF back into an image without an extra
+        dependency, so the raster is produced here, from the same figure,
+        instead).
+        """
+        if not self.signals:
+            messagebox.showinfo(
+                t("Sin señales"),
+                t("Cargá y configurá al menos una señal antes de "
+                  "agregar el gráfico al tablero."))
+            return
+
+        if self._board_export_dir is None:
+            chosen = filedialog.askdirectory(
+                title=t("Carpeta donde se guardan las figuras del tablero"))
+            if not chosen:
+                return
+            self._board_export_dir = chosen
+
+        title = (self.board_title_var.get().strip()
+                 or self.title_var.get().strip()
+                 or f"Figura {board.total_panels(self.board_rows) + 1}")
+
+        slug = latex.sanitize_label(title, prefix="panel").split(":", 1)[1]
+        preview_dir = os.path.join(self._board_export_dir, ".board_preview")
+        vector_path = os.path.join(self._board_export_dir, f"{slug}.pdf")
+        preview_path = os.path.join(preview_dir, f"{slug}.png")
+        n = 1
+        while os.path.exists(vector_path):
+            n += 1
+            vector_path = os.path.join(self._board_export_dir, f"{slug}_{n}.pdf")
+            preview_path = os.path.join(preview_dir, f"{slug}_{n}.png")
+
+        try:
+            export_figure(self.fig, vector_path)
+            export_figure(self.fig, preview_path, dpi=100)
+        except Exception as exc:
+            messagebox.showerror(t("Error al agregar al tablero"), str(exc))
+            return
+
+        self.board_rows[-1].append(
+            board.BoardPanel(title=title, vector_path=vector_path,
+                             preview_path=preview_path))
+        self.board_title_var.set("")
+
+        count = board.total_panels(self.board_rows)
+        self.board_status_label.configure(
+            text=f"{count} panel(es) · {self._board_export_dir}")
+
+        if self._board_window is not None and self._board_window.winfo_exists():
+            self._board_window._refresh()
+
+    def _open_board_window(self) -> None:
+        if self._board_window is not None and self._board_window.winfo_exists():
+            self._board_window.lift()
+            self._board_window.focus_force()
+            return
+        self._board_window = BoardWindow(self, self)
 
     # ------------------------------------------------------------------ #
     # Overlay layer: cursors and annotations
     # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------ #
+    # Undo / redo
+    # ------------------------------------------------------------------ #
+    DEFAULT_LINE_WIDTH = 1.4
+
+    def _lw(self, uid: str) -> float:
+        return self.line_widths.get(uid, self.DEFAULT_LINE_WIDTH)
+
+    def _snapshot(self, label: str):
+        return self.history.capture(label, self.signals, self.signal_order,
+                                    self._signal_columns, self.selected_uid,
+                                    extras=self.line_widths)
+
+    def _record(self, label: str) -> None:
+        """Call immediately *before* mutating the trace set."""
+        self.history.push(self._snapshot(label))
+
+    def _undo(self) -> None:
+        restored = self.history.undo(self._snapshot(t("Deshacer")))
+        if restored is None:
+            self.status_label.configure(text=t("Nada para deshacer."))
+            return
+        self._apply_history(restored, t("Deshecho"))
+
+    def _redo(self) -> None:
+        restored = self.history.redo(self._snapshot(t("Rehacer")))
+        if restored is None:
+            self.status_label.configure(text=t("Nada para rehacer."))
+            return
+        self._apply_history(restored, t("Rehecho"))
+
+    def _apply_history(self, snapshot, verb: str) -> None:
+        self.selected_uid = apply_snapshot(snapshot, self.signals,
+                                           self.signal_order,
+                                           self._signal_columns,
+                                           extras=self.line_widths)
+        self._sync_unit_options()
+        self._refresh_signal_list()
+        self._refresh_xy_combos()
+        if self.selected_uid is not None:
+            self._build_param_panel(self.selected_uid)
+        else:
+            self._build_param_placeholder()
+        self.update_plot()
+        self.status_label.configure(text=f"{verb}: {snapshot.label}")
+
     def _overlay_units(self) -> tuple[str, str]:
         """Units used to format the cursor readout."""
         return self.cursors.x_unit, self.cursors.y_unit
@@ -2469,7 +3470,7 @@ class App(ctk.CTk):
         self.annotations.redraw()
         self.canvas.draw_idle()
 
-    def _open_overlay_window(self, tab: str = "Cursores") -> None:
+    def _open_overlay_window(self, tab: str = "cursors") -> None:
         if self.overlay_window is not None and self.overlay_window.winfo_exists():
             self.overlay_window.panel.show_pane(tab)
             self.overlay_window.lift()
@@ -2487,9 +3488,11 @@ class App(ctk.CTk):
 
 
 def main() -> None:
-    # CustomTkinter reads the theme dictionary when each widget is built, so
-    # the palette must be installed before the window exists.
-    apply_theme("light")                  # use "dark" for the dark variant
+    # Language and palette are both read at widget-construction time, so both
+    # have to be settled before the window exists.
+    saved = session.load_session() or {}
+    set_language(saved.get("language", "es"))
+    apply_theme(saved.get("settings", {}).get("theme_mode", "light"))
     app = App()
     app.mainloop()
 

@@ -126,6 +126,67 @@ def addplot_block(csv_path: str, x_col: str, y_col: str,
     return f"{line}\n\\addlegendentry{{{legend_text}}}"
 
 
+def board_requirements() -> str:
+    """One-line note on what the preamble needs to compile `board_block()`."""
+    return (r"Requiere: \usepackage{graphicx} y \usepackage{subcaption} "
+            r"(subfiguras numeradas a, b, c...).")
+
+
+def board_block(rows: Sequence[Sequence], caption: str = "", label: str = "",
+                relative_to: Optional[str] = None, width: str = "\\linewidth",
+                subfig_gap: float = 0.02, placement: str = "htbp",
+                escape_titles: bool = True) -> str:
+    """
+    `figure` environment holding one row of `subfigure`s per board row, each
+    `\\includegraphics` pointing at that panel's own exported file and
+    captioned with its title -- the LaTeX equivalent of a `core.board`
+    layout, so the printed figure reproduces the on-screen arrangement.
+
+    `rows` is a sequence of rows, each a sequence of panel-like objects
+    exposing `.title`, `.vector_path` and `.weight` (i.e.
+    `core.board.BoardPanel`); this module does not import `core.board` so
+    the two responsibilities -- layout bookkeeping and LaTeX text -- stay
+    decoupled. Within a row, each panel's width is its `weight` normalised
+    against the row's total, minus the `subfig_gap` reserved between
+    panels; rows are separated by a `\\\\[1em]` line break, which is the
+    standard way of stacking `subfigure` rows inside one `figure`.
+    """
+    lines = [f"\\begin{{figure}}[{placement}]", "  \\centering"]
+    nonempty_rows = [row for row in rows if row]
+
+    for r, row in enumerate(nonempty_rows):
+        n = len(row)
+        gap = subfig_gap if n > 1 else 0.0
+        available = max(1.0 - gap * (n - 1), 0.05)
+        total_weight = sum(max(panel.weight, 1e-6) for panel in row)
+
+        for c, panel in enumerate(row):
+            frac = available * (max(panel.weight, 1e-6) / total_weight)
+            included = latex_path(panel.vector_path, relative_to)
+            caption_text = escape(panel.title) if escape_titles else (panel.title or "")
+            label_text = sanitize_label(panel.title or f"panel-{r + 1}-{c + 1}")
+
+            lines.append(f"  \\begin{{subfigure}}[t]{{{frac:.3f}{width}}}")
+            lines.append("    \\centering")
+            lines.append(f"    \\includegraphics[width=\\linewidth]{{{included}}}")
+            if caption_text:
+                lines.append(f"    \\caption{{{caption_text}}}")
+            lines.append(f"    \\label{{{label_text}}}")
+            lines.append("  \\end{subfigure}")
+            if c < n - 1:
+                lines.append("  \\hfill")
+
+        if r < len(nonempty_rows) - 1:
+            lines.append("  \\\\[1em]")
+
+    if caption:
+        caption_text = escape(caption) if escape_titles else caption
+        lines.append(f"  \\caption{{{caption_text}}}")
+    lines.append(f"  \\label{{{label or sanitize_label(caption or 'tablero')}}}")
+    lines.append("\\end{figure}")
+    return "\n".join(lines)
+
+
 def axis_block(plots: Sequence[str], xlabel: str = "", ylabel: str = "",
                xmode: str = "normal", ymode: str = "normal",
                grid: bool = True, width: str = "0.85\\linewidth") -> str:

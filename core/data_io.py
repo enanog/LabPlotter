@@ -101,9 +101,21 @@ class Signal:
     visible: bool = True
     linestyle: str = "-"
 
+    marker: str = "None"          # símbolo de Matplotlib ("o", "x", "+", ...); "None" = sin marcador
+    marker_size: float = 5.0      # tamaño del marcador en puntos
+    marker_hollow: bool = False   # True = marcador hueco (sin relleno, borde del color de la traza)
+
     color: Optional[str] = None          # color hex (#RRGGBB); None = automático
     legend_label: Optional[str] = None   # leyenda personalizada; None = usar `name`
     secondary_y: bool = False            # True = graficar contra un eje Y2 (twinx), sin tocar la ganancia
+
+    # Alias puramente cosmético para la lista de trazas de la GUI. A
+    # diferencia de `name` -- que además alimenta la leyenda y el eje
+    # X/Y por defecto cuando `legend_label` está vacío -- este campo no lo
+    # lee ninguna función de graficado ni de exportación: existe para poder
+    # renombrar una traza en la lista (por ejemplo, aclarar qué archivo es
+    # cada una) sin que ese cambio se filtre al gráfico.
+    display_name: Optional[str] = None
 
     def processed(self) -> tuple[np.ndarray, np.ndarray]:
         """Devuelve (x, y) en la unidad base del dominio/tipo, con offset/ganancia/inversión aplicados."""

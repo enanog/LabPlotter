@@ -660,6 +660,16 @@ class AnnotationManager:
         for key, value in kwargs.items():
             if hasattr(spec, key):
                 setattr(spec, key, value)
+        # `add()` clamps `axes_index` against `self.axes` at creation time,
+        # but this didn't: editing an annotation (e.g. via the "Actualizar"
+        # form, which still carries the axes_index it was captured with)
+        # after the plot was rebuilt with FEWER axes -- switching Bode from
+        # "Separado" (two axes) to "Juntos" (one) -- left `spec.axes_index`
+        # out of range. `_render()` then indexed `self.axes[spec.axes_index]`
+        # and raised, which `redraw()`'s broad except silently swallowed:
+        # the annotation just vanished from the canvas with no error shown.
+        if self.axes:
+            spec.axes_index = max(0, min(spec.axes_index, len(self.axes) - 1))
         return spec
 
     def remove(self, aid: int) -> None:

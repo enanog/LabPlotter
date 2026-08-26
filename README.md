@@ -31,24 +31,226 @@ main.py                 # punto de entrada
 core/
   data_io.py            # lectura robusta, detección de formato, modelo Signal
   processing.py         # recorte, diezmado por factor y por número objetivo de puntos
+  units.py              # parseo de notación de ingeniería en campos numéricos (4u7, 2.2k, -3dB)
   export.py             # estilo de publicación y exportación de datos/figuras
   layout.py             # geometría de leyenda (posiciones externas y coordenadas libres)
+  latex.py              # genera el bloque \figure / \subfigure listo para pegar en el informe
+  board.py              # modelo de datos del tablero multi-panel (filas de paneles con peso)
+  history.py            # undo/redo snapshot-based sobre el conjunto de señales
+  tabs.py               # snapshot de una pestaña completa (señales + ajustes + historial)
+  session.py            # persistencia de sesión y perfiles de exportación (fuera del repo)
+  i18n.py               # catálogo de strings es/en, keyed por el string en español
 gui/
-  app.py                # ventana principal: paneles, canvas y orquestación
+  app.py                # ventana principal: paneles, canvas, pestañas y orquestación
   theme.py              # identidad visual monocromática (CustomTkinter + chrome Matplotlib)
+  widgets.py            # controles reutilizables (campos, secciones colapsables, chips, etc.)
   overlays.py           # estado y render de cursores y anotaciones (solo Matplotlib/NumPy)
   overlay_panel.py      # paleta flotante que edita ese estado
+  board_window.py       # ventana del tablero: arma filas de paneles y exporta el layout
 ```
+
+### 2.1 `core/` — alcance y funciones de cada módulo
+
+Sin ninguna dependencia de la GUI: cada punto se puede importar y usar desde un script o probar
+de forma aislada (ver sección 13).
+
+**`data_io.py`** — carga y parseo de archivos de osciloscopio, LTspice (dominio temporal) y Bode
+de LTspice (`(-40.1dB,89.4°)`); detecta automáticamente separador de campo, separador decimal y
+codificación, y descompone las celdas complejas de Bode en dB/fase/módulo lineal.
+
+- `Signal` — dataclass con las muestras crudas, offsets, ganancia, inversión y todo ajuste visual
+  no destructivo de un canal.
+- `read_table(path, decimal_comma=False)` — lee cualquier CSV/TXT soportado con autodetección de
+  formato.
+- `build_signal(df, time_col, value_col, name, source_path, domain, y_kind, color)` — arma un
+  `Signal` a partir de dos columnas ya leídas.
+- `x_units_for_domain(domain)` / `y_units_for_kind(y_kind)` — unidades disponibles según el
+  dominio (tiempo/frecuencia) o el tipo de magnitud (voltage/dB/deg).
+
+**`processing.py`** — recorte temporal y diezmado sobre arrays ya en unidades SI.
+
+- `crop(t, v, t_min, t_max)` — recorta al intervalo `[t_min, t_max]` en segundos.
+- `decimate(t, v, factor)` — toma 1 de cada `factor` muestras.
+- `decimate_to_target(t, v, target_points)` — diezma para acercarse a una cantidad de puntos
+  objetivo.
+- `resample_uniform(t, v, n_points)` — remuestrea a una grilla uniforme de `n_points`.
+
+**`units.py`** — parseo de notación de ingeniería en los campos numéricos de la GUI (`4u7`,
+`2.2k`, `-3dB`, `10 kHz`).
+
+- `parse_eng(text, fallback=None)` / `parse_eng_or(text, fallback=0.0)` — texto → float en
+  unidades SI base; la variante `_or` nunca devuelve `None`.
+- `format_eng(value, unit="", digits=4)` — float → texto en notación de ingeniería para mostrar
+  en pantalla.
+
+**`export.py`** — estilo de publicación de Matplotlib y exportación de datos/figuras; fuerza
+`text.usetex = False` y renderiza todo con el motor **mathtext** interno.
+
+- `set_publication_style(font_family, base_fontsize, ...)` — aplica fuente, grillas y tamaños
+  antes de graficar (la misma función que usa la GUI y cualquier script headless).
+- `export_csv_individual(...)` / `export_csv_combined(...)` — CSV por señal o sobre una grilla X
+  común, listos para `\addplot table`.
+- `export_xy_csv(...)` — exporta el par paramétrico de modo X/Y.
+- `export_figure(fig, out_path, dpi=300, ...)` — guarda PDF/SVG/PGF vectorial o PNG rasterizado
+  con `bbox_inches="tight"`.
+- `_resolve_font(candidates)` — resuelve la primera fuente instalada de una lista de preferencia
+  (p. ej. Latin Modern Roman → CMU Serif → cmr10) sin romper si ninguna está instalada.
+
+**`layout.py`** — geometría de leyenda; vive separado de `export.py` porque exportar datos y
+posicionar una leyenda son responsabilidades distintas.
+
+- `is_outside(position)` — indica si una posición de leyenda cae fuera del área de ejes.
+- `legend_kwargs(position, ...)` — traduce una posición (incluidas las `outside …` y la
+  personalizada por coordenadas) a kwargs de `Axes.legend()`.
+- `reserve_legend_space(...)` — reserva el margen que `tight_layout()` no puede calcular solo
+  cuando la leyenda queda anclada fuera del área de ejes.
+
+**`latex.py`** — genera el bloque LaTeX que reproduce en el informe lo que la GUI acaba de
+exportar, con paths siempre en forward slashes.
+
+- `figure_block(path, caption, label, ...)` — bloque `figure` completo
+  (`\includegraphics`/`\input` según el tipo de archivo).
+- `board_block(rows, caption, label, ...)` — bloque `figure` con un `subfigure` por panel del
+  tablero, reproduciendo el mismo layout de filas.
+- `axis_block(plots, xlabel, ylabel, ...)` — bloque `pgfplots` a partir de los CSV exportados.
+- `sanitize_label(text, prefix="fig")` / `escape(text)` / `latex_path(path, relative_to=None)` —
+  utilidades de saneamiento de labels, texto y paths para los bloques anteriores.
+- `figure_requirements(path)` / `board_requirements()` — paquetes LaTeX (`\usepackage{...}`) que
+  necesita el bloque generado.
+
+**`board.py`** — modelo de datos del tablero multi-panel: filas de `BoardPanel`, cada panel con
+título y peso relativo dentro de su fila.
+
+- `BoardPanel` — un panel: figura ya exportada, título y peso.
+- `new_row()` — fila vacía para empezar a agregar paneles.
+- `validate_board(rows)` — errores de layout (fila vacía, panel sin archivo, etc.) antes de
+  exportar.
+- `compose_preview_figure(...)` — arma la figura combinada que se previsualiza en
+  `gui/board_window.py`.
+- `export_individual_pdfs(rows, out_dir)` — copia cada panel a `out_dir`, de-duplicando nombres
+  por el archivo de salida real (base + sufijo + extensión), no solo por el slug base.
+- `slugify_filename(text, fallback="panel")` — título de panel → nombre de archivo válido.
+
+**`history.py`** — undo/redo *snapshot-based* sobre el conjunto de señales (ver sección 15).
+
+- `Snapshot` — copia de los atributos mutables de cada señal más el orden, en un punto del tiempo.
+- `History` — pila de snapshots con `undo`/`redo`.
+- `apply_snapshot(snapshot, signals, order, ...)` — restaura un snapshot sobre el estado vivo.
+
+**`tabs.py`** — snapshot de una pestaña completa (ver sección 14).
+
+- `PlotTab` — nombre + `state` (lo que devuelve `App._gather_plot_state`) + `history` propio de
+  esa pestaña.
+
+**`session.py`** — persistencia de sesión y perfiles de exportación en JSON, fuera del
+repositorio (bajo el directorio de configuración del usuario).
+
+- `load_session()` / `save_session(state)` / `clear_session()` — sesión completa ("qué había en
+  pantalla la última vez").
+- `load_profiles()` / `save_profiles(profiles)` / `upsert_profile(name, values)` /
+  `delete_profile(name)` — perfiles de exportación con nombre.
+- `save_figure_state(fig_path, state)` / `load_figure_state(path)` — el sidecar
+  `<figura>.labplotter.json` que usa "Importar figura..." (sección 9).
+- `config_dir()` — directorio de configuración resuelto según el sistema operativo.
+
+**`i18n.py`** — catálogo de strings es/en, keyed por el string en español (ver sección 18).
+
+- `t(text)` — traduce si hay entrada para el idioma activo; si no, devuelve el español recibido.
+- `set_language(code)` / `get_language()` / `language_name(code=None)` — idioma activo.
+- `missing()` / `coverage()` — strings sin traducir y cobertura, para detectar huecos.
+
+### 2.2 `gui/` — alcance y funciones de cada módulo
+
+**`app.py`** — ventana principal: `App(ctk.CTk)` orquesta todo, agrupado por responsabilidad
+(125 métodos en total; no se listan uno por uno):
+
+- *Ciclo de vida y sesión* — `__init__`, `_persisted_vars`, `_gather_state`/`_apply_state`,
+  `_restore_session_if_any`, `_save_session_soon`, `_on_close`.
+- *Pestañas* — `_gather_plot_state`/`_apply_plot_state`, `_switch_tab`, `_add_tab`, `_close_tab`,
+  `_rename_tab`, `_refresh_tab_strip`.
+- *Carga de archivos* — `_load_files`, `_ingest_files`, `_enable_drag_and_drop` y sus callbacks
+  `_on_files_dropped`/`_on_drop_enter`/`_on_drop_leave`, `ColumnSelectDialog` (selección de
+  columnas Y en archivos multicanal).
+- *Panel de señales y parámetros* — `_refresh_signal_list`, `_build_param_panel`,
+  `_sync_unit_options`, `_move_signal`, `_remove_selected_signal`/`_remove_all_signals`,
+  `_pick_row_color`.
+- *Graficado* — `update_plot`, `_draw_standard` (Tiempo/Frecuencia), `_draw_bode`, `_draw_xy`,
+  `_gather_curves`, `_apply_axis_cosmetics`, `_decorate_legend`/`_finish_legend`.
+- *Deshacer/rehacer* — `_snapshot`, `_record`, `_undo`, `_redo`, `_apply_history` (ver sección 15).
+- *Exportación* — `_export_csv`, `_export_figure`, `_import_figure`, `_show_latex_figure`.
+- *Tablero* — `_add_current_to_board`, `_open_board_window`.
+- *Overlays* — `_refresh_overlays`, `_open_overlay_window`, `_on_overlay_closed`.
+- *Ajustes globales / tema / idioma* — `_build_right_panel` y sus secciones
+  (`_build_axes_section`, `_build_labels_section`, `_build_legend_section`, `_build_data_section`,
+  `_build_export_section`), `_on_theme_change`, `_on_language_change`, `_on_font_change`.
+- `SubplotConfigDialog` — diálogo de márgenes de subgráfico (equivalente propio al *Configure
+  subplots* de Matplotlib, con persistencia).
+- `EditableNavigationToolbar` — barra de herramientas de Matplotlib extendida.
+- `main()` — punto de entrada real que usa `main.py`.
+
+**`theme.py`** — identidad visual monocromática, aplicada en dos capas (ver sección 4).
+
+- `apply_theme(mode="light")` / `set_theme_mode(mode)` — instala/cambia el tema sobre el árbol de
+  widgets ya construido, sin reconstruirlo.
+- `apply_plot_chrome(fig)` / `style_matplotlib_toolbar(toolbar, mode="light")` — chrome de
+  Matplotlib (ejes, grilla, toolbar) a tono con el tema activo.
+- `col(token)` / `tk_color(token)` — color `[claro, oscuro]` resuelto para el modo activo.
+- `font(role="body", size=None, ...)` / `family(role="serif")` — tipografía consistente por rol.
+- `set_font_scale(factor)` / `font_scale()` — escala global de fuente de la interfaz.
+- `spaced(text)` — texto con tracking manual, para los títulos de sección en versalitas.
+
+**`widgets.py`** — primitivas estilizadas compartidas por toda la interfaz; centralizarlas es lo
+que impide que un widget se aparte del tema (ningún color o fuente se escribe en el sitio de uso).
+
+- Campos: `entry_field`, `text_field`, `combo_field`, `check_field`, `segmented_field`,
+  `stacked_entry`, `SliderField`, `LabeledCombo`.
+- Estructura: `StaticSection`/`SectionGroup` (secciones colapsables), `SectionHeader`, `Rule`/
+  `VRule` (filetes), `Splitter` (panel redimensionable).
+- Controles: `primary_button`, `ghost_button`, `ToolButton`, `Segmented`, `Chip`, `hint`.
+- Filas y diálogos específicos: `TraceRow` (fila de señal en el panel izquierdo),
+  `MeasurementsCard`, `TextPrompt`, `ShortcutsWindow`, `CodeDialog`.
+
+**`overlays.py`** — estado e interacción de cursores y anotaciones sobre el canvas; solo
+Matplotlib/NumPy, sin CustomTkinter (ver secciones 7 y 8).
+
+- `CursorManager` — banco de cursores: colocación, arrastre con *snap*, lectura por curva y
+  cálculo de deltas entre cursores de la misma orientación.
+- `AnnotationManager` — anotaciones de calidad de informe: puntos de interés, flechas, líneas y
+  bandas de referencia, texto libre.
+- `CursorSpec` / `AnnotationSpec` — dataclasses de un cursor/anotación individual.
+- `save_overlays(path, cursors, ...)` / `load_overlays(path, cursors, ...)` — serialización a
+  JSON del conjunto completo.
+- `_crossings(x, y, level, ...)` — cruces de una curva con un nivel dado (lectura de cursor
+  horizontal), interpolados linealmente.
+
+**`overlay_panel.py`** — frente CustomTkinter de `gui.overlays`: paleta flotante no modal
+(nunca llama `grab_set()`, porque hay que poder clickear el canvas con la paleta abierta).
+
+- `OverlayPanel` — el contenido de la paleta: banco de cursores + editor de anotaciones.
+- `OverlayWindow` — el `CTkToplevel` que aloja al panel anterior.
+- `refresh_cursor_ui()` — sincroniza los campos del cursor seleccionado tras un arrastre.
+
+**`board_window.py`** — ventana del tablero: arma filas de paneles ya exportados, previsualiza el
+layout y exporta los archivos individuales más el bloque LaTeX (ver sección 17).
+
+- `BoardWindow` — edita `app.board_rows` in place: agregar un panel desde la ventana principal
+  mientras el tablero está cerrado, o reabrirlo después, siempre ve el estado vivo.
+- `_parse_weight(text, fallback=1.0)` — texto de peso de panel → float, con valor por defecto si
+  no es un número válido.
 
 Separación de responsabilidades:
 
-- **`core/`** no importa nada de la GUI. Es scriptable y testeable de forma aislada.
+- **`core/`** no importa nada de la GUI ni de CustomTkinter. Es scriptable y testeable de forma
+  aislada (ver sección 13); `core/i18n.py`, `core/history.py`, `core/tabs.py` y `core/board.py`
+  son datos y lógica pura por la misma razón, aunque solo la GUI los use en la práctica.
 - **`gui/overlays.py`** no importa CustomTkinter: guarda *estado* (dataclasses), no widgets. Por
   eso los cursores y las anotaciones sobreviven al ciclo completo de `fig.clear()` + re-graficado
   que ejecuta `App.update_plot()`, y por eso el conjunto puede serializarse a JSON y recargarse
   para reproducir una figura idéntica.
 - **`gui/overlay_panel.py`** es el único módulo que conoce widgets de overlays; edita el estado y
   pide a la aplicación que vuelva a renderizar la capa mediante un callback.
+- **`gui/board_window.py`** edita `app.board_rows` (`list[core.board.BoardRow]`) in place: no hay
+  una copia separada que sincronizar entre la ventana principal y la del tablero.
 
 ---
 
@@ -66,12 +268,17 @@ python main.py
 ```
 customtkinter>=5.2.0   # solo GUI (main.py)
 matplotlib>=3.7        # GUI + core/ headless
-numpy>=1.24             # GUI + core/ headless
-pandas>=2.0             # GUI + core/ headless
+numpy>=1.24            # GUI + core/ headless
+pandas>=2.0            # GUI + core/ headless
+tkinterdnd2>=0.1.0     # solo GUI: arrastrar y soltar archivos (opcional, ver más abajo)
 ```
 
+`tkinterdnd2` es la única dependencia con degradación explícita: si no está instalada, `gui/app.py`
+lo detecta en el import (`try/except ImportError`) y deshabilita el *drag & drop* mostrando un
+aviso en la interfaz, en vez de fallar al arrancar. El resto de la GUI funciona igual.
+
 Para usar únicamente `core/` desde un script, sin la GUI (ver sección 13), no hace falta
-`customtkinter`: alcanza con
+`customtkinter` ni `tkinterdnd2`: alcanza con
 
 ```bash
 pip install matplotlib pandas numpy
@@ -116,8 +323,10 @@ flotante de cursores y anotaciones.
 | **Modo X/Y** | Curvas paramétricas y figuras de Lissajous a partir de dos canales |
 | **Diagrama de Bode** | Magnitud y fase, superpuestas (`Y1/Y2`) o en subgráficos independientes |
 
-Ajustes por canal: offsets, ganancia, inversión, estilo de línea, color, etiqueta de leyenda, eje
-secundario, dominio y tipo de magnitud. Ajustes globales: unidades, escalas lineal/logarítmica,
+Ajustes por canal: offsets, ganancia (solo tiene efecto en señales de tipo `voltage`; para dB o
+fase se usa el offset en Y), inversión, estilo y grosor de línea, marcador (con tamaño y variante
+hueca/rellena), color, etiqueta de leyenda, eje secundario, dominio y tipo de magnitud. Ajustes
+globales: unidades, escalas lineal/logarítmica,
 grilla mayor y menor densa (subdivisiones 2–9 por década), notación de ingeniería en los ejes
 logarítmicos (1, 10, 100, 1k, 10k, 1M), márgenes de subgráfico y tipografía.
 
@@ -232,6 +441,12 @@ mucho después, o versionar el conjunto junto al informe.
 `bbox_inches="tight"` y fuentes embebidas (`pdf.fonttype = 42`), manteniendo el texto
 seleccionable. Los cursores y anotaciones visibles forman parte del vectorial exportado.
 
+**Importar figura:** cada exportación deja, junto al archivo de la figura, un sidecar
+`<nombre>.labplotter.json` con los datos, señales y ajustes que la generaron. `Importar
+figura...` lee ese sidecar y reconstruye la pestaña completa (equivalente a abrir el `.json` de
+sesión de esa figura puntual), para retomar y ajustar una figura ya exportada sin tener que
+recordar qué offsets, colores o recorte se usaron.
+
 ---
 
 ## 10. Robustez de lectura
@@ -253,6 +468,8 @@ seleccionable. Los cursores y anotaciones visibles forman parte del vectorial ex
 |---|---|
 | Borrar la señal seleccionada | `Supr` / `Retroceso` (excepto dentro de un campo de texto) |
 | Aplicar un valor numérico | `Enter` en el campo correspondiente |
+| Deshacer / rehacer | `Ctrl+Z` / `Ctrl+Y` (ver sección 15) |
+| Cargar archivos | Diálogo estándar, o arrastrarlos y soltarlos sobre la ventana (`tkinterdnd2`; se avisa en la interfaz si no está instalado) |
 | Márgenes del subgráfico | Botón *Configure subplots* de la barra de Matplotlib |
 | Abrir la paleta de overlays | Botón **Cursores / Anotaciones...** sobre el canvas |
 
@@ -353,3 +570,56 @@ onda cuadrada/triangular, mediciones punto a punto) a partir de los CSV/TXT crud
 los antiguos diagramas `pgfplots` embebidos en el `.tex` por `\includegraphics` de los PDF
 exportados. Sirve como referencia de cómo estructurar un script de generación en lote para un
 informe con muchas figuras.
+
+---
+
+## 14. Pestañas
+
+Cada pestaña (`+` en la barra superior) es un plot completo e independiente: sus propias señales,
+modo de graficado y ajustes. Cambiar de pestaña guarda instantáneamente el estado de la que se
+deja (incluida su propia pila de deshacer/rehacer, ver sección 15) y restaura el de la que se
+abre; no comparten nada entre sí salvo, opcionalmente, terminar en el mismo tablero (sección 17).
+Se persisten en la sesión (nombre y ajustes; el historial de deshacer no, ver sección 15).
+
+## 15. Deshacer / rehacer
+
+`Ctrl+Z` / `Ctrl+Y` deshacen y rehacen cualquier cambio sobre el conjunto de señales: carga y
+borrado de canales, todo ajuste por canal (offsets, ganancia, inversión, color, estilo y grosor
+de línea, marcador, eje secundario, etiqueta de leyenda) y su orden. La estrategia es por
+*snapshot* y no por comando (ver `core/history.py`): antes de cada acción se guarda una copia de
+los atributos mutables de cada señal (no de las muestras crudas, que pueden ser millones de
+puntos), así que deshacer nunca necesita una inversa escrita a mano por acción, a costa de algo
+más de memoria por paso. El historial es propio de cada pestaña y no sobrevive a un cierre y
+reapertura de la aplicación (no tendría sentido restaurarlo entre sesiones distintas).
+
+## 16. Sesión y perfiles de exportación
+
+`core/session.py` guarda automáticamente, al cerrar la aplicación, todo lo necesario para
+continuar donde se dejó: archivos cargados, ajustes por canal, ajustes globales, geometría de
+ventana y anchos de panel, en un JSON fuera del repositorio (bajo el directorio de configuración
+del usuario, así que sobrevive a un `git clean` y no necesita entrada en `.gitignore`). Se
+restaura solo al abrir. Un archivo de sesión corrupto o ausente nunca impide arrancar: se ignora
+y se empieza de cero.
+
+Aparte de la sesión, se pueden guardar **perfiles de exportación** con nombre (formato, DPI, modo
+de CSV, coma decimal) para cambiar entre configuraciones de exportación habituales sin tener que
+reconfigurar cada campo.
+
+## 17. Tablero multi-panel
+
+Además de exportar una figura a la vez, cada plot puede agregarse como panel a un **tablero**
+(`core.board`, ventana en `gui/board_window.py`): varias figuras ya generadas se acomodan en
+filas, cada panel con su propio título y peso relativo dentro de la fila (paneles iguales, uno
+grande arriba y dos chicos abajo, un grid de 2x3 como tres filas de a dos, etc.). El tablero
+exporta los archivos vectoriales individuales de cada panel más el bloque LaTeX
+(`core.latex.board_block`) que reproduce exactamente ese mismo layout en el informe, vía
+`subfigure`.
+
+## 18. Interfaz bilingüe
+
+Toda la interfaz (`core/i18n.py`) está disponible en español e inglés, con el conmutador
+**Idioma** en el panel de ajustes globales. El catálogo está *keyed* por el string en español, no
+por un identificador inventado: una traducción faltante cae de nuevo en el español legible en vez
+de mostrar una clave cruda, así que un hueco de traducción es un detalle cosmético y no una
+pantalla rota. Cambiar el idioma reconstruye los paneles en el acto, para que lo que está en
+pantalla y el idioma activo nunca queden desincronizados.

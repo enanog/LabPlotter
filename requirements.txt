@@ -1,5 +1,5 @@
 customtkinter>=5.2.0   # solo GUI (main.py); no requerido para uso headless de core/
-matplotlib>=3.7
-numpy>=1.24
-pandas>=2.0
-tkinterdnd2>=0.1.0
+matplotlib>=3.7        # GUI + core/ headless
+numpy>=1.24            # GUI + core/ headless
+pandas>=2.0            # GUI + core/ headless
+tkinterdnd2>=0.1.0     # solo GUI: drag & drop de archivos; opcional, se degrada con aviso si falta

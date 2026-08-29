@@ -1372,7 +1372,17 @@ class App(ctk.CTk):
             })
 
         return {"settings": settings, "signals": signals,
-                "manual_margins": self._manual_margins}
+                "manual_margins": self._manual_margins,
+                # Cursors/annotations live in ONE shared CursorManager/
+                # AnnotationManager instance for the whole app (see __init__),
+                # since `update_plot()` re-attaches them to whatever axes it
+                # just rebuilt on every redraw -- they were never scoped to a
+                # tab on their own. Snapshotting them here, and reloading them
+                # in `_apply_plot_state`, is what makes each tab keep its own
+                # cursors/annotations instead of the same set bleeding into
+                # whichever tab happens to be on screen.
+                "cursors": self.cursors.to_dict(),
+                "annotations": self.annotations.to_dict()}
 
     def _tab_persisted_vars(self) -> dict[str, "ctk.Variable"]:
         """
@@ -1441,6 +1451,13 @@ class App(ctk.CTk):
         self._refresh_signal_list()
         self._refresh_xy_combos()
         self._build_param_placeholder()
+
+        # Swap in THIS tab's own cursors/annotations -- `from_dict` clears
+        # whatever the previously active tab had left in the shared managers
+        # first, so a tab with none of its own starts clean instead of still
+        # showing the last tab's cursors/annotations (see `_gather_plot_state`).
+        self.cursors.from_dict(data.get("cursors") or {})
+        self.annotations.from_dict(data.get("annotations") or {})
 
         self._plot_suspended = True
         try:

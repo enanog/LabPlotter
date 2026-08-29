@@ -73,6 +73,40 @@ def _write_json(path: Path, payload: dict) -> bool:
 
 
 # ========================================================================== #
+# Portabilidad de rutas entre computadoras
+# ========================================================================== #
+def _iter_signal_lists(payload: dict):
+    """Recorre toda lista de registros de señales dentro de un payload de
+    sesión/sidecar: la plana de nivel superior (legacy + sidecars de figura)
+    y la de cada tab, si existen."""
+    if isinstance(payload.get("signals"), list):
+        yield payload["signals"]
+    for tab in payload.get("tabs", []) or []:
+        state = tab.get("state") if isinstance(tab, dict) else None
+        if isinstance(state, dict) and isinstance(state.get("signals"), list):
+            yield state["signals"]
+
+
+def _stamp_relative_paths(payload: dict, anchor_dir: Path) -> None:
+    """
+    Agrega `source_rel` a cada registro de señal, relativo a `anchor_dir`
+    (la carpeta donde este mismo JSON está por escribirse). Best-effort:
+    en Windows, `os.path.relpath` levanta ValueError si origen y ancla
+    están en discos distintos -- en ese caso sobrevive solo la ruta
+    absoluta (ver `core.data_io.resolve_source_path`).
+    """
+    for signals in _iter_signal_lists(payload):
+        for record in signals:
+            src = record.get("source_path")
+            if not src:
+                continue
+            try:
+                record["source_rel"] = os.path.relpath(src, anchor_dir)
+            except ValueError:
+                record.pop("source_rel", None)
+
+
+# ========================================================================== #
 # Session ("last project")
 # ========================================================================== #
 def session_path() -> Path:
@@ -89,6 +123,7 @@ def load_session() -> Optional[dict]:
 
 def save_session(state: dict) -> bool:
     payload = {"version": SESSION_VERSION, **state}
+    _stamp_relative_paths(payload, config_dir())
     return _write_json(session_path(), payload)
 
 
@@ -160,6 +195,7 @@ def save_figure_state(fig_path: str, state: dict) -> bool:
     """Write the sidecar for `fig_path`. Best-effort: a failure here must
     never undo an export that already succeeded."""
     payload = {"version": FIGURE_STATE_VERSION, **state}
+    _stamp_relative_paths(payload, Path(fig_path).parent)
     return _write_json(figure_state_path(fig_path), payload)
 
 

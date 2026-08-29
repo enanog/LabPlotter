@@ -36,7 +36,8 @@ except Exception:
 
 from core.data_io import (
     FREQ_UNIT_LATEX, TIME_UNIT_LATEX, VOLT_UNIT_LATEX,
-    Signal, build_signal, read_table, x_units_for_domain, y_units_for_kind,
+    Signal, build_missing_signal, build_signal, read_table,
+    resolve_source_path, x_units_for_domain, y_units_for_kind,
 )
 from core.export import (
     FONT_FAMILIES, export_csv_combined, export_csv_individual,
@@ -852,19 +853,37 @@ class App(ctk.CTk):
             "active_tab": self.active_tab,
         }
 
-    def _restore_signal(self, record: dict) -> bool:
-        path = record.get("source_path")
+    def _restore_signal(self, record: dict, anchor_dir: Optional[str] = None) -> bool:
+        """
+        Replay one saved signal record. `anchor_dir` is the folder of the
+        JSON currently being loaded (session config dir, or a
+        *.labplotter.json sidecar's own folder) -- it is what lets
+        `resolve_source_path` find the data file again when the absolute
+        path from another machine no longer exists.
+
+        A record whose file can't be found is NOT dropped: it survives as a
+        "missing" placeholder (see `build_missing_signal`) so its settings,
+        order and legend entry aren't lost, and the user can reconnect it by
+        hand from the trace list (`_relink_signal`).
+        """
         x_col, y_col = record.get("x_col"), record.get("y_col")
-        if not path or not x_col or not y_col or not os.path.isfile(path):
-            return False
-        try:
-            df, _col_kind = read_table(path, decimal_comma=self.decimal_comma_var.get())
-            sig = build_signal(df, x_col, y_col, record.get("name") or "señal", path,
-                               domain=record.get("domain", "time"),
-                               y_kind=record.get("y_kind", "voltage"),
-                               color=record.get("color") or self._next_color())
-        except Exception:
-            return False   # file moved/changed/corrupted: skip, don't crash
+        if not x_col or not y_col:
+            return False   # no columns to replay with -- nothing to keep either
+
+        sig = None
+        resolved = resolve_source_path(record, anchor_dir)
+        if resolved:
+            try:
+                df, _col_kind = read_table(resolved, decimal_comma=self.decimal_comma_var.get())
+                sig = build_signal(df, x_col, y_col, record.get("name") or "señal", resolved,
+                                   domain=record.get("domain", "time"),
+                                   y_kind=record.get("y_kind", "voltage"),
+                                   color=record.get("color") or self._next_color())
+            except Exception:
+                sig = None   # found but unreadable/corrupted: fall through to placeholder
+
+        if sig is None:
+            sig = build_missing_signal(record, color=record.get("color") or self._next_color())
 
         for attr in ("unit_t_in", "unit_v_in", "t_offset", "v_offset", "gain",
                     "invert", "linestyle", "marker", "marker_size",
@@ -873,7 +892,10 @@ class App(ctk.CTk):
                 setattr(sig, attr, record[attr])
         sig.legend_label = record.get("legend_label")
         sig.display_name = record.get("display_name")
-        sig.visible = record.get("visible", True)
+        # A missing placeholder has nothing to draw -- force it hidden
+        # regardless of what was saved, so it doesn't show as an empty
+        # legend entry until it's reconnected.
+        sig.visible = record.get("visible", True) and not sig.missing
         self.line_widths[sig.uid] = float(
             record.get("line_width", self.DEFAULT_LINE_WIDTH))
 
@@ -881,6 +903,96 @@ class App(ctk.CTk):
         self.signal_order.append(sig.uid)
         self._signal_columns[sig.uid] = (x_col, y_col)
         return True
+
+    def _replace_missing_signal(self, uid: str, path: str) -> bool:
+        """
+        Swap the placeholder `Signal` at `uid` for real data read from
+        `path`, keeping every cosmetic/replay setting it already had
+        (offsets, gain, color, legend, marker, visibility...). Returns
+        False -- leaving the placeholder untouched -- if `path` can't be
+        read with the x/y columns this trace was originally saved under,
+        e.g. it turns out to be an unrelated file that just shares a name.
+        """
+        sig = self.signals.get(uid)
+        if sig is None:
+            return False
+        x_col, y_col = self._signal_columns.get(uid, (None, None))
+        if not x_col or not y_col:
+            return False
+        try:
+            df, _col_kind = read_table(path, decimal_comma=self.decimal_comma_var.get())
+            new_sig = build_signal(df, x_col, y_col, sig.name, path,
+                                   domain=sig.domain, y_kind=sig.y_kind, color=sig.color)
+        except Exception:
+            return False
+
+        for attr in ("unit_t_in", "unit_v_in", "t_offset", "v_offset", "gain",
+                    "invert", "linestyle", "marker", "marker_size",
+                    "marker_hollow", "secondary_y", "legend_label", "display_name"):
+            setattr(new_sig, attr, getattr(sig, attr))
+        new_sig.visible = True
+        new_sig.uid = uid   # keep identity: signal_order/line_widths/selection key off this
+        self.signals[uid] = new_sig
+        return True
+
+    def _relink_signal(self, uid: str) -> None:
+        """
+        Manually point a 'missing' trace at its new location via a file
+        dialog, then piggy-back on that pick to resolve every OTHER missing
+        trace that originally lived in the same folder: if the folder the
+        user just pointed to also contains a file with each one's original
+        basename, it's reconnected automatically too -- this is the common
+        case of a whole batch of CSVs that got moved/synced together (e.g.
+        a OneDrive folder under a new root on another computer), so the
+        person doesn't have to repeat this dialog once per trace.
+        """
+        sig = self.signals.get(uid)
+        if sig is None or not sig.missing:
+            return
+
+        initial_dir = os.path.dirname(sig.source_rel or sig.source_path or "") or None
+        path = filedialog.askopenfilename(
+            title=t("Reconectar archivo de origen"), initialdir=initial_dir,
+            filetypes=[(t("Archivos de datos"), "*.csv *.txt"),
+                      (t("Todos los archivos"), "*.*")])
+        if not path:
+            return
+
+        if not self._replace_missing_signal(uid, path):
+            messagebox.showerror(
+                t("No se pudo reconectar"),
+                t("El archivo elegido no tiene las columnas esperadas para esta traza."))
+            return
+
+        # Other still-missing traces that originally sat in the very same
+        # folder as this one: try their own basename inside the folder just
+        # picked. Silent/best-effort -- a miss here just leaves that trace
+        # missing, same as before.
+        old_dir = os.path.dirname(sig.source_path or "")
+        new_dir = os.path.dirname(path)
+        resolved_extra = 0
+        if old_dir:
+            for other_uid in list(self.signal_order):
+                if other_uid == uid:
+                    continue
+                other = self.signals.get(other_uid)
+                if other is None or not other.missing or not other.source_path:
+                    continue
+                if os.path.dirname(other.source_path) != old_dir:
+                    continue
+                candidate = os.path.join(new_dir, os.path.basename(other.source_path))
+                if os.path.isfile(candidate) and self._replace_missing_signal(other_uid, candidate):
+                    resolved_extra += 1
+
+        self._refresh_signal_list()
+        self._refresh_xy_combos()
+        self.update_plot()
+        self._save_session_soon()
+        if resolved_extra:
+            messagebox.showinfo(
+                t("Señales reconectadas"),
+                t("Se reconectaron automáticamente {n} señal(es) más desde "
+                  "la misma carpeta.").format(n=resolved_extra))
 
     def _apply_state(self, data: dict) -> None:
         geometry = data.get("geometry")
@@ -923,10 +1035,15 @@ class App(ctk.CTk):
             self.active_tab = 0
 
         self._refresh_tab_strip()
+        # Anchor for path resolution: tabs not yet visited this run still
+        # carry raw (unresolved) records straight from session.json, so
+        # `_switch_tab` needs this too, not just the tab restored right now.
+        self._session_anchor_dir = str(session.config_dir())
         # Restoring a whole session (as opposed to switching tabs) is the one
         # case with no "previous tab" to keep the app-wide theme from, so it
         # is the one caller that restores `theme_mode` too.
-        self._apply_plot_state(self.plot_tabs[self.active_tab].state, restore_theme=True)
+        self._apply_plot_state(self.plot_tabs[self.active_tab].state, restore_theme=True,
+                               anchor_dir=self._session_anchor_dir)
 
     def _restore_session_if_any(self) -> bool:
         data = session.load_session()
@@ -1269,7 +1386,8 @@ class App(ctk.CTk):
         return {k: v for k, v in self._persisted_vars().items() if k != "theme_mode"}
 
     def _apply_plot_state(self, data: dict, restore_theme: bool = False,
-                          history: Optional[History] = None) -> None:
+                          history: Optional[History] = None,
+                          anchor_dir: Optional[str] = None) -> None:
         """
         Load ONE plot's settings + signals as the live state, replacing
         whatever was previously on screen. Shared by whole-session restore
@@ -1285,6 +1403,10 @@ class App(ctk.CTk):
         did nothing, because its history was gone. `None` (a genuinely new
         or restored-from-session tab, which has no meaningful prior history)
         still gets a fresh `History()`.
+
+        `anchor_dir` is forwarded to `_restore_signal` for each signal
+        record -- the folder to resolve a moved/renamed `source_path`
+        against (see `core.data_io.resolve_source_path`).
         """
         settings = data.get("settings", {}) or {}
         varmap = self._persisted_vars() if restore_theme else self._tab_persisted_vars()
@@ -1313,7 +1435,7 @@ class App(ctk.CTk):
         self.line_widths = {}
         self.selected_uid = None
         for record in data.get("signals", []):
-            self._restore_signal(record)
+            self._restore_signal(record, anchor_dir)
 
         self._sync_unit_options()
         self._refresh_signal_list()
@@ -1341,13 +1463,41 @@ class App(ctk.CTk):
         self.plot_tabs[self.active_tab].history = self.history
         self.active_tab = index
         self._apply_plot_state(self.plot_tabs[index].state,
-                               history=self.plot_tabs[index].history)
+                               history=self.plot_tabs[index].history,
+                               anchor_dir=getattr(self, "_session_anchor_dir", None))
         self._refresh_tab_strip()
+
+    def _next_tab_name(self) -> str:
+        """
+        Smallest "Gráfico N" not currently in use by any open tab.
+
+        Previously this was `len(self.plot_tabs) + 1`: a plain tab COUNT,
+        not a name lookup. Close or rename "Gráfico 1" and every future new
+        tab still starts counting from however many tabs happen to be open
+        right now -- "Gráfico 1" is never offered again, and closing tabs
+        down and adding new ones can even hand out an already-used name
+        (e.g. close #1 with two tabs open, add one: count-based naming
+        gives "Gráfico 2" again, colliding with the tab that survived).
+        Picking the lowest free number instead reuses "Gráfico 1" as soon
+        as it's free and never repeats a name still in use.
+        """
+        template = t("Gráfico {n}")
+        prefix, _, suffix = template.partition("{n}")
+        pattern = re.compile(re.escape(prefix) + r"(\d+)" + re.escape(suffix) + r"$")
+        used = set()
+        for tab in self.plot_tabs:
+            m = pattern.match(tab.name or "")
+            if m:
+                used.add(int(m.group(1)))
+        n = 1
+        while n in used:
+            n += 1
+        return template.format(n=n)
 
     def _add_tab(self) -> None:
         self.plot_tabs[self.active_tab].state = self._gather_plot_state()
         self.plot_tabs[self.active_tab].history = self.history
-        name = t("Gráfico {n}").format(n=len(self.plot_tabs) + 1)
+        name = self._next_tab_name()
         self.plot_tabs.append(tabs.PlotTab(name=name))
         self.active_tab = len(self.plot_tabs) - 1
         self._apply_plot_state(self.plot_tabs[self.active_tab].state)
@@ -2028,8 +2178,12 @@ class App(ctk.CTk):
         for uid in self.signal_order:
             sig = self.signals[uid]
             tag = {"dB": "dB", "deg": "fase"}.get(sig.y_kind, "V")
+            # A missing trace (source file not found -- see `_restore_signal`)
+            # gets a "⚠" marker in its label and is clicked to reconnect
+            # (`_select_signal`) instead of opening the normal param panel.
+            label = sig.display_name or sig.name
             row = TraceRow(
-                self.signal_list_frame, name=sig.display_name or sig.name,
+                self.signal_list_frame, name=f"⚠ {label}" if sig.missing else label,
                 color=sig.color or "#8A8A8A", tag=tag, visible=sig.visible,
                 on_select=lambda u=uid: self._select_signal(u),
                 on_toggle=lambda value, u=uid: self._toggle_signal(u, value),
@@ -2094,6 +2248,10 @@ class App(ctk.CTk):
     def _select_signal(self, uid: str) -> None:
         self.selected_uid = uid
         self._highlight_selected()
+        sig = self.signals.get(uid)
+        if sig is not None and sig.missing:
+            self._relink_signal(uid)
+            return
         self._build_param_panel(uid)
 
     def _refresh_xy_combos(self) -> None:
@@ -3289,20 +3447,22 @@ class App(ctk.CTk):
         name = os.path.basename(path)
         if name.endswith(session.FIGURE_STATE_SUFFIX):
             name = name[: -len(session.FIGURE_STATE_SUFFIX)]
-        name = name or t("Gráfico {n}").format(n=len(self.plot_tabs) + 1)
+        name = name or self._next_tab_name()
         self.plot_tabs.append(tabs.PlotTab(name=name, state=data))
         self.active_tab = len(self.plot_tabs) - 1
-        self._apply_plot_state(data)
+        self._apply_plot_state(data, anchor_dir=os.path.dirname(path))
         self._refresh_tab_strip()
 
         total = len(data.get("signals", []) or [])
-        missing = total - len(self.signal_order)
+        missing = sum(1 for uid in self.signal_order if self.signals[uid].missing)
         if missing > 0:
             messagebox.showwarning(
                 t("Faltan archivos de origen"),
                 t("{missing} de {total} señal(es) no se pudieron recargar: "
                   "el archivo de datos original ya no está en la misma ruta "
-                  "que cuando se exportó la figura.").format(
+                  "que cuando se exportó la figura. Quedaron marcadas (⚠) en "
+                  "la lista de trazas -- hacé clic en una para reconectarla "
+                  "a mano.").format(
                       missing=missing, total=total))
 
     def _show_latex_figure(self, out_path: str) -> None:

@@ -20,6 +20,7 @@ Soporta:
 from __future__ import annotations
 
 import csv
+import os
 import re
 import uuid
 from dataclasses import dataclass
@@ -116,6 +117,14 @@ class Signal:
     # renombrar una traza en la lista (por ejemplo, aclarar qué archivo es
     # cada una) sin que ese cambio se filtre al gráfico.
     display_name: Optional[str] = None
+
+    # True when `source_path` could not be found on this machine at load
+    # time (moved project, different computer/drive) and this Signal is a
+    # data-less placeholder -- see `build_missing_signal`/`resolve_source_path`.
+    # `source_rel` is kept only to seed the "reconectar" file dialog's
+    # starting folder.
+    missing: bool = False
+    source_rel: Optional[str] = None
 
     def processed(self) -> tuple[np.ndarray, np.ndarray]:
         """Devuelve (x, y) en la unidad base del dominio/tipo, con offset/ganancia/inversión aplicados."""
@@ -359,4 +368,80 @@ def build_signal(
         unit_v_in=unit_v_in,
         color=color,
     )
+
+
+# ---------------------------------------------------------------------- #
+# Portabilidad de rutas entre computadoras (session.json / *.labplotter.json)
+# ---------------------------------------------------------------------- #
+def build_missing_signal(record: dict, color: Optional[str] = None) -> Signal:
+    """
+    Placeholder para una señal cuyo archivo de origen no se pudo encontrar
+    en esta máquina (proyecto movido, otra computadora, otra letra de
+    unidad/raíz de OneDrive). Conserva nombre/leyenda/dominio para que la
+    GUI la siga mostrando en la lista de trazas -- el resto de los ajustes
+    (offsets, ganancia, color, etc.) los copia `_restore_signal` encima
+    apenas se crea. `t_raw`/`v_raw` vacíos evitan tocar `read_table` con un
+    path inválido; `processed()` sigue funcionando (arrays de tamaño 0).
+    """
+    return Signal(
+        uid=str(uuid.uuid4()),
+        name=record.get("name") or "señal",
+        source_path=record.get("source_path", ""),
+        source_rel=record.get("source_rel"),
+        t_raw=np.array([]),
+        v_raw=np.array([]),
+        domain=record.get("domain", "time"),
+        y_kind=record.get("y_kind", "voltage"),
+        color=color,
+        missing=True,
+    )
+
+
+def resolve_source_path(record: dict, anchor_dir: Optional[str] = None) -> Optional[str]:
+    """
+    Recupera la ruta en disco del archivo de origen de una señal guardada,
+    intentando en orden:
+
+      1. `source_path` tal cual (misma máquina, nada se movió).
+      2. `source_rel` resuelto contra `anchor_dir` -- la carpeta del JSON
+         que se está cargando ahora mismo (config_dir() para session.json,
+         o la carpeta del propio sidecar *.labplotter.json). Funciona
+         mientras el archivo de datos viaje junto con ese JSON dentro del
+         mismo árbol de proyecto (Git/OneDrive), sin importar que cambie
+         la letra de unidad o el usuario de Windows.
+      3. Una búsqueda por nombre de archivo bajo `anchor_dir` (profundidad
+         acotada), aceptada solo si hay un único candidato -- ante
+         ambigüedad se prefiere no adivinar y dejar que el usuario
+         reconecte el archivo a mano.
+
+    Devuelve None si no se pudo resolver; quien llama es responsable de
+    conservar el registro como "missing" en lugar de descartarlo.
+    """
+    abs_path = record.get("source_path")
+    if abs_path and os.path.isfile(abs_path):
+        return abs_path
+
+    rel_path = record.get("source_rel")
+    if rel_path and anchor_dir:
+        candidate = os.path.normpath(os.path.join(anchor_dir, rel_path))
+        if os.path.isfile(candidate):
+            return candidate
+
+    basename = os.path.basename(abs_path or rel_path or "")
+    if basename and anchor_dir and os.path.isdir(anchor_dir):
+        max_depth = 6
+        base_depth = anchor_dir.rstrip(os.sep).count(os.sep)
+        matches: list[str] = []
+        for root, dirs, files in os.walk(anchor_dir):
+            if root.rstrip(os.sep).count(os.sep) - base_depth > max_depth:
+                dirs[:] = []
+                continue
+            if basename in files:
+                matches.append(os.path.join(root, basename))
+                if len(matches) > 1:
+                    break   # ambiguo: mejor no adivinar
+        if len(matches) == 1:
+            return matches[0]
+
+    return None
 

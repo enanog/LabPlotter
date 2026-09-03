@@ -624,6 +624,62 @@ _EN: dict[str, str] = {
         "data file is no longer at the same path it was when the figure was "
         "exported. They are flagged (⚠) in the trace list -- click one to "
         "reconnect it by hand.",
+
+    # --- rail / stage labels and tooltips (Shell) --------------------------
+    # These were missing an _EN entry entirely -- the rail, its per-stage
+    # tooltips and the command palette/topbar fell back to Spanish even in
+    # English mode. Audited with a small AST script that walks every t(...)
+    # call site in gui/ and diffs it against this dict's keys.
+    "Ajuste": "Adjust",
+    "Selección": "Selection",
+    "Comandos": "Commands",
+    "Comandos  ⌘K": "Commands  ⌘K",
+    "Atajos de teclado": "Keyboard shortcuts",
+    "Buscar un comando...": "Search a command...",
+    "Sin resultados.": "No results.",
+    "Modificado -- clic para volver al valor por defecto.":
+        "Modified -- click to reset to default.",
+    "Archivos cargados y qué columna usa cada traza.":
+        "Loaded files and which column each trace uses.",
+    "Estilo, correcciones y unidades de cada traza.":
+        "Style, corrections and units for each trace.",
+    "Cursores de medición y anotaciones de la figura.":
+        "Measurement cursors and figure annotations.",
+    "Formato, DPI y el bloque LaTeX que incluye la figura.":
+        "Format, DPI and the LaTeX block that includes the figure.",
+    "Exportar CSV": "Export CSV",
+    "Exportar figura": "Export figure",
+    "Tablero": "Board",
+    "Modo compacto (ocultar paneles laterales)":
+        "Compact mode (hide side panels)",
+    "Con «Magnitud: custom» el combo de unidad acepta texto libre (o vacío, "
+    "para no mostrar ninguna unidad) -- no hay conversión de prefijos para "
+    "una magnitud propia.":
+        "With “Magnitude: custom” the unit combo accepts free text (or "
+        "empty, to show no unit at all) -- there is no prefix conversion "
+        "for a custom magnitude.",
+
+    # --- Histograma / Tablero stages (this session: embedded, no longer a
+    # floating window) and the "Exportar" stage's simplified export console ---
+    "Distribución superpuesta de una o más señales cargadas.":
+        "Overlaid distribution of one or more loaded signals.",
+    "Combina varias figuras ya exportadas en una grilla para el informe.":
+        "Combines several already-exported figures into a report grid.",
+    "Selección: ajustes de la traza elegida en la lista. Gráfico: ajustes de "
+    "toda la figura (ejes, leyenda, exportación) -- no cambian según qué "
+    "traza esté seleccionada.":
+        "Selection: settings for the trace chosen in the list. Plot: "
+        "settings for the whole figure (axes, legend, export) -- they don't "
+        "change depending on which trace is selected.",
+    "Muestreo (todas las trazas)": "Sampling (all traces)",
+    "Más formatos": "More formats",
+    "Otros formatos (PNG, SVG, PGF) y DPI.": "Other formats (PNG, SVG, PGF) and DPI.",
+    "Exportar figura (PDF)...": "Export figure (PDF)...",
+    "Agregá este gráfico como un panel más -- edición, filas y exportación "
+    "del tablero viven en el stage «Tablero».":
+        "Add this figure as one more panel -- editing rows and exporting "
+        "the board live in the “Board” stage.",
+    "Etiquetas": "Labels",
 }
 
 

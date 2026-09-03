@@ -48,6 +48,7 @@ from core.layout import (
     legend_kwargs, reserve_legend_space,
 )
 from core import board, latex, session, tabs
+from core.histogram import BIN_RULES, combined_range, compute_histogram
 from core.history import History, apply_snapshot
 from core.i18n import LANGUAGES, get_language, set_language, t
 from core.processing import crop, decimate, decimate_to_target
@@ -58,7 +59,7 @@ from gui.theme import (
     TRACE_CYCLE, apply_plot_chrome, apply_theme, col, font, font_scale,
     set_font_scale, set_theme_mode, spaced, tk_color,
 )
-from gui.shell import Shell
+from gui.shell import WIDE_NAVIGATOR_WIDTH, WIDE_STAGES, Shell
 from gui.widgets import (
     Chip, LINE_GLYPHS, MeasurementsCard, Rule, SectionHeader,
     CodeDialog, LabeledCombo, Segmented, SectionGroup, Splitter, StaticSection,
@@ -68,8 +69,7 @@ from gui.widgets import (
     stacked_entry, stacked_label,
     DirtyDot, DirtyGroup, Field, Tooltip, info_dot,
 )
-from gui.board_window import BoardWindow
-from gui.histogram_window import HistogramWindow
+from gui.board_window import BoardEditor
 
 # Window width at which the type scale is exactly as designed (1.0). Matches
 # the default geometry, so the app opens at native size. Clamping lives in
@@ -80,7 +80,8 @@ _REFERENCE_WIDTH = 1480
 _LEFT_MIN, _LEFT_MAX = 220, 480
 _RIGHT_MIN, _RIGHT_MAX = 260, 520
 
-PLOT_MODES = ["Tiempo / Frecuencia", "Modo X/Y", "Diagrama de Bode", "Pizarra en blanco"]
+PLOT_MODES = ["Tiempo / Frecuencia", "Modo X/Y", "Diagrama de Bode",
+              "Histograma de valores", "Pizarra en blanco"]
 # Internal identifiers, never shown. Display text lives in `*_LABELS` and goes
 # through `t()`; an earlier version compared translated strings directly
 # (`startswith("Separados")`), which would silently break the moment the
@@ -107,7 +108,9 @@ def _labels() -> dict:
     """Display labels for every internal identifier, in the active language."""
     return {
         "modes": {"Tiempo / Frecuencia": t("Tiempo"), "Modo X/Y": t("X / Y"),
-                  "Diagrama de Bode": t("Bode"), "Pizarra en blanco": t("Pizarra")},
+                  "Diagrama de Bode": t("Bode"),
+                  "Histograma de valores": t("Histograma"),
+                  "Pizarra en blanco": t("Pizarra")},
         "bode": {"shared": t("Juntos"), "separate": t("Separados")},
         "dec": {"none": t("Ninguno"), "factor": t("Factor N"),
                 "target": t("Máx. puntos")},
@@ -496,8 +499,7 @@ class App(Shell):
         # saved session -- it is scratch space for the current run, exactly
         # like `_last_export_path`.
         self.board_rows: list = [board.new_row()]
-        self._board_window: Optional[BoardWindow] = None
-        self._histogram_window: Optional[HistogramWindow] = None
+        self.board_editor: Optional[BoardEditor] = None
         self._board_export_dir: Optional[str] = None
 
         # Plot tabs: several independent plots (own signals + settings) held
@@ -528,6 +530,10 @@ class App(Shell):
         self._left_width = 300
         self._right_width = 320
         self._compact = False
+        # One-shot: `_set_stage` widens the navigator the first time the
+        # user enters a `WIDE_STAGES` stage, then leaves later drags (in
+        # either direction) alone. See `_set_stage`.
+        self._navigator_auto_widened = False
 
         # Proportional type scale, driven by window width and debounced in
         # `_on_root_configure`. Only shared font objects are resized -- the
@@ -577,6 +583,7 @@ class App(Shell):
         # export console -- built once here and rebuilt in `_rebuild_ui`
         # after its own `_build_layout()` recreates the navigator frames.
         self._build_overlay_panel()
+        self._build_board_panel()
         self._build_export_navigator()
         self._refresh_chips()
 
@@ -637,13 +644,17 @@ class App(Shell):
     def _drag_navigator(self, delta: int) -> None:
         self._left_width = max(_LEFT_MIN, min(_LEFT_MAX, self._left_width + delta))
         self.navigator_panel.configure(width=self._left_width)
+        # A hand-dragged width -- at any point, on any stage -- is the
+        # user's own choice; `_set_stage` never overrides it again.
+        self._navigator_auto_widened = True
 
     def _drag_inspector(self, delta: int) -> None:
         self._right_width = max(_RIGHT_MIN, min(_RIGHT_MAX, self._right_width - delta))
         self.inspector_panel.configure(width=self._right_width)
 
     def _bind_shortcuts(self) -> None:
-        """Shell's own bindings (Ctrl+K/O/E/Z, F1, Ctrl+1..4) plus the ones
+        """Shell's own bindings (Ctrl+K/O/E/Z, F1, Ctrl+1..6 -- one per rail
+        stage, `Shell.STAGES` now has six) plus the ones
         this application had before the migration and Shell doesn't know
         about: delete-key, redo aliases and CSV export."""
         super()._bind_shortcuts()
@@ -879,6 +890,11 @@ class App(Shell):
             "csv_mode": self.csv_mode_var,
             "xy_x": self.xy_x_var, "xy_y": self.xy_y_var,
             "xy_legend": self.xy_legend_var, "xy_color": self.xy_color_var,
+            "hist_axis": self.hist_axis_var, "hist_bin_rule": self.hist_bin_rule_var,
+            "hist_bin_count": self.hist_bin_count_var,
+            "hist_density": self.hist_density_var,
+            "hist_shared_bins": self.hist_shared_bins_var,
+            "hist_alpha": self.hist_alpha_var,
         }
 
     def _gather_state(self) -> dict:
@@ -1194,6 +1210,52 @@ class App(Shell):
         """
         return
 
+    def _set_stage(self, key: str) -> None:
+        super()._set_stage(key)
+        self._show_plot_frame(key)
+        # Cursor/Zoom/Pan/Anotar all act on the main canvas -- while it's
+        # hidden ("board" showing its own preview instead), leaving them
+        # clickable would silently do nothing visible. Disarm whatever was
+        # active and grey them out rather than leave a tool that looks live
+        # but has no canvas to act on. Histograma is a plot MODE now (see
+        # `PLOT_MODES`), not a stage that hides the main canvas, so it needs
+        # no entry here -- the main canvas (and its tools) stay live in every
+        # stage except "board".
+        main_stage = key != "board"
+        if not main_stage and self._active_tool is not None:
+            self._set_tool(None)
+        for button in self.tool_buttons.values():
+            button.configure(state="normal" if main_stage else "disabled")
+        self.fit_button.configure(state="normal" if main_stage else "disabled")
+        # "annotate"/"board" pack more into the navigator column than a
+        # plain list -- a form with several fields side by side, or a whole
+        # row editor -- so the default width clips them exactly like the
+        # embedded cursor/annotation editor used to (it was sized for the
+        # ~1040px floating window it came from; so was Tablero). Widen once,
+        # the first time the user reaches either; never again after that, so
+        # a width they later drag by hand (see `_drag_navigator`) always wins.
+        if key in WIDE_STAGES and not self._navigator_auto_widened:
+            self._navigator_auto_widened = True
+            self._left_width = WIDE_NAVIGATOR_WIDTH
+            self.navigator_panel.configure(width=self._left_width)
+
+    def _show_plot_frame(self, key: str) -> None:
+        """
+        Swap what the workspace canvas shows. Every stage except "board"
+        keeps looking at the main figure (`self.fig`) -- "board" draws its
+        own, separate `Figure` (`BoardEditor`'s preview), so entering it has
+        to change the canvas itself, not just the navigator beside it.
+        Histograma has no frame of its own here: it is a mode of `self.fig`
+        (see `PLOT_MODES`/`update_plot`), so it shows in whichever stage's
+        navigator the user already is in. -> `_build_workspace` (frames),
+        `_build_board_panel` (content).
+        """
+        target = key if key == "board" else "main"
+        for name, frame in self._plot_frames.items():
+            frame.pack_forget()
+            if name == target:
+                frame.pack(fill="both", expand=True)
+
     def _build_workspace(self) -> None:
         super()._build_workspace()
 
@@ -1221,8 +1283,9 @@ class App(Shell):
         # Tk's pack() silently clipped the button to whatever was left,
         # which happened to still fit the text but made the requested width
         # meaningless. See `_build_topbar` for where "Compacto" went instead.
-        ghost_button(tools, t("Encuadrar"), self._fit_to_data,
-                     width=92).pack(side="left", padx=(8, 0), pady=9)
+        self.fit_button = ghost_button(tools, t("Encuadrar"), self._fit_to_data,
+                                       width=92)
+        self.fit_button.pack(side="left", padx=(8, 0), pady=9)
 
         # No "Compacto" button here: it moved to the topbar (see
         # `_build_topbar`) -- a whole-window layout toggle doesn't belong
@@ -1263,10 +1326,31 @@ class App(Shell):
                   command=lambda _v: self.update_plot()).pack(side="left")
         # Neither is packed yet -- `_on_mode_change` shows the right one.
 
+        # ------------------ stage-switchable plot frames ---------------- #
+        # `self.plot_container` (built by `Shell._build_workspace`) is the
+        # one grid cell the whole canvas region occupies. Two children share
+        # it, exactly one packed at a time -- same swap mechanism
+        # `Shell._set_stage` already uses for `self.navigators` -- so
+        # entering the "board" stage changes what's actually drawn in the
+        # middle of the window instead of leaving a second, separate window
+        # for the user to lose track of. See `App._show_plot_frame` (called
+        # from `App._set_stage`). Histograma has no frame of its own: it is
+        # a mode of THIS main figure (see `PLOT_MODES`), not a separate
+        # plot, so switching to it never touches this swap.
+        self._main_plot_frame = ctk.CTkFrame(self.plot_container, corner_radius=0,
+                                             fg_color=col("app"))
+        self._main_plot_frame.pack(fill="both", expand=True)
+        self._board_plot_frame = ctk.CTkFrame(self.plot_container, corner_radius=0,
+                                              fg_color=col("app"))
+        self._plot_frames = {
+            "main": self._main_plot_frame,
+            "board": self._board_plot_frame,
+        }
+
         # ---------------------------- canvas -------------------------- #
         self.fig = Figure(figsize=(7.6, 5.2), dpi=100)
         self.axes: list = [self.fig.add_subplot(111)]
-        self.canvas = FigureCanvasTkAgg(self.fig, master=self.plot_container)
+        self.canvas = FigureCanvasTkAgg(self.fig, master=self._main_plot_frame)
         canvas_widget = self.canvas.get_tk_widget()
         canvas_widget.configure(borderwidth=0, highlightthickness=1,
                                 highlightbackground=tk_color("border_str"),
@@ -1276,12 +1360,12 @@ class App(Shell):
         # The stock Matplotlib toolbar is created but never displayed: the
         # tool strip above drives pan/zoom/margins through it, so the window
         # keeps a single visual language instead of two.
-        self._toolbar_host = tk.Frame(self.plot_container)
+        self._toolbar_host = tk.Frame(self._main_plot_frame)
         self.mpl_toolbar = EditableNavigationToolbar(self.canvas, self._toolbar_host)
         self.mpl_toolbar.on_margins_applied = self._on_margins_applied
         self.mpl_toolbar.update()
 
-        self.measurements = MeasurementsCard(self.plot_container, width=230)
+        self.measurements = MeasurementsCard(self._main_plot_frame, width=230)
         self.measurements.bind_close(self._hide_measurements)
         self._measurements_visible = False
 
@@ -1296,10 +1380,29 @@ class App(Shell):
     # ------------------------------------------------------------------ #
     # Plot tabs -- several independent plots held in memory at once
     # ------------------------------------------------------------------ #
+    # A tab chip past this many characters gets truncated with an ellipsis
+    # -- otherwise one long name (typically an imported figure-state's own
+    # filename, which nothing caps) can by itself eat all the width freed
+    # up by widening `parent` and crowd out every other tab.
+    _TAB_NAME_MAX_CHARS = 22
+
     def _build_tab_strip(self, parent) -> None:
-        strip = ctk.CTkFrame(parent, height=36, corner_radius=0, fg_color=col("panel"))
+        # `parent` (Shell.tab_strip) now stretches to fill the leftover
+        # topbar width (see Shell._build_topbar), but grid doesn't hand that
+        # extra space to `strip` on its own -- column 0 needs weight, same
+        # as any other grid cell that should track its container's size.
+        parent.grid_columnconfigure(0, weight=1)
+        parent.grid_rowconfigure(0, weight=1)
+        # No fixed height/propagate(False) here (there used to be a
+        # `height=36`): that forced `strip` to a height SMALLER than what
+        # its own child (a chip's label, at whatever the "label" font's
+        # real metrics are on this machine) actually needs, which is what
+        # clipped every tab name vertically -- not something a bigger guess
+        # would have reliably fixed for every font/DPI. Left to size itself,
+        # `strip` always ends up exactly tall enough for its content, and
+        # `Shell._build_topbar`'s taller `bar` gives that real room.
+        strip = ctk.CTkFrame(parent, corner_radius=0, fg_color=col("panel"))
         strip.grid(row=0, column=0, sticky="ew")
-        strip.pack_propagate(False)   # children are packed; see _build_topbar
         Rule(strip).pack(side="bottom", fill="x")
 
         self.tab_strip_row = ctk.CTkFrame(strip, fg_color="transparent")
@@ -1322,10 +1425,15 @@ class App(Shell):
                                 border_color=col("accent") if active else col("border"))
             chip.pack(side="left", padx=(0, 4), pady=5)
 
+            full_name = tab.name
+            display_name = (full_name if len(full_name) <= self._TAB_NAME_MAX_CHARS
+                            else full_name[: self._TAB_NAME_MAX_CHARS - 1] + "…")
             label = ctk.CTkLabel(
-                chip, text=tab.name, font=font("label"), cursor="hand2",
+                chip, text=display_name, font=font("label"), cursor="hand2",
                 text_color=col("on_accent") if active else col("fg_muted"))
             label.pack(side="left", padx=(10, 6), pady=4)
+            if display_name != full_name:
+                Tooltip(label, full_name)
             label.bind("<Button-1>", lambda _e, idx=i: self._switch_tab(idx))
             label.bind("<Double-Button-1>", lambda _e, idx=i: self._rename_tab(idx))
             chip.bind("<Button-1>", lambda _e, idx=i: self._switch_tab(idx))
@@ -1741,12 +1849,20 @@ class App(Shell):
         """
         Overrides Shell's stub entirely (four empty `StaticSection`s wired to
         a generic "Aplicar ajustes" button) rather than calling `super()`:
-        this pane's real content -- axes/labels/legend/data/export -- is the
-        same flat set of foldable sections `_build_right_panel` used to
-        build into the old right column, just retargeted to `parent` (the
+        this pane's real content -- axes/labels/legend/data -- is the same
+        flat set of foldable sections `_build_right_panel` used to build
+        into the old right column, just retargeted to `parent` (the
         "Gráfico" pane, already a scrollable frame via `PaneStack.add`).
-        Splitting these into their own navigator/inspector (the "export"
-        stage) is future work, out of scope for this migration pass.
+
+        No `_build_export_section` here anymore: it used to repeat, almost
+        verbatim, everything `_build_export_navigator` already shows in the
+        "Exportar" stage (profile, CSV, format/DPI, import, board, histogram)
+        -- reachable from every stage via this always-visible pane AND from
+        the "Exportar" stage itself, so the two fell out of sync in spirit
+        even when both were technically correct. Export now lives only in
+        its stage; this pane is purely the figure's cosmetics (axes, text,
+        legend, sampling), which -- unlike export -- genuinely make sense to
+        reach from any stage since they affect what's on screen right now.
         """
         self.settings = SectionGroup()
         self._sections_header = SectionHeader(
@@ -1760,10 +1876,19 @@ class App(Shell):
         self._build_labels_section(parent)
         self._build_legend_section(parent)
         self._build_data_section(parent)
-        self._build_export_section(parent)
+        self._build_histogram_section(parent)
 
     def _section(self, parent, title: str, expanded: bool = True):
         """One settings group, foldable from the caret in its header."""
+        return self._section_pair(parent, title, expanded)[0]
+
+    def _section_pair(self, parent, title: str, expanded: bool = True):
+        """
+        Same as `_section`, but also returns the `StaticSection` itself
+        (not just its `.body`) -- needed by `_build_histogram_section`,
+        whose whole section is shown/hidden by `_on_mode_change` rather than
+        staying permanently packed like the other four.
+        """
         def _on_toggle(_s) -> None:
             self._save_session_soon()
             self._refresh_toggle_all_label()
@@ -1771,7 +1896,7 @@ class App(Shell):
         section = StaticSection(parent, title, expanded=expanded, on_toggle=_on_toggle)
         section.pack(fill="x", pady=(0, 12))
         self.settings.add(section)
-        return section.body
+        return section.body, section
 
     def _toggle_all_sections(self) -> None:
         self.settings.set_all(not self.settings.any_expanded())
@@ -1948,7 +2073,13 @@ class App(Shell):
              wraplength=280).pack(fill="x", pady=(8, 0))
 
     def _build_data_section(self, parent) -> None:
-        box = self._section(parent, t("Datos"), expanded=False)
+        # Named "Muestreo (todas las trazas)", not "Datos": the "Datos" stage
+        # (source files, in the navigator) and this section (downsampling
+        # applied to every visible trace at once, see the hint below) used
+        # to share the one Spanish word "Datos" for two unrelated things --
+        # exactly the kind of same-name-different-meaning mix-up the
+        # Selección/Gráfico split elsewhere already tries to avoid.
+        box = self._section(parent, t("Muestreo (todas las trazas)"), expanded=False)
 
         self.dec_mode_var = ctk.StringVar(value="none")
         self.dec_mode_combo = combo_field(
@@ -1971,83 +2102,81 @@ class App(Shell):
         self.decimal_comma_check = check_field(
             box, t("Archivos con coma decimal"), self.decimal_comma_var, rule=False)
 
-    def _build_export_section(self, parent) -> None:
-        box = self._section(parent, t("Exportar"), expanded=True)
+    def _build_histogram_section(self, parent) -> None:
+        """
+        Settings for "Histograma de valores" (see `PLOT_MODES`).
 
-        stacked_label(box, t("Perfil de exportación"))
-        profile_row = ctk.CTkFrame(box, fg_color="transparent")
-        profile_row.pack(fill="x", pady=(0, 6))
-        self.profile_var = ctk.StringVar(value="")
-        self.profile_combo = ctk.CTkComboBox(
-            profile_row, values=[], variable=self.profile_var, height=28,
-            font=font("body"), dropdown_font=font("body"),
-            command=lambda _=None: self._apply_export_profile())
-        self.profile_combo.pack(fill="x")
-        profile_actions = ctk.CTkFrame(box, fg_color="transparent")
-        profile_actions.pack(fill="x", pady=(0, 14))
-        ghost_button(profile_actions, t("Guardar como..."), self._save_export_profile,
-                     width=140).pack(side="left")
-        ghost_button(profile_actions, t("Eliminar"), self._delete_export_profile,
-                     width=90).pack(side="left", padx=6)
-        self._refresh_export_profiles()
-        Rule(box).pack(fill="x", pady=(0, 12))
+        Built into the SAME "Gráfico" pane as Ejes/Textos/Leyenda/Muestreo,
+        not a separate stage or navigator section -- that was the whole
+        point of folding Histograma into the mode switch (`_on_mode_change`)
+        instead of keeping it as its own rail entry. Kept packed but hidden
+        (`pack_forget`, via `_section_pair` instead of `_section`) except
+        while that mode is active, exactly like `xy_frame`/`bode_frame`
+        already do for their own mode-only controls.
 
-        self.csv_mode_container = ctk.CTkFrame(box, fg_color="transparent")
-        self.csv_mode_container.pack(fill="x", pady=(0, 8))
-        stacked_label(self.csv_mode_container, t("Datos para PGFPlots"))
-        self.csv_mode_var = ctk.StringVar(value="individual")
-        self.csv_mode_combo = LabeledCombo(
-            self.csv_mode_container, CSV_MODES, self.csv_mode_var,
-            labels=_labels()["csv"], height=28)
-        self.csv_xy_note = hint(self.csv_mode_container,
-                                 t("Modo X/Y: se exporta la curva actual."),
-                                 wraplength=280)
-        self.csv_mode_combo.pack(fill="x")   # default (non-XY) state
-        ghost_button(box, t("Exportar CSV..."), self._export_csv,
-                     height=30).pack(fill="x", pady=(8, 14))
+        No "Señales" checklist here: it uses whichever signals are already
+        visible in this tab (`_gather_curves`, same as every other mode),
+        so the trace list's own eye-toggle in "Ajuste" IS the selection.
+        "Escala X"/"Escala Y" aren't repeated either -- "Ejes y escalas"
+        above already has them, and they apply to whatever mode is active,
+        histogram included (see `_draw_histogram` -> `_apply_axis_cosmetics`).
+        """
+        self.hist_axis_var = ctk.StringVar(value="y")
+        self.hist_bin_rule_var = ctk.StringVar(value="auto")
+        self.hist_bin_count_var = ctk.StringVar(value="30")
+        self.hist_density_var = ctk.BooleanVar(value=False)
+        self.hist_shared_bins_var = ctk.BooleanVar(value=True)
+        self.hist_alpha_var = ctk.StringVar(value="0.55")
 
-        Rule(box).pack(fill="x", pady=(0, 12))
+        box, section = self._section_pair(parent, t("Histograma"), expanded=True)
+        self._histogram_section = section
+        self._histogram_section.pack_forget()   # shown only in that mode -- see `_on_mode_change`
 
-        self.fig_format_var = ctk.StringVar(value="pdf")
-        combo_field(box, t("Formato"), self.fig_format_var,
-                    ["pdf", "png", "svg", "pgf"], width=110)
-        self.dpi_var = ctk.StringVar(value="300")
-        entry_field(box, "DPI", self.dpi_var, rule=False)
-        hint(box, t("PDF, SVG y PGF son vectoriales; el DPI sólo afecta al PNG."),
-             wraplength=280).pack(fill="x", pady=(6, 10))
-        primary_button(box, t("Exportar figura..."), self._export_figure,
-                       height=32).pack(fill="x")
-        ghost_button(box, t("Importar figura..."), self._import_figure,
-                    height=28).pack(fill="x", pady=(6, 0))
-        hint(box, t("Recupera una figura exportada antes con TODOS sus ajustes "
-                    "y señales, en una pestaña nueva. Necesita el archivo "
-                    "«.labplotter.json» que se guarda junto a la figura."),
-             wraplength=280).pack(fill="x", pady=(4, 0))
-        ghost_button(box, t("Guardar solo ajustes (JSON)..."),
-                    self._export_settings_only, height=28
-                    ).pack(fill="x", pady=(6, 0))
+        combo_field(box, t("Eje a histogramar"), self.hist_axis_var, ["y", "x"],
+                    width=90, command=lambda _v: self.update_plot())
+        hint(box, t("«y» = valores de la señal (tensión, dB, magnitud "
+                    "propia...); «x» = tiempo o frecuencia."),
+             wraplength=280).pack(fill="x", pady=(0, 10))
 
-        Rule(box).pack(fill="x", pady=(14, 12))
+        combo_field(box, t("Regla de bins"), self.hist_bin_rule_var,
+                    list(BIN_RULES) + ["manual"], width=90,
+                    command=lambda _v: self._on_hist_bin_rule_change())
+        self.hist_bin_count_field = entry_field(box, t("Cantidad de bins"),
+                                                self.hist_bin_count_var, rule=False,
+                                                on_enter=self.update_plot)
+        self.hist_bin_count_field.configure(state="disabled")
+        hint(box, t("«manual» habilita el campo de cantidad de bins; "
+                    "cualquier otra regla la calcula sola a partir de los "
+                    "datos (ver `core/histogram.py`)."),
+             wraplength=280).pack(fill="x", pady=(0, 10))
 
-        stacked_label(box, t("Tablero (varias figuras en un mismo layout)"))
-        self.board_title_var = ctk.StringVar(value="")
-        stacked_entry(box, t("Título del panel"), self.board_title_var)
-        board_actions = ctk.CTkFrame(box, fg_color="transparent")
-        board_actions.pack(fill="x", pady=(0, 8))
-        ghost_button(board_actions, t("+ Agregar gráfico actual"), self._add_current_to_board,
-                    width=170).pack(side="left")
-        ghost_button(board_actions, t("Ver tablero..."), self._open_board,
-                    width=100).pack(side="left", padx=(6, 0))
-        self.board_status_label = hint(box, t("Tablero vacío."), wraplength=280)
-        self.board_status_label.pack(fill="x")
+        check_field(box, t("Densidad (normalizar área a 1)"), self.hist_density_var,
+                    command=self.update_plot)
+        check_field(box, t("Mismos bordes de bin para todas"), self.hist_shared_bins_var,
+                    command=self.update_plot, rule=False)
+        hint(box, t("Con esto tildado, las señales superpuestas comparten "
+                    "rango y bordes de bin -- si no, cada una arma los "
+                    "suyos y comparar alturas entre ellas no tiene sentido."),
+             wraplength=280).pack(fill="x", pady=(0, 10))
 
-        Rule(box).pack(fill="x", pady=(14, 12))
+        entry_field(box, t("Opacidad de barras"), self.hist_alpha_var, rule=False,
+                    on_enter=self.update_plot)
+        hint(box, t("Log en Y es lo habitual para ver la cola de una "
+                    "distribución (como en la figura de referencia). Log "
+                    "en X sólo tiene sentido si TODOS los bins caen en "
+                    "valores positivos -- con un histograma que cruza el "
+                    "cero (p. ej. deltaG) va a recortar la mitad negativa; "
+                    "en ese caso dejalo en «linear»."),
+             wraplength=280).pack(fill="x", pady=(8, 10))
 
-        stacked_label(box, t("Histograma"))
-        ghost_button(box, t("Ver histograma..."), self._open_histogram_window,
-                    width=140).pack(fill="x", pady=(0, 4))
-        hint(box, t("Distribución de los valores (eje X o Y) de una o más "
-                    "señales, superpuestas."), wraplength=280).pack(fill="x")
+        stacked_label(box, t("Estadísticas")).pack(fill="x", pady=(0, 2))
+        self.hist_stats_label = hint(box, "", wraplength=280)
+        self.hist_stats_label.pack(fill="x")
+
+    def _on_hist_bin_rule_change(self) -> None:
+        manual = self.hist_bin_rule_var.get() == "manual"
+        self.hist_bin_count_field.configure(state="normal" if manual else "disabled")
+        self.update_plot()
 
     def _refresh_export_profiles(self) -> None:
         self._export_profiles = session.load_profiles()
@@ -2777,10 +2906,31 @@ class App(Shell):
             self.xy_frame.pack_forget()
             self.bode_frame.pack(fill="x")
             self._reset_xscale_for_domain("freq")   # Bode is always frequency-domain
+        elif mode == "Histograma de valores":
+            self.xy_frame.pack_forget()
+            self.bode_frame.pack_forget()
+            # The X axis stops being time/frequency and becomes "value of
+            # the signal(s)" -- a log default carried over from a
+            # frequency-domain signal (e.g. a Bode magnitude in dB, which is
+            # routinely negative) would clip the histogram to nothing the
+            # instant this mode is entered. Linear is always a safe default;
+            # the hint next to "Escala X" in the histogram section already
+            # explains when switching it to log is meaningful.
+            self.xscale_var.set("linear")
         else:
             self.xy_frame.pack_forget()
             self.bode_frame.pack_forget()
             self._reset_xscale_for_domain(self._dominant_domain())
+
+        # Histogram-specific controls only make sense in that mode -- shown
+        # here, in the "Gráfico" pane, instead of a separate stage/section:
+        # same principle as `xy_frame`/`bode_frame` above, just anchored in
+        # the inspector instead of the tool strip's contextual row, since
+        # this mode has far more settings than a one-line context bar fits.
+        if mode == "Histograma de valores":
+            self._histogram_section.pack(fill="x", pady=(0, 12))
+        else:
+            self._histogram_section.pack_forget()
 
         # CSV export: the Individual/Combinado choice is meaningless in X/Y
         # mode (a single paired curve is exported regardless) -- swap it for
@@ -2869,12 +3019,11 @@ class App(Shell):
         if self._shortcuts_window is not None and self._shortcuts_window.winfo_exists():
             self._shortcuts_window.destroy()
         self._shortcuts_window = None
-        if self._board_window is not None and self._board_window.winfo_exists():
-            self._board_window.destroy()
-        self._board_window = None
-        if self._histogram_window is not None and self._histogram_window.winfo_exists():
-            self._histogram_window.destroy()
-        self._histogram_window = None
+        # `board_editor` lives inside the navigator/workspace frames
+        # `_build_layout()` is about to tear down (see the `child.destroy()`
+        # loop below) -- no separate `.destroy()` needed, unlike the old
+        # floating Toplevel this replaced.
+        self.board_editor = None
 
         self._plot_suspended = True
         try:
@@ -2895,6 +3044,7 @@ class App(Shell):
             # `_build_layout()` just created (the old ones, and everything
             # embedded in them, were destroyed above).
             self._build_overlay_panel()
+            self._build_board_panel()
             self._build_export_navigator()
 
             for key, var in self._persisted_vars().items():
@@ -2919,7 +3069,15 @@ class App(Shell):
                 self._set_compact(True)
         finally:
             self._plot_suspended = False
-        self.update_plot()
+        # Not a bare `update_plot()`: `plot_mode_var` was just restored by
+        # plain `var.set()` above, which (unlike clicking the mode segmented
+        # control) does NOT run `_on_mode_change` -- so `xy_frame`/
+        # `bode_frame`/`_histogram_section` would keep whatever visibility
+        # they got at construction (all hidden) regardless of the restored
+        # mode. `_on_mode_change()` re-syncs them and calls `update_plot()`
+        # itself at the end -- same fix `_apply_plot_state` already applies
+        # for tab switching/session restore.
+        self._on_mode_change()
 
     def _preview_width(self, uid: str, var) -> None:
         """
@@ -3006,7 +3164,23 @@ class App(Shell):
             "legend_title": self.legend_title_var.get().strip(),
             "legend_extra": self._legend_extra_entries(),
             "bode_layout": self.bode_layout_var.get(),
+            "hist_axis": self.hist_axis_var.get(),
+            "hist_bin_spec": self._hist_bin_spec(),
+            "hist_density": self.hist_density_var.get(),
+            "hist_shared_bins": self.hist_shared_bins_var.get(),
+            "hist_alpha": max(0.05, min(1.0, _parse_float(self.hist_alpha_var.get(), 0.55))),
         }
+
+    def _hist_bin_spec(self) -> "int | str":
+        """Bin count (manual) or one of `BIN_RULES` (`core/histogram.py`)."""
+        if self.hist_bin_rule_var.get() == "manual":
+            try:
+                n = int(float(str(self.hist_bin_count_var.get()).strip().replace(",", ".")))
+            except (TypeError, ValueError):
+                n = 30
+            return max(1, n)
+        rule = self.hist_bin_rule_var.get()
+        return rule if rule in BIN_RULES else "auto"
 
     def _gather_curves(self, settings: dict, for_display: bool = True
                        ) -> list[tuple[str, np.ndarray, np.ndarray]]:
@@ -3138,6 +3312,8 @@ class App(Shell):
                 n_points = self._draw_xy(settings)
             elif mode == "Diagrama de Bode":
                 n_points = self._draw_bode(settings)
+            elif mode == "Histograma de valores":
+                n_points = self._draw_histogram(settings)
             elif mode == "Pizarra en blanco":
                 n_points = self._draw_blank(settings)
             else:
@@ -3304,6 +3480,92 @@ class App(Shell):
         if settings["title"]:
             ax.set_title(settings["title"])
         return 0
+
+    def _draw_histogram(self, settings: dict) -> int:
+        """
+        Overlaid distribution of the values (X or Y axis, `hist_axis`) of
+        every VISIBLE signal in this tab.
+
+        Was a dedicated "Histograma" stage with its own separate `Figure`
+        and its own "Señales" checklist duplicating trace visibility; folded
+        into a plot mode instead (see `PLOT_MODES`) so it draws into
+        `self.fig` like every other mode -- which is what makes "Agregar
+        gráfico actual" (-> `_add_current_to_board`) and every export action
+        already work on a histogram with no special case, and is why the
+        signal list here is just `_gather_curves`: the same trace list, same
+        eye-toggle, same crop/decimation as any other mode, no separate
+        selection to keep in sync.
+
+        `for_display=False`: decimation the user explicitly asked for (a
+        deliberate downsampling of a huge capture) still applies, but the
+        screen-only point cap does not -- capping would silently distort bar
+        heights relative to what `_export_csv` writes for the same tab.
+        """
+        curves = self._gather_curves(settings, for_display=False)
+        self._reset_figure(1)
+        ax = self.axes[0]
+
+        axis = settings["hist_axis"]
+        x_factor = x_units_for_domain(settings["domain"]).get(settings["x_unit"], 1.0)
+
+        series: list[tuple[Signal, np.ndarray]] = []
+        for uid, x, y in curves:
+            sig = self.signals[uid]
+            if axis == "x":
+                values = x / x_factor
+            else:
+                unit = settings["y2_unit"] if sig.secondary_y else settings["y_unit"]
+                y_factor = y_units_for_kind(sig.y_kind).get(unit, 1.0)
+                values = y / y_factor
+            series.append((sig, values))
+
+        if not series:
+            ax.text(0.5, 0.5,
+                    t("No hay señales visibles con datos en el rango seleccionado."),
+                    ha="center", va="center", transform=ax.transAxes,
+                    color=tk_color("fg_muted"))
+            self.hist_stats_label.configure(text="")
+            if settings["title"]:
+                ax.set_title(settings["title"])
+            return 0
+
+        all_values = [values for _sig, values in series]
+        value_range = combined_range(all_values) if settings["hist_shared_bins"] else None
+        bins = settings["hist_bin_spec"]
+        alpha = settings["hist_alpha"]
+
+        stats_lines = []
+        total = 0
+        for sig, values in series:
+            result = compute_histogram(values, bins=bins, value_range=value_range,
+                                       density=settings["hist_density"])
+            label = self._legend_label(sig)
+            if result is None:
+                stats_lines.append(f"{label}: {t('sin datos válidos')}")
+                continue
+            total += result.n_samples
+            ax.stairs(result.counts, result.edges, fill=True, color=sig.color,
+                      alpha=alpha, label=label)
+            ax.stairs(result.counts, result.edges, fill=False, color=sig.color,
+                      alpha=1.0, linewidth=1.0)
+            unit = (settings["x_unit"] if axis == "x" else
+                    (settings["y2_unit"] if sig.secondary_y else settings["y_unit"]))
+            unit_txt = f" {unit}" if unit else ""
+            stats_lines.append(
+                f"{label}: n={result.n_samples}"
+                + (f" (+{result.n_dropped} desc.)" if result.n_dropped else "")
+                + f", μ={result.mean:.4g}{unit_txt}, σ={result.std:.4g}{unit_txt}")
+
+        xlabel = settings["xlabel"] or (
+            self._default_xlabel(settings) if axis == "x" else t("Valor"))
+        ylabel = settings["ylabel"] or (
+            t("Densidad de probabilidad") if settings["hist_density"] else t("Cuentas"))
+        self._apply_axis_cosmetics(ax, settings, xlabel, ylabel)
+        if settings["title"]:
+            ax.set_title(settings["title"])
+        self._finish_legend(ax, settings)
+        self.hist_stats_label.configure(text="\n".join(stats_lines))
+        return total
 
     def _draw_bode(self, settings: dict) -> int:
         """
@@ -3736,6 +3998,15 @@ class App(Shell):
         cannot rasterize a PDF back into an image without an extra
         dependency, so the raster is produced here, from the same figure,
         instead).
+
+        Ends by jumping to the "board" stage so the panel just added is
+        immediately visible, whether this was called from the "Exportar"
+        stage's shortcut or from the Tablero stage's own "+ Agregar gráfico
+        actual" button (`BoardEditor`) -- either way the user lands looking
+        at the result instead of having to go find it. Reselecting a stage
+        that's already active is a harmless no-op (`Shell._set_stage`
+        doesn't special-case it, but rebuilding the same navigator/footer is
+        cheap and idempotent).
         """
         if not self.signals:
             messagebox.showinfo(
@@ -3751,8 +4022,10 @@ class App(Shell):
                 return
             self._board_export_dir = chosen
 
-        title = (self.board_title_var.get().strip()
-                 or self.title_var.get().strip()
+        # No dedicated "panel title" field anymore -- the figure's own title
+        # (or an auto-numbered fallback) pre-fills the panel, and it can be
+        # renamed from its row editor once it's on the board (`BoardEditor`).
+        title = (self.title_var.get().strip()
                  or f"Figura {board.total_panels(self.board_rows) + 1}")
 
         slug = latex.sanitize_label(title, prefix="panel").split(":", 1)[1]
@@ -3775,50 +4048,29 @@ class App(Shell):
         self.board_rows[-1].append(
             board.BoardPanel(title=title, vector_path=vector_path,
                              preview_path=preview_path))
-        self.board_title_var.set("")
-        self._update_board_status()
 
-        if self._board_window is not None and self._board_window.winfo_exists():
-            self._board_window._refresh()
-
-    def _update_board_status(self) -> None:
-        """
-        Keep every place that shows the board's panel count in sync -- the
-        "Exportar" section (deep in the Gráfico pane) and the "Exportar"
-        stage's navigator (`_build_export_navigator`) both display it, and
-        neither should go stale just because the other one exists.
-        """
-        count = board.total_panels(self.board_rows)
-        text = (f"{count} panel(es) · {self._board_export_dir}" if count
-                else t("Tablero vacío."))
-        for label in (getattr(self, "board_status_label", None),
-                     getattr(self, "nav_board_status", None)):
-            if label is not None:
-                label.configure(text=text)
+        if self.board_editor is not None:
+            self.board_editor._refresh()
+        self.rail.select("board")
 
     def _open_board(self) -> None:
-        if self._board_window is not None and self._board_window.winfo_exists():
-            self._board_window.lift()
-            self._board_window.focus_force()
-            return
-        self._board_window = BoardWindow(self, self)
+        # No more floating window to instantiate/lift -- "Tablero" is a rail
+        # stage now (see `Shell.STAGES`); entering it is entering the stage.
+        self.rail.select("board")
 
     def _open_histogram(self) -> None:
-        # Alias for `Shell._register_commands`'s command-palette entry, which
-        # calls this name -- Shell only knows the generic verb, the real
-        # window lives in `_open_histogram_window` alongside `_open_board`.
-        self._open_histogram_window()
+        """
+        Command-palette "Histograma" entry (`Shell._register_commands`).
 
-    def _open_histogram_window(self) -> None:
-        if self._histogram_window is not None and self._histogram_window.winfo_exists():
-            # Re-scan `self.signal_order` on every reopen -- a signal loaded
-            # or removed while the window was already open otherwise stayed
-            # invisible to it until it was closed and reopened.
-            self._histogram_window.refresh_signals()
-            self._histogram_window.lift()
-            self._histogram_window.focus_force()
-            return
-        self._histogram_window = HistogramWindow(self, self)
+        Histograma is a plot MODE now (see `PLOT_MODES`), not a rail stage,
+        so this switches the mode segmented control instead of navigating
+        anywhere -- except out of "board", the one stage that hides the
+        main canvas a mode change would otherwise be invisible on.
+        """
+        if self.stage_var.get() == "board":
+            self.rail.select("adjust")
+        self.plot_mode_var.set("Histograma de valores")
+        self._on_mode_change()
 
     # ------------------------------------------------------------------ #
     # Overlay layer: cursors and annotations
@@ -3913,43 +4165,125 @@ class App(Shell):
         """
         self.overlay_panel = OverlayPanel(
             self.navigators["annotate"], self.cursors, self.annotations,
-            on_refresh=self._refresh_overlays, unit_provider=self._overlay_units)
+            on_refresh=self._refresh_overlays, unit_provider=self._overlay_units,
+            show_header=False)   # Shell.navigator_header already shows this title
         self.overlay_panel.pack(fill="both", expand=True)
+
+    def _build_board_panel(self) -> None:
+        """
+        "Tablero" stage: row/panel editor in `navigators["board"]`, preview
+        in `_board_plot_frame`. Same floating-window-to-stage move as
+        `_build_overlay_panel`, applied to what used to be `BoardWindow` --
+        see `gui/board_window.py`. Edits `self.board_rows` in place, so
+        nothing about the board itself is lost across a rebuild, only (like
+        the overlay panel) the widgets showing it.
+
+        (Histograma went through this same move for one session and was
+        reverted back to a plot mode -- see `PLOT_MODES`/
+        `_build_histogram_section` -- so it has no panel of its own here.)
+        """
+        self.board_editor = BoardEditor(
+            self, self.navigators["board"], self._board_plot_frame)
+
+    def _export_figure_as(self, fmt: str) -> None:
+        self.fig_format_var.set(fmt)
+        self._export_figure()
 
     def _build_export_navigator(self) -> None:
         """
-        Static content for the "Exportar" stage's navigator: the board and
-        histogram entry points used to sit at the very bottom of the long
-        "Exportar" section in the Gráfico pane, past Ejes/Etiquetas/Leyenda/
-        Datos -- reachable, but only after scrolling past four other
-        sections first, which is what made them "poco accesibles". The
-        stage's own primary action (Shell's default footer, "Exportar
-        figura") stays exactly where it was; this is everything else
-        export-related that deserves to be seen without scrolling for it.
+        "Exportar" stage's navigator -- now the ONE place that owns every
+        export action. Until a previous session, the same controls (profile,
+        CSV, format/DPI, import, plus Tablero/Histograma entry points) were
+        split between here and an "Exportar" section inside the
+        always-visible "Gráfico" pane (removed -- see `_build_plot_pane`),
+        so the two could be edited without the other ever being touched:
+        literal duplication, not just a similar-looking pair of panels.
+
+        Tablero doesn't get a compact block here anymore either: it's a
+        full rail stage (`_build_board_panel`), so repeating its controls in
+        miniature here would just move the same duplication one level down.
+        The one exception is "+ Agregar gráfico actual" below -- it has to
+        live somewhere the CURRENT figure is still on screen (the "board"
+        stage swaps the canvas to the board preview instead), so it stays a
+        one-button shortcut here too, alongside the same button now ALSO in
+        the Tablero stage itself (`BoardEditor`) -- both call
+        `_add_current_to_board`, which jumps to "board" afterwards so
+        whichever one was clicked, the result is what's on screen next.
+
+        Histograma has nothing here at all: it's a plot mode now (see
+        `PLOT_MODES`), so exporting a histogram is exporting whatever tab
+        has that mode active, same as any other mode -- no special case.
+
+        Three primary actions -- CSV (datos), PDF (la figura) y JSON (sólo
+        ajustes) -- match what actually gets reached for; PNG/SVG/PGF sit
+        behind "Más formatos" instead of competing with those three.
         """
         parent = self.navigators["export"]
         for w in parent.winfo_children():
             w.destroy()
 
-        stacked_label(parent, t("Tablero"))
-        self.nav_board_status = hint(parent, t("Tablero vacío."), wraplength=190)
-        self.nav_board_status.pack(fill="x", pady=(0, 8))
-        board_actions = ctk.CTkFrame(parent, fg_color="transparent")
-        board_actions.pack(fill="x", pady=(0, 16))
-        ghost_button(board_actions, t("+ Agregar actual"), self._add_current_to_board,
-                    width=132).pack(side="left")
-        ghost_button(board_actions, t("Ver..."), self._open_board,
-                    width=58).pack(side="left", padx=(6, 0))
+        stacked_label(parent, t("Perfil de exportación"))
+        self.profile_var = ctk.StringVar(value="")
+        self.profile_combo = ctk.CTkComboBox(
+            parent, values=[], variable=self.profile_var, height=28,
+            font=font("body"), dropdown_font=font("body"),
+            command=lambda _=None: self._apply_export_profile())
+        self.profile_combo.pack(fill="x", pady=(0, 6))
+        profile_actions = ctk.CTkFrame(parent, fg_color="transparent")
+        profile_actions.pack(fill="x", pady=(0, 14))
+        ghost_button(profile_actions, t("Guardar como..."), self._save_export_profile,
+                    width=126).pack(side="left")
+        ghost_button(profile_actions, t("Eliminar"), self._delete_export_profile,
+                    width=84).pack(side="left", padx=6)
+        self._refresh_export_profiles()
 
-        Rule(parent).pack(fill="x", pady=(0, 16))
+        Rule(parent).pack(fill="x", pady=(0, 14))
 
-        stacked_label(parent, t("Histograma"))
-        hint(parent, t("Distribución de los valores de una o más señales."),
-             wraplength=200).pack(fill="x", pady=(0, 6))
-        ghost_button(parent, t("Ver histograma..."), self._open_histogram_window,
+        stacked_label(parent, t("Datos para PGFPlots"))
+        self.csv_mode_var = ctk.StringVar(value="individual")
+        self.csv_mode_combo = LabeledCombo(
+            parent, CSV_MODES, self.csv_mode_var, labels=_labels()["csv"], height=28)
+        self.csv_xy_note = hint(parent, t("Modo X/Y: se exporta la curva actual."),
+                                wraplength=190)
+        self.csv_mode_combo.pack(fill="x")
+        primary_button(parent, t("Exportar CSV..."), self._export_csv,
+                       height=30).pack(fill="x", pady=(8, 14))
+
+        self.fig_format_var = ctk.StringVar(value="pdf")
+        self.dpi_var = ctk.StringVar(value="300")
+        primary_button(parent, t("Exportar figura (PDF)..."),
+                       lambda: self._export_figure_as("pdf"),
+                       height=32).pack(fill="x", pady=(0, 6))
+        ghost_button(parent, t("Guardar solo ajustes (JSON)..."),
+                    self._export_settings_only, height=28).pack(fill="x", pady=(0, 14))
+
+        more_formats = StaticSection(parent, t("Más formatos"), expanded=False)
+        more_formats.pack(fill="x", pady=(0, 14))
+        mbox = more_formats.body
+        combo_field(mbox, t("Formato"), self.fig_format_var,
+                    ["png", "svg", "pgf"], width=90)
+        entry_field(mbox, "DPI", self.dpi_var, rule=False)
+        hint(mbox, t("Otros formatos (PNG, SVG, PGF) y DPI."),
+             wraplength=190).pack(fill="x", pady=(4, 8))
+        ghost_button(mbox, t("Exportar figura..."), self._export_figure,
                     height=28).pack(fill="x")
 
-        self._update_board_status()
+        Rule(parent).pack(fill="x", pady=(0, 14))
+        ghost_button(parent, t("Importar figura..."), self._import_figure,
+                    height=28).pack(fill="x")
+        hint(parent, t("Recupera una figura exportada antes con TODOS sus ajustes "
+                    "y señales, en una pestaña nueva. Necesita el archivo "
+                    "«.labplotter.json» que se guarda junto a la figura."),
+             wraplength=190).pack(fill="x", pady=(4, 0))
+
+        Rule(parent).pack(fill="x", pady=(14, 12))
+
+        stacked_label(parent, t("Tablero"))
+        hint(parent, t("Agregá este gráfico como un panel más -- edición, "
+                    "filas y exportación del tablero viven en el stage "
+                    "«Tablero»."), wraplength=190).pack(fill="x", pady=(0, 6))
+        ghost_button(parent, t("+ Agregar gráfico actual"), self._add_current_to_board,
+                    height=28).pack(fill="x")
 
 
 def main() -> None:

@@ -20,6 +20,7 @@ selected), with a **rail** that narrows both to one stage of the workflow.
     data       sources / columns        the plot (figure-level settings)
     adjust     the trace list           the selected trace, or the plot
     annotate   cursors + annotations    the plot (figure-level settings)
+    board      row/panel editor         the plot (figure-level settings)
     export     figure / board queue     the plot (figure-level settings)
 
     Only "adjust" ever has an object worth showing in "Selección" (a
@@ -51,16 +52,54 @@ from .widgets import (
 
 # Rail order == workflow order. The labels are the stage names the user sees;
 # the keys are what the routing switches on.
-STAGES: list[tuple[str, str]] = [
-    ("data", t("Datos")),
-    ("adjust", t("Ajuste")),
-    ("annotate", t("Anotar")),
-    ("export", t("Exportar")),
-]
+#
+# "board" was a floating `CTkToplevel` window opened on demand from a button
+# buried in the "export" stage (see `gui/board_window.py`). Promoted to a
+# stage of its own for the same reason "annotate" stopped being a floating
+# `OverlayWindow`: a side window the user has to remember to reopen reads as
+# "not really part of the app". As a stage, entering it swaps the workspace
+# canvas to the board preview exactly like entering "annotate" already swaps
+# the navigator -- see `App._show_plot_frame`.
+#
+# "histogram" went through the same promotion for one session and was
+# reverted: the user asked for it back as one more entry in the per-plot mode
+# switch (Tiempo/X-Y/Bode/Pizarra -- see `App.PLOT_MODES`), sharing the SAME
+# figure/canvas those already draw into, with its settings folded into the
+# "Gráfico" inspector pane instead of a dedicated navigator column. That also
+# means a histogram is just whatever `self.fig` currently shows, so
+# `App._add_current_to_board` (add the current plot to the board) and every
+# export action already work on it with no special case.
+def STAGES() -> list[tuple[str, str]]:
+    """
+    (key, label) pairs, translated fresh on every call.
+
+    Was a module-level constant; `t(...)` only ran once, at import time, so
+    the rail kept showing whatever language was active the first time
+    `gui.shell` was imported -- language switches rebuild the rail (see
+    `App._rebuild_ui` -> `_build_layout` -> `_build_rail`) but a frozen list
+    never picks up the new translations. This was the "izquierda no pasa a
+    ingles" bug: every other label in the app is produced by a method or a
+    widget built at call time, so only this constant was stuck.
+    """
+    return [
+        ("data", t("Datos")),
+        ("adjust", t("Ajuste")),
+        ("annotate", t("Anotar")),
+        ("board", t("Tablero")),
+        ("export", t("Exportar")),
+    ]
 
 RAIL_WIDTH = 78
 NAVIGATOR_WIDTH = 236
 INSPECTOR_WIDTH = 308
+
+# Stages whose navigator content doesn't fit the default column width without
+# clipping (forms with several fields side by side, not a simple list) --
+# "annotate" (cursor/annotation editor) and "board" (used to be a floating
+# ~1040px-wide window). `App._set_stage` widens the navigator to this on
+# first entering one of them, unless the user already dragged it.
+WIDE_STAGES = frozenset({"annotate", "board"})
+WIDE_NAVIGATOR_WIDTH = 340
 
 
 class Shell(ctk.CTk):
@@ -122,7 +161,18 @@ class Shell(ctk.CTk):
 
     def _build_topbar(self) -> None:
         """Wordmark, plot tabs, and the one action that starts a session."""
-        bar = ctk.CTkFrame(self, height=46, corner_radius=0, fg_color=col("bar"))
+        # 64, not the original 46: the tab strip alone (a chip's label at
+        # this app's own "label" font, plus the chip's internal padding,
+        # plus its own outer pady) needs ~59px end to end in THIS
+        # environment's fallback font -- 46 was simply smaller than what its
+        # own children asked for, so every chip's name rendered squeezed
+        # into a shorter box than its text actually needed (confirmed by
+        # measuring winfo_height() against winfo_reqheight() at every
+        # level: `content` itself requested more height than `bar` gave
+        # it). 64 leaves a few pixels of real margin over that 59px instead
+        # of matching it exactly -- a real font on the user's machine can
+        # need a little more than this headless fallback font does.
+        bar = ctk.CTkFrame(self, height=64, corner_radius=0, fg_color=col("bar"))
         bar.grid(row=0, column=0, columnspan=6, sticky="ew")
         bar.pack_propagate(False)       # children are packed
         Rule(bar, strong=True).pack(side="bottom", fill="x")
@@ -141,7 +191,14 @@ class Shell(ctk.CTk):
         # region they replace. -> App._build_tab_strip / _refresh_tab_strip
         self.tab_strip = ctk.CTkFrame(content, fg_color="transparent",
                                       width=1, height=1)
-        self.tab_strip.pack(side="left", pady=9)
+        # fill+expand: without this the frame sizes to CTkFrame's own
+        # default width (200px, since App._build_tab_strip disables
+        # propagate on its inner "strip" without giving it an explicit
+        # width either) and never grows past that no matter how many tabs
+        # are open or how long a tab's name is -- chips just silently
+        # overflow the fixed box instead of the strip claiming the leftover
+        # room between the wordmark and the topbar's right-aligned buttons.
+        self.tab_strip.pack(side="left", fill="x", expand=True, pady=6)
 
         ghost_button(content, "?", self._open_shortcuts,
                      width=28).pack(side="right", pady=9)
@@ -150,7 +207,7 @@ class Shell(ctk.CTk):
 
     def _build_rail(self) -> None:
         """Permanent stage rail -- the only always-visible global control."""
-        self.rail = NavRail(self, STAGES, self.stage_var,
+        self.rail = NavRail(self, STAGES(), self.stage_var,
                             command=self._set_stage, width=RAIL_WIDTH)
         self.rail.grid(row=1, column=0, sticky="ns")
 
@@ -180,7 +237,7 @@ class Shell(ctk.CTk):
 
         holder = ctk.CTkFrame(panel, fg_color="transparent", width=1, height=1)
         holder.pack(fill="both", expand=True)
-        for key, _label in STAGES:
+        for key, _label in STAGES():
             self.navigators[key] = ctk.CTkScrollableFrame(
                 holder, fg_color="transparent", corner_radius=0)
 
@@ -238,8 +295,23 @@ class Shell(ctk.CTk):
         panel.pack_propagate(False)
         self.inspector_panel = panel
 
-        self.subject = ColorHeader(panel)
-        self.subject.pack(fill="x", padx=16, pady=(14, 0))
+        subject_row = ctk.CTkFrame(panel, fg_color="transparent",
+                                   width=1, height=1)
+        subject_row.pack(fill="x", padx=16, pady=(14, 0))
+        self.subject = ColorHeader(subject_row)
+        self.subject.pack(side="left", fill="x", expand=True)
+        # What tells "Selección" and "Gráfico" apart isn't visible from the
+        # tab names alone -- one is per-trace, the other whole-figure, and
+        # both are reachable from every stage. Same info_dot pattern as
+        # `navigator_info` in `_build_navigator`, not a new widget language;
+        # placed beside the subject header rather than inside `PaneStack`
+        # (whose own header is rebuilt on every `add()`/language change, so
+        # anything packed into it directly would need to survive that).
+        info_dot(subject_row,
+                 t("Selección: ajustes de la traza elegida en la lista. "
+                   "Gráfico: ajustes de toda la figura (ejes, leyenda, "
+                   "exportación) -- no cambian según qué traza esté "
+                   "seleccionada.")).pack(side="right")
         Rule(panel, strong=True).pack(fill="x", padx=16, pady=(8, 12))
 
         self.inspector = PaneStack(panel)
@@ -332,6 +404,7 @@ class Shell(ctk.CTk):
     def _navigator_title(key: str) -> str:
         return {"data": t("Archivos de datos"), "adjust": t("Trazas"),
                 "annotate": t("Cursores y anotaciones"),
+                "board": t("Tablero de figuras"),
                 "export": t("Exportar")}.get(key, "")
 
     @staticmethod
@@ -340,6 +413,7 @@ class Shell(ctk.CTk):
             "data": t("Archivos cargados y qué columna usa cada traza."),
             "adjust": t("Estilo, correcciones y unidades de cada traza."),
             "annotate": t("Cursores de medición y anotaciones de la figura."),
+            "board": t("Combina varias figuras ya exportadas en una grilla para el informe."),
             "export": t("Formato, DPI y el bloque LaTeX que incluye la figura."),
         }.get(key, "")
 
@@ -358,12 +432,13 @@ class Shell(ctk.CTk):
         actions = {
             "data": (t("+  Abrir archivo"), self._load_files),
             "adjust": (t("Quitar"), self._remove_selected_signal),
-            # "annotate" has no primary-button action here on purpose: the
-            # embedded cursor/annotation editor (-> App._build_overlay_panel)
-            # already opens with its own "+ Vertical" / "+ Horizontal" /
-            # "Agregar" buttons, so a second "+ Vertical" in the footer
-            # would just be the same action offered twice.
-            "export": (t("Exportar figura"), self._export_figure),
+            # "annotate", "board" and "export" have no primary-button
+            # action here on purpose: each of those stages'
+            # navigator (-> App._build_overlay_panel / _build_board_panel /
+            # _build_export_navigator) already ends with its own primary
+            # button(s) built into the content itself, so a footer button
+            # would just be the same action offered a second time in the
+            # same column.
         }
         label, command = actions.get(key, (None, None))
         if label is not None:
@@ -414,7 +489,7 @@ class Shell(ctk.CTk):
         self.bind_all("<Control-e>", lambda _e: self._export_figure())
         self.bind_all("<Control-z>", lambda _e: self._undo())
         self.bind_all("<F1>", lambda _e: self._open_shortcuts())
-        for index, (key, _label) in enumerate(STAGES, start=1):
+        for index, (key, _label) in enumerate(STAGES(), start=1):
             self.bind_all(f"<Control-Key-{index}>",
                           lambda _e, k=key: self.rail.select(k))
 

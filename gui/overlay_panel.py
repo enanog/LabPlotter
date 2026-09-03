@@ -100,7 +100,8 @@ class OverlayPanel(ctk.CTkFrame):
                  annotations: AnnotationManager,
                  on_refresh: Callable[[], None],
                  unit_provider: Optional[Callable[[], tuple[str, str]]] = None,
-                 initial_pane: str = "cursors", **kwargs):
+                 initial_pane: str = "cursors", show_header: bool = True,
+                 **kwargs):
         super().__init__(master, fg_color="transparent", **kwargs)
         self.cursors = cursors
         self.annotations = annotations
@@ -111,26 +112,46 @@ class OverlayPanel(ctk.CTkFrame):
         self._sel_annotation: Optional[int] = None
         self._axes_index = 0
 
-        header = ctk.CTkFrame(self, fg_color="transparent")
-        header.pack(fill="x", padx=18, pady=(16, 0))
-        ctk.CTkLabel(header, text=spaced(t("Cursores y anotaciones")), font=font("header"),
-                     text_color=col("fg_muted")).pack(side="left")
-        Rule(self, strong=True).pack(fill="x", padx=18, pady=(8, 12))
+        # `show_header=False` when embedded in the "Anotar" stage's navigator
+        # (`App._build_overlay_panel`) -- `Shell.navigator_header` already
+        # prints this exact same title ("Cursores y anotaciones") above the
+        # navigator column, so repeating it here just doubled it on screen.
+        # Still on by default for `OverlayWindow` below, the floating
+        # `CTkToplevel` this panel was originally built for (currently
+        # unused, kept for reference): there, the window's own title bar is
+        # a separate surface, so this header isn't a duplicate.
+        if show_header:
+            header = ctk.CTkFrame(self, fg_color="transparent")
+            header.pack(fill="x", padx=18, pady=(16, 0))
+            ctk.CTkLabel(header, text=spaced(t("Cursores y anotaciones")), font=font("header"),
+                        text_color=col("fg_muted")).pack(side="left")
+            Rule(self, strong=True).pack(fill="x", padx=18, pady=(8, 12))
 
         self.pane_var = ctk.StringVar(value=initial_pane if initial_pane in PANES
                                       else PANES[0])
         Segmented(self, PANES, self.pane_var, labels=_pane_labels(),
                   command=lambda _v: self._show_pane(),
-                  width=132).pack(padx=18, anchor="w")
+                  width=132).pack(padx=18, pady=(16, 0), anchor="w")
 
         self.panes: dict[str, ctk.CTkFrame] = {}
         holder = ctk.CTkFrame(self, fg_color="transparent")
         holder.pack(fill="both", expand=True, padx=18, pady=(14, 16))
         for name in PANES:
-            # Scrollable: the annotation editor is taller than the palette,
-            # and the cursor pane grows with every cursor placed.
-            self.panes[name] = ctk.CTkScrollableFrame(
-                holder, fg_color="transparent", corner_radius=0)
+            # A plain frame, NOT its own CTkScrollableFrame: this panel is
+            # embedded in `navigators["annotate"]` (`App._build_overlay_panel`),
+            # which is ALREADY a `CTkScrollableFrame` (`Shell._build_navigator`,
+            # same as every other stage's navigator column). Nesting a second
+            # scrollable canvas inside that one is exactly the pattern
+            # `gui/shell.py` already warns about elsewhere in this codebase
+            # (two `CTkScrollableFrame`s competing for vertical space): the
+            # inner one doesn't stretch to fill the outer one's real
+            # available height, it just claims a height of its own -- which
+            # is what read as "a box with a fixed height" that stopped short
+            # of the column's actual bottom instead of using it. A plain
+            # frame has no height of its own to claim; it just flows as part
+            # of the ONE scrollable region the navigator column already is,
+            # using all the height that's there and scrolling with it.
+            self.panes[name] = ctk.CTkFrame(holder, fg_color="transparent")
         self._build_cursor_pane(self.panes["cursors"])
         self._build_annotation_pane(self.panes["annotations"])
         self._show_pane()
@@ -175,18 +196,26 @@ class OverlayPanel(ctk.CTkFrame):
     # Cursors
     # ================================================================== #
     def _build_cursor_pane(self, parent) -> None:
+        # Stacked, not a row of fixed-width buttons: the old 104+112+76px
+        # row was sized for the ~440px floating OverlayWindow and doesn't
+        # fit the navigator column, so it clipped (see git history for the
+        # exact budget). One full-width button per row -- plain `pack`,
+        # deliberately no `grid` here (a `grid`+`pack` mix inside a
+        # DPI-scaled CTk hierarchy is where the next report traced back to)
+        # -- uses the column's actual width, whatever it is, and the
+        # vertical room a single cramped row was leaving empty.
         actions = ctk.CTkFrame(parent, fg_color="transparent")
         actions.pack(fill="x")
         primary_button(actions, t("+ Vertical"), lambda: self._arm_cursor("v"),
-                       height=28, width=104).pack(side="left")
+                       height=28).pack(fill="x")
         ghost_button(actions, t("+ Horizontal"), lambda: self._arm_cursor("h"),
-                     width=112).pack(side="left", padx=6)
+                     height=28).pack(fill="x", pady=(6, 0))
         ghost_button(actions, t("Quitar"), self._remove_cursor,
-                     width=76).pack(side="left")
+                     height=28).pack(fill="x", pady=(6, 0))
 
         self.cursor_hint = hint(parent,
                                 t("Clic sobre el gráfico para colocarlo; "
-                                  "arrastralos para medir."), wraplength=390)
+                                  "arrastralos para medir."), wraplength=230)
         self.cursor_hint.pack(fill="x", pady=(8, 12))
 
         self.cursor_list = ctk.CTkFrame(parent, fg_color="transparent",
@@ -230,7 +259,7 @@ class OverlayPanel(ctk.CTkFrame):
         self.cursor_slider.set(0.5)
         self.cursor_slider.configure(state="disabled")
         self.slider_readout = hint(box, t("Seleccioná un cursor de la lista."),
-                                   wraplength=390)
+                                   wraplength=230)
         self.slider_readout.pack(fill="x", pady=(0, 4))
 
         self._slider_range: tuple[float, float, bool] = (0.0, 1.0, False)
@@ -461,7 +490,7 @@ class OverlayPanel(ctk.CTkFrame):
         self.text_var = ctk.StringVar(value="")
         stacked_entry(parent, t("Texto"), self.text_var)
         hint(parent, t("Admite mathtext: $f_0 = 9{,}61\\,$kHz"),
-             wraplength=390).pack(fill="x", pady=(0, 12))
+             wraplength=230).pack(fill="x", pady=(0, 12))
 
         # Coordinates: the two things you always set, kept in the open.
         self.vars: dict[str, ctk.StringVar] = {
@@ -488,10 +517,10 @@ class OverlayPanel(ctk.CTkFrame):
         capture = ctk.CTkFrame(parent, fg_color="transparent")
         capture.pack(fill="x", pady=(10, 4))
         ghost_button(capture, t("Capturar X/Y"), lambda: self._capture(False),
-                     width=136).pack(side="left")
+                     height=28).pack(fill="x")
         ghost_button(capture, t("Capturar X₂/Y₂"), lambda: self._capture(True),
-                     width=136).pack(side="left", padx=6)
-        self.annotation_hint = hint(parent, "", wraplength=390)
+                     height=28).pack(fill="x", pady=(6, 0))
+        self.annotation_hint = hint(parent, "", wraplength=230)
         self.annotation_hint.pack(fill="x", pady=(2, 10))
 
         # Everything else is style, and style has a sensible default.
@@ -580,16 +609,19 @@ class OverlayPanel(ctk.CTkFrame):
             rule=False)]
         hint(box, t("La fuente aplica al texto plano; los tramos entre $...$ "
                     "siguen el set de mathtext."),
-             wraplength=380).pack(fill="x", pady=(4, 0))
+             wraplength=230).pack(fill="x", pady=(4, 0))
 
+        # Same stacked layout as the cursor pane's action row, and for the
+        # same reason: fixed-width buttons in one row don't fit the
+        # navigator column.
         actions = ctk.CTkFrame(parent, fg_color="transparent")
         actions.pack(fill="x")
         primary_button(actions, t("Agregar"), self._add_annotation,
-                       height=28, width=96).pack(side="left")
+                       height=28).pack(fill="x")
         ghost_button(actions, t("Actualizar"), self._update_annotation,
-                     width=100).pack(side="left", padx=6)
+                     height=28).pack(fill="x", pady=(6, 0))
         ghost_button(actions, t("Quitar"), self._remove_annotation,
-                     width=84).pack(side="left")
+                     height=28).pack(fill="x", pady=(6, 0))
 
         Rule(parent).pack(fill="x", pady=12)
         SectionHeader(parent, t("Anotaciones"), action=t("Limpiar todo"),
@@ -604,9 +636,9 @@ class OverlayPanel(ctk.CTkFrame):
         io_bar = ctk.CTkFrame(parent, fg_color="transparent")
         io_bar.pack(fill="x", pady=(10, 0))
         ghost_button(io_bar, t("Guardar..."), self._save_overlays,
-                     width=132).pack(side="left")
+                     height=28).pack(fill="x")
         ghost_button(io_bar, t("Cargar..."), self._load_overlays,
-                     width=132).pack(side="left", padx=6)
+                     height=28).pack(fill="x", pady=(6, 0))
 
         self._on_kind_change()
 

@@ -51,17 +51,40 @@ DEFAULT_COLOR_CYCLE = [
 ]
 
 
+# Unidad "comodín" para magnitudes personalizadas: no representa ningún
+# texto en particular (el texto real lo escribe el usuario en el combo de
+# unidad y viaja en `Signal.unit_v_in`/en las StringVar de la GUI), es sólo
+# la clave de reserva que usan `y_units_for_kind`/los combos cuando todavía
+# no se escribió nada. Vacía == "sin unidad", que es una opción válida.
+CUSTOM_UNIT_KEY = ""
+
+
 def x_units_for_domain(domain: str) -> dict:
     """Devuelve el diccionario de unidades de eje X correspondiente al dominio."""
     return FREQ_UNITS if domain == "freq" else TIME_UNITS
 
 
 def y_units_for_kind(y_kind: str) -> dict:
-    """Devuelve el diccionario de unidades de eje Y correspondiente al tipo de magnitud."""
+    """
+    Devuelve el diccionario de unidades de eje Y correspondiente al tipo de
+    magnitud.
+
+    "custom" es la magnitud "a mano" (presión, cuentas de ADC, adimensional,
+    lo que sea) que no encaja en tensión/dB/fase: no tiene prefijos
+    conocidos, así que el diccionario tiene una sola entrada de factor 1.0
+    cuya clave es la unidad que el usuario haya escrito (ver
+    `CUSTOM_UNIT_KEY` y `Signal.unit_v_in`, que para esta magnitud guarda el
+    texto libre en lugar de una clave fija de `VOLT_UNITS`/`DB_UNITS`/
+    `DEG_UNITS`). El diccionario nunca queda vacío: sin texto propio, la
+    clave es "" (sin unidad), que es exactamente lo que pidió el usuario
+    como alternativa a escribir algo.
+    """
     if y_kind == "dB":
         return DB_UNITS
     if y_kind == "deg":
         return DEG_UNITS
+    if y_kind == "custom":
+        return {CUSTOM_UNIT_KEY: 1.0}
     return VOLT_UNITS
 
 
@@ -131,7 +154,13 @@ class Signal:
         x_units = x_units_for_domain(self.domain)
         y_units = y_units_for_kind(self.y_kind)
         t = self.t_raw * x_units[self.unit_t_in] + self.t_offset
-        v = self.v_raw * y_units[self.unit_v_in] * self.gain + self.v_offset
+        # `.get(..., 1.0)`: for `y_kind == "custom"`, `unit_v_in` holds
+        # whatever free text the user typed as the unit label (see
+        # `y_units_for_kind`), which is never a key of `y_units` itself
+        # (that dict only ever has the "" placeholder) -- so this must not
+        # be a direct `y_units[self.unit_v_in]` index or a custom-unit
+        # signal would raise KeyError on every redraw.
+        v = self.v_raw * y_units.get(self.unit_v_in, 1.0) * self.gain + self.v_offset
         if self.invert:
             v = -v
         return t, v

@@ -120,9 +120,10 @@ class SectionHeader(ctk.CTkFrame):
     def __init__(self, master, title: str, action: Optional[str] = None,
                  command: Optional[Callable[[], None]] = None, **kwargs):
         super().__init__(master, fg_color="transparent", **kwargs)
-        ctk.CTkLabel(self, text=spaced(title), font=font("header"),
-                     text_color=col("fg_muted"), anchor="w"
-                     ).pack(side="left")
+        self.title_label = ctk.CTkLabel(self, text=spaced(title),
+                                        font=font("header"),
+                                        text_color=col("fg_muted"), anchor="w")
+        self.title_label.pack(side="left")
         if action is not None:
             link = ctk.CTkLabel(self, text=action, font=font("hint"),
                                 text_color=col("fg_muted"), cursor="hand2")
@@ -130,6 +131,10 @@ class SectionHeader(ctk.CTkFrame):
             if command is not None:
                 link.bind("<Button-1>", lambda _e: command())
             self.action_label = link
+
+    def set_title(self, title: str) -> None:
+        """Retitle in place -- the navigator header changes with the stage."""
+        self.title_label.configure(text=spaced(title))
 
 
 # --------------------------------------------------------------------------- #
@@ -146,6 +151,7 @@ class Field(ctk.CTkFrame):
         super().__init__(master, fg_color="transparent", **kwargs)
         row = ctk.CTkFrame(self, fg_color="transparent")
         row.pack(fill="x")
+        self.row = row   # exposed so callers can anchor a DirtyDot beside the label
         self.label = ctk.CTkLabel(row, text=label, font=font("label"),
                                   text_color=col("fg_muted"),
                                   width=label_width, anchor="w")
@@ -278,8 +284,21 @@ class Segmented(ctk.CTkFrame):
             button.pack(side="left", padx=0)
             self.buttons[value] = button
 
-        variable.trace_add("write", lambda *_: self._sync())
+        self._trace_id = variable.trace_add("write", lambda *_: self._sync())
         self._sync()
+
+    def destroy(self) -> None:
+        # Without this, a rebuilt inspector/navigator leaves the OLD button's
+        # `_sync` callback registered on `self.variable` -- the variable
+        # itself usually survives (it's often owned by `App`, not this
+        # widget), so the next `.set()` fires the callback against buttons
+        # that no longer exist ("invalid command name ..."), visible as a
+        # `TclError` spammed to the console on every stage switch / rebuild.
+        try:
+            self.variable.trace_remove("write", self._trace_id)
+        except Exception:
+            pass   # variable already gone, or trace already cleared
+        super().destroy()
 
     def _choose(self, value: str) -> None:
         if not self._enabled:
@@ -423,6 +442,13 @@ class StaticSection(ctk.CTkFrame):
         header = ctk.CTkFrame(self, fg_color="transparent", height=18)
         header.pack(fill="x")
         header.pack_propagate(False)
+        self.header = header
+        # Badge slot: a collapsed section must still be able to say that it
+        # holds non-default values (see `DirtyGroup`).
+        self._badge = ctk.CTkLabel(header, text="", width=16,
+                                   font=font("mono", 9),
+                                   text_color=col("accent"))
+        self._badge.pack(side="right")
 
         self._caret = ctk.CTkLabel(header, text="", width=12, font=font("small"),
                                    text_color=col("fg_faint"))
@@ -454,6 +480,10 @@ class StaticSection(ctk.CTkFrame):
         self._caret.configure(text="\u25be" if self._expanded else "\u25b8")
         self._title.configure(
             text_color=col("fg_muted") if self._expanded else col("fg_faint"))
+
+    def set_badge(self, text: str) -> None:
+        """Short marker shown at the right of the header ('3', '*', ...)."""
+        self._badge.configure(text=text)
 
     def toggle(self) -> None:
         self.collapse() if self._expanded else self.expand()
@@ -1071,7 +1101,16 @@ class LabeledCombo(ctk.CTkFrame):
             self._combo.configure(width=width)
         self._combo.pack(fill="x")
 
-        variable.trace_add("write", lambda *_: self._sync_from_variable())
+        self._trace_id = variable.trace_add(
+            "write", lambda *_: self._sync_from_variable())
+
+    def destroy(self) -> None:
+        # Same leak as `Segmented.destroy` -- see its comment.
+        try:
+            self.variable.trace_remove("write", self._trace_id)
+        except Exception:
+            pass
+        super().destroy()
 
     def _label_for(self, value: str) -> str:
         return self.labels.get(value, value)
@@ -1119,3 +1158,490 @@ class LabeledCombo(ctk.CTkFrame):
             return None
 
     # `pack_forget`/`pack` are used by the X/Y mode switch on this widget.
+
+
+# =========================================================================== #
+# Redesign components
+# --------------------------------------------------------------------------- #
+# Everything below is additive: nothing above changed, so the current window
+# keeps working while the new shell (`gui/shell.py`) is migrated screen by
+# screen. The same design rules apply -- square corners, hairlines, label left
+# / control right -- so a redesigned panel cannot look foreign next to one that
+# has not been migrated yet.
+# =========================================================================== #
+
+TOOLTIP_DELAY_MS = 450
+
+
+class Tooltip:
+    """
+    Hover explanation for one widget.
+
+    This exists to delete paragraphs from the panels. The application
+    currently explains itself with permanent `hint()` blocks -- the unit
+    tooltip alone is five lines that are on screen whether or not anybody is
+    reading them, in a column where vertical space is the scarce resource.
+    Moving that text behind a hover keeps the explanation one gesture away
+    and gives the space back to the controls.
+
+    Plain Tk on purpose: the popup lives for a second or two, so a CTkFrame's
+    extra canvas buys nothing, and being rebuilt on every hover means it
+    always picks up the current palette without registering for repaints.
+    """
+
+    def __init__(self, widget, text: str, delay_ms: int = TOOLTIP_DELAY_MS,
+                 wraplength: int = 280):
+        self.widget = widget
+        self.text = text
+        self.delay_ms = delay_ms
+        self.wraplength = wraplength
+        self._job = None
+        self._window: Optional[tk.Toplevel] = None
+        widget.bind("<Enter>", self._schedule, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+        # A click means the user is acting, not asking: get out of the way.
+        widget.bind("<Button-1>", self._hide, add="+")
+
+    def set_text(self, text: str) -> None:
+        self.text = text
+
+    def _schedule(self, _event=None) -> None:
+        self._cancel()
+        if self.text:
+            self._job = self.widget.after(self.delay_ms, self._show)
+
+    def _cancel(self) -> None:
+        if self._job is not None:
+            try:
+                self.widget.after_cancel(self._job)
+            except Exception:
+                pass
+            self._job = None
+
+    def _show(self) -> None:
+        self._job = None
+        if self._window is not None or not self.text:
+            return
+        try:
+            x = self.widget.winfo_rootx() + 14
+            y = self.widget.winfo_rooty() + self.widget.winfo_height() + 6
+        except tk.TclError:
+            return                      # widget destroyed mid-hover
+        win = tk.Toplevel(self.widget)
+        win.wm_overrideredirect(True)   # no title bar, no taskbar entry
+        try:
+            win.wm_attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        frame = tk.Frame(win, background=tk_color("border_str"))
+        frame.pack()
+        label = tk.Label(frame, text=self.text, justify="left",
+                         wraplength=self.wraplength,
+                         background=tk_color("surface"),
+                         foreground=tk_color("fg_muted"),
+                         font=font("hint"), padx=8, pady=5)
+        label.pack(padx=1, pady=1)      # 1px frame showing through = hairline
+        win.wm_geometry(f"+{x}+{y}")
+        self._window = win
+
+    def _hide(self, _event=None) -> None:
+        self._cancel()
+        if self._window is not None:
+            try:
+                self._window.destroy()
+            except tk.TclError:
+                pass
+            self._window = None
+
+
+def info_dot(master, text: str, **kwargs) -> ctk.CTkLabel:
+    """The 'ⓘ' marker that carries a `Tooltip`. Pack it beside a label."""
+    dot = ctk.CTkLabel(master, text="ⓘ", width=14, font=font("small"),
+                       text_color=col("fg_faint"), **kwargs)
+    # Attached, not just constructed: the caller needs it to retarget the text
+    # when the same marker explains a changing context.
+    dot.tooltip = Tooltip(dot, text)
+    _hand(dot)
+    return dot
+
+
+class DirtyDot(ctk.CTkLabel):
+    """
+    Marks a field whose value differs from its default; click to revert.
+
+    The question this answers is "what did I change?", which today can only
+    be answered by remembering. It matters most on a trace: offset, gain,
+    inversion and unit are all invisible once set, and a figure that came out
+    wrong gives no clue which of them is responsible.
+    """
+
+    def __init__(self, master, variable, default, label: str = "",
+                 on_revert: Optional[Callable[[], None]] = None, **kwargs):
+        super().__init__(master, text="", width=10, font=font("small"),
+                         text_color=col("accent"), **kwargs)
+        self.variable = variable
+        self.default = default
+        self.label = label
+        self.on_revert = on_revert
+        self._listeners: list[Callable[[], None]] = []
+        self._trace_id = variable.trace_add("write", lambda *_: self._sync())
+        self.bind("<Button-1>", lambda _e: self.revert())
+        Tooltip(self, t("Modificado -- clic para volver al valor por defecto."))
+        self._sync()
+
+    def destroy(self) -> None:
+        # Same leak as `Segmented.destroy` (see its comment): a trace never
+        # removed keeps this dot, its variable and its listeners alive in
+        # Tk's own callback table for the rest of the process, even though
+        # `_sync`'s TclError guard means it never crashes visibly here.
+        try:
+            self.variable.trace_remove("write", self._trace_id)
+        except Exception:
+            pass
+        super().destroy()
+
+    @property
+    def dirty(self) -> bool:
+        return str(self.variable.get()) != str(self.default)
+
+    def add_listener(self, callback: Callable[[], None]) -> None:
+        """Called on every dirty-state change (used by `DirtyGroup`)."""
+        self._listeners.append(callback)
+
+    def revert(self) -> None:
+        if not self.dirty:
+            return
+        self.variable.set(self.default)
+        if self.on_revert is not None:
+            self.on_revert()
+
+    def _sync(self) -> None:
+        try:
+            self.configure(text="•" if self.dirty else "")
+            _hand(self) if self.dirty else self.configure(cursor="")
+        except tk.TclError:
+            return                      # widget destroyed
+        for callback in self._listeners:
+            try:
+                callback()
+            except Exception:
+                pass
+
+
+class DirtyGroup:
+    """
+    Counts the modified fields of one section and badges its header.
+
+    Without this, progressive disclosure hides information: a collapsed
+    section looks exactly the same whether it holds defaults or six edited
+    values. The badge is what makes folding a section safe.
+    """
+
+    def __init__(self, section: Optional["StaticSection"] = None):
+        self.section = section
+        self.dots: list[DirtyDot] = []
+
+    def add(self, dot: DirtyDot) -> DirtyDot:
+        self.dots.append(dot)
+        dot.add_listener(self.refresh)
+        self.refresh()
+        return dot
+
+    def count(self) -> int:
+        return sum(1 for dot in self.dots if dot.dirty)
+
+    def revert_all(self) -> None:
+        for dot in self.dots:
+            dot.revert()
+
+    def refresh(self) -> None:
+        if self.section is None:
+            return
+        n = self.count()
+        self.section.set_badge(str(n) if n else "")
+
+
+class NavRail(ctk.CTkFrame):
+    """
+    The permanent left rail: one entry per stage of the workflow.
+
+    Ordered as the work actually happens -- ingest, adjust, annotate, export
+    -- and numbered, because the order is the instruction. Selecting a stage
+    is what swaps the navigator and the inspector, so at any moment roughly a
+    quarter of the application's controls are reachable and the rest are not
+    on screen at all.
+    """
+
+    def __init__(self, master, items: Sequence[tuple[str, str]], variable,
+                 command: Optional[Callable[[str], None]] = None,
+                 width: int = 78, **kwargs):
+        super().__init__(master, width=width, corner_radius=0,
+                         fg_color=col("panel"), **kwargs)
+        self.pack_propagate(False)
+        self.variable = variable
+        self.command = command
+        self.entries: dict[str, dict] = {}
+
+        VRule(self, height=1).pack(side="right", fill="y")
+        for index, (key, label) in enumerate(items, start=1):
+            self.entries[key] = self._build_entry(key, index, label)
+        self.refresh()
+
+    def _build_entry(self, key: str, index: int, label: str) -> dict:
+        row = ctk.CTkFrame(self, fg_color="transparent", height=58,
+                           corner_radius=0)
+        row.pack(fill="x")
+        row.pack_propagate(False)
+        marker = ctk.CTkFrame(row, width=3, height=1, corner_radius=0,
+                              fg_color="transparent")
+        marker.pack(side="left", fill="y")
+        stack = ctk.CTkFrame(row, fg_color="transparent")
+        stack.pack(fill="both", expand=True)
+        number = ctk.CTkLabel(stack, text=f"{index}", font=font("mono", 10),
+                              text_color=col("fg_faint"))
+        number.pack(pady=(11, 0))
+        name = ctk.CTkLabel(stack, text=label, font=font("small"),
+                            text_color=col("fg_muted"))
+        name.pack()
+        for widget in (row, stack, number, name):
+            widget.bind("<Button-1>", lambda _e, k=key: self.select(k))
+            _hand(widget)
+        return {"row": row, "marker": marker, "number": number, "name": name}
+
+    def select(self, key: str) -> None:
+        if key not in self.entries:
+            return
+        self.variable.set(key)
+        self.refresh()
+        if self.command is not None:
+            self.command(key)
+
+    def refresh(self) -> None:
+        current = self.variable.get()
+        for key, parts in self.entries.items():
+            active = key == current
+            parts["row"].configure(fg_color=col("sel") if active else "transparent")
+            parts["marker"].configure(
+                fg_color=col("accent") if active else "transparent")
+            parts["number"].configure(
+                text_color=col("fg") if active else col("fg_faint"))
+            parts["name"].configure(
+                text_color=col("fg") if active else col("fg_muted"))
+
+
+class PaneStack(ctk.CTkFrame):
+    """
+    A `Segmented` header over swapped bodies -- this project's CTkTabview.
+
+    CTkTabview is the obvious choice and is deliberately not used: it draws
+    its own rounded segmented button and its own card-like frame, neither of
+    which can be brought into a vocabulary built on square corners and
+    hairlines without fighting its internals on every release. `Segmented`
+    already renders the exact control this needs, and `OverlayPanel` already
+    swaps panes this way, so this is that pattern promoted to a widget. The
+    API is deliberately CTkTabview-shaped (`add`, `tab`, `set`), so swapping
+    one for the other later is a mechanical change.
+    """
+
+    def __init__(self, master, variable=None, width: int = 0, **kwargs):
+        super().__init__(master, fg_color="transparent", width=1, height=1,
+                         **kwargs)
+        self.variable = variable or ctk.StringVar(value="")
+        self._labels: dict[str, str] = {}
+        self._bodies: dict[str, ctk.CTkFrame] = {}
+        self._segmented: Optional[Segmented] = None
+        self._segmented_width = width
+        self._header = ctk.CTkFrame(self, fg_color="transparent", width=1,
+                                    height=1)
+        self._header.pack(fill="x")
+        self._holder = ctk.CTkFrame(self, fg_color="transparent", width=1,
+                                    height=1)
+        self._holder.pack(fill="both", expand=True, pady=(10, 0))
+
+    def add(self, key: str, label: str, scrollable: bool = True) -> ctk.CTkFrame:
+        """Register a pane and return the frame its content goes into."""
+        self._labels[key] = label
+        body = (ctk.CTkScrollableFrame(self._holder, fg_color="transparent",
+                                       corner_radius=0) if scrollable
+                else ctk.CTkFrame(self._holder, fg_color="transparent",
+                                  width=1, height=1))
+        self._bodies[key] = body
+        if not self.variable.get():
+            self.variable.set(key)
+        self._rebuild_header()
+        return body
+
+    def tab(self, key: str) -> Optional[ctk.CTkFrame]:
+        return self._bodies.get(key)
+
+    def set(self, key: str) -> None:
+        if key not in self._bodies:
+            return
+        self.variable.set(key)
+        self._show()
+
+    def get(self) -> str:
+        return self.variable.get()
+
+    def _rebuild_header(self) -> None:
+        if self._segmented is not None:
+            self._segmented.destroy()
+        keys = list(self._labels)
+        self._segmented = Segmented(
+            self._header, keys, self.variable, labels=dict(self._labels),
+            command=lambda _v: self._show(),
+            width=self._segmented_width or max(72, 210 // max(1, len(keys))))
+        self._segmented.pack(anchor="w")
+        self._show()
+
+    def _show(self) -> None:
+        current = self.variable.get()
+        for key, body in self._bodies.items():
+            body.pack_forget()
+            if key == current:
+                body.pack(fill="both", expand=True)
+
+
+class ColorHeader(ctk.CTkFrame):
+    """
+    Inspector header carrying the selected trace's colour.
+
+    This is the visual link between a control and the curve it drives: the
+    swatch here, the swatch in the trace list and the line on the canvas are
+    the same colour, so a panel of twenty anonymous fields becomes "the panel
+    for the red one" at a glance.
+    """
+
+    def __init__(self, master, **kwargs):
+        super().__init__(master, fg_color="transparent", height=30,
+                         corner_radius=0, **kwargs)
+        self.pack_propagate(False)
+        self._bar = ctk.CTkFrame(self, width=4, height=1, corner_radius=0,
+                                 fg_color=col("border_str"))
+        self._bar.pack(side="left", fill="y")
+        self._title = ctk.CTkLabel(self, text="", font=font("header"),
+                                   text_color=col("fg"), anchor="w")
+        self._title.pack(side="left", padx=(9, 0))
+        self._tag = ctk.CTkLabel(self, text="", font=font("mono", 9),
+                                 text_color=col("fg_faint"))
+        self._tag.pack(side="right", padx=(4, 0))
+
+    def set_subject(self, title: str, color: Optional[str] = None,
+                    tag: str = "") -> None:
+        self._title.configure(text=spaced(title))
+        self._tag.configure(text=tag.upper())
+        self._bar.configure(fg_color=color or col("border_str"))
+
+
+class CommandPalette(ctk.CTkToplevel):
+    """
+    Ctrl+K: type a few letters, run any command.
+
+    The application exposes well over a hundred actions. A palette is what
+    keeps that from forcing either a crowded toolbar or a deep menu tree: the
+    rarely used commands stop competing for screen space with the frequent
+    ones, which is the same reason the rail can afford to show only four
+    entries.
+    """
+
+    def __init__(self, master, commands: Sequence[tuple[str, Callable[[], None]]],
+                 title: str = "", limit: int = 9):
+        super().__init__(master)
+        self.commands = list(commands)
+        self.limit = limit
+        self._rows: list[tuple[ctk.CTkFrame, Callable[[], None]]] = []
+        self._active = 0
+
+        self.title(title or t("Comandos"))
+        self.geometry("520x330")
+        self.resizable(False, False)
+        self.configure(fg_color=col("panel"))
+
+        self.query_var = ctk.StringVar(value="")
+        entry = ctk.CTkEntry(self, textvariable=self.query_var, height=34,
+                             font=font("body"),
+                             placeholder_text=t("Buscar un comando..."))
+        entry.pack(fill="x", padx=16, pady=(16, 10))
+        Rule(self).pack(fill="x", padx=16)
+        self.list_frame = ctk.CTkFrame(self, fg_color="transparent", width=1,
+                                       height=1)
+        self.list_frame.pack(fill="both", expand=True, padx=16, pady=(8, 14))
+
+        self.query_var.trace_add("write", lambda *_: self._render())
+        for sequence, delta in (("<Down>", 1), ("<Up>", -1)):
+            self.bind(sequence, lambda _e, d=delta: self._move(d))
+        self.bind("<Return>", lambda _e: self._run(self._active))
+        self.bind("<Escape>", lambda _e: self.destroy())
+        self.transient(master)
+        self._render()
+        entry.focus_set()
+
+    @staticmethod
+    def _score(query: str, label: str) -> Optional[int]:
+        """Subsequence match; a prefix hit outranks a scattered one."""
+        query, low = query.strip().lower(), label.lower()
+        if not query:
+            return 0
+        if low.startswith(query):
+            return -2
+        if query in low:
+            return -1
+        index = 0
+        for char in query:
+            index = low.find(char, index) + 1
+            if index == 0:
+                return None
+        return index
+
+    def _matches(self) -> list[tuple[str, Callable[[], None]]]:
+        query = self.query_var.get()
+        scored = []
+        for label, action in self.commands:
+            score = self._score(query, label)
+            if score is not None:
+                scored.append((score, label, action))
+        scored.sort(key=lambda item: (item[0], item[1]))
+        return [(label, action) for _s, label, action in scored[:self.limit]]
+
+    def _render(self) -> None:
+        for widget in self.list_frame.winfo_children():
+            widget.destroy()
+        self._rows = []
+        self._active = 0
+        matches = self._matches()
+        if not matches:
+            hint(self.list_frame, t("Sin resultados.")).pack(fill="x", pady=8)
+            return
+        for index, (label, action) in enumerate(matches):
+            row = ctk.CTkFrame(self.list_frame, corner_radius=0,
+                               height=ROW_HEIGHT, fg_color="transparent")
+            row.pack(fill="x", pady=1)
+            row.pack_propagate(False)
+            name = ctk.CTkLabel(row, text=label, font=font("small"), anchor="w")
+            name.pack(side="left", padx=10)
+            for widget in (row, name):
+                widget.bind("<Button-1>", lambda _e, i=index: self._run(i))
+                _hand(widget)
+            self._rows.append((row, action))
+        self._highlight()
+
+    def _highlight(self) -> None:
+        for index, (row, _action) in enumerate(self._rows):
+            row.configure(fg_color=col("sel") if index == self._active
+                          else "transparent")
+
+    def _move(self, delta: int) -> None:
+        if not self._rows:
+            return
+        self._active = (self._active + delta) % len(self._rows)
+        self._highlight()
+
+    def _run(self, index: int) -> None:
+        if not (0 <= index < len(self._rows)):
+            return
+        action = self._rows[index][1]
+        self.destroy()
+        try:
+            action()
+        except Exception:
+            pass    # a failing command must not take the window with it

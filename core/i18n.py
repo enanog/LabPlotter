@@ -212,7 +212,9 @@ _EN: dict[str, str] = {
         "Board (several figures in one layout)",
     "Título del panel": "Panel title",
     "+ Agregar gráfico actual": "+ Add current plot",
+    "+ Agregar actual": "+ Add current",
     "Ver tablero...": "View board...",
+    "Ver...": "View...",
     "Tablero vacío.": "Board is empty.",
     "Cargá y configurá al menos una señal antes de agregar el gráfico al tablero.":
         "Load and configure at least one signal before adding the plot to the board.",
@@ -274,6 +276,8 @@ _EN: dict[str, str] = {
         "Select a trace from the list to see its settings.",
     "Sin trazas. Abrí un archivo para empezar.":
         "No traces. Open a file to get started.",
+    "Sin archivos. Abrí uno para empezar.":
+        "No files. Open one to get started.",
 
     # --- cursors and annotations -----------------------------------------
     "+ Vertical": "+ Vertical",
@@ -451,6 +455,22 @@ _EN: dict[str, str] = {
     "Rombo": "Diamond",
     "Estrella": "Star",
     "Eje vertical": "Vertical axis",
+    "Apariencia": "Appearance",
+    "Unidades y Eje": "Units & axis",
+    "Muestreo": "Sampling",
+    "Desplaza la traza en el eje X. 0 = sin desplazamiento.":
+        "Shifts the trace along the X axis. 0 = no shift.",
+    "Desplaza la traza en el eje Y. 0 = sin desplazamiento.":
+        "Shifts the trace along the Y axis. 0 = no shift.",
+    "Se aplica a todas las trazas visibles, no sólo a ésta -- es el mismo "
+    "recorte/diezmado de la sección «Datos» del panel Gráfico.":
+        "Applies to every visible trace, not just this one -- it's the same "
+        "crop/decimation as the “Data” section of the Plot pane.",
+    "Guardar solo ajustes (JSON)...": "Save settings only (JSON)...",
+    "Guardar solo ajustes (JSON)": "Save settings only (JSON)",
+    "Guardar ajustes (sin figura)": "Save settings (no figure)",
+    "Error al guardar ajustes": "Error saving settings",
+    "No se pudo escribir el archivo.": "Could not write the file.",
     "Correcciones": "Corrections",
     "Ganancia": "Gain",
     "Sólo tiene efecto en señales de tipo «voltage»: escalar "
@@ -460,6 +480,18 @@ _EN: dict[str, str] = {
         "the value of a dB or phase trace has no physical meaning "
         "(that's what “Shift in Y” is for).",
     "Cursores y anotaciones": "Cursors and annotations",
+    "Mover cursor": "Move cursor",
+    "Seleccioná un cursor de la lista.": "Select a cursor from the list.",
+    "Tipografía y ubicación": "Typography and placement",
+    "Peso": "Weight",
+    "Alineación H": "H alignment",
+    "Alineación V": "V alignment",
+    "La fuente aplica al texto plano; los tramos entre $...$ "
+    "siguen el set de mathtext.":
+        "The family applies to plain text; runs between $...$ follow the "
+        "mathtext set.",
+    "Admite mathtext: $f_0 = 9{,}61\\,$kHz":
+        "Supports mathtext: $f_0 = 9{.}61\\,$kHz",
     "Máx. puntos en pantalla": "Max points on screen",
     "Líneas de texto extra": "Extra text lines",
     "Posición en la línea": "Position along the line",
@@ -503,6 +535,95 @@ _EN: dict[str, str] = {
     "trazas cargadas?": "loaded traces?",
     "El idioma se aplicará la próxima vez que abras la aplicación.":
         "The language will be applied the next time you open the application.",
+
+    # --- histogram window --------------------------------------------------
+    "Histograma": "Histogram",
+    "Ver histograma...": "View histogram...",
+    "Distribución de los valores (eje X o Y) de una o más señales, "
+    "superpuestas.":
+        "Distribution of the values (X or Y axis) of one or more signals, "
+        "overlaid.",
+    "Distribución de los valores de una o más señales.":
+        "Distribution of the values of one or more signals.",
+    "Señales": "Signals",
+    "Sin trazas cargadas.": "No traces loaded.",
+    "↻ Actualizar": "↻ Refresh",
+    "↻ Actualizar lista de señales": "↻ Refresh signal list",
+    "Eje a histogramar": "Axis to histogram",
+    "«y» = valores de la señal (tensión, dB, magnitud propia...); "
+    "«x» = tiempo o frecuencia.":
+        "“y” = the signal's values (voltage, dB, custom quantity...); "
+        "“x” = time or frequency.",
+    "Regla de bins": "Binning rule",
+    "«manual» habilita el campo de cantidad de bins; cualquier otra regla "
+    "la calcula sola a partir de los datos (ver `core/histogram.py`).":
+        "“manual” enables the bin-count field; every other rule works it out "
+        "from the data itself (see `core/histogram.py`).",
+    "Cantidad de bins": "Number of bins",
+    "Densidad (normalizar área a 1)": "Density (normalise area to 1)",
+    "Mismos bordes de bin para todas": "Same bin edges for all",
+    "Con esto tildado, las señales superpuestas comparten rango y bordes "
+    "de bin -- si no, cada una arma los suyos y comparar alturas entre "
+    "ellas no tiene sentido.":
+        "With this ticked, the overlaid signals share range and bin edges -- "
+        "otherwise each builds its own and comparing bar heights between "
+        "them is meaningless.",
+    "Opacidad de barras": "Bar opacity",
+    "Log en Y es lo habitual para ver la cola de una distribución (como en "
+    "la figura de referencia). Log en X sólo tiene sentido si TODOS los "
+    "bins caen en valores positivos -- con un histograma que cruza el cero "
+    "(p. ej. deltaG) va a recortar la mitad negativa; en ese caso dejalo "
+    "en «linear».":
+        "Log on Y is the usual choice to see the tail of a distribution (as "
+        "in the reference figure). Log on X only makes sense if ALL the bins "
+        "fall on positive values -- with a histogram that crosses zero "
+        "(e.g. deltaG) it will clip the negative half; leave it on “linear” "
+        "in that case.",
+    "Estadísticas": "Statistics",
+    "sin datos válidos": "no valid data",
+    "Cuentas": "Counts",
+    "Densidad de probabilidad": "Probability density",
+    "Tiempo / frecuencia": "Time / frequency",
+    "Exportar histograma": "Export histogram",
+    "Elegí al menos una señal a la izquierda.":
+        "Select at least one signal on the left.",
+    # --- manual units ------------------------------------------------------
+    "Unidad X manual": "Manual X unit",
+    "Unidad Y1 manual": "Manual Y1 unit",
+    "Unidad Y2 manual": "Manual Y2 unit",
+    "s/u": "n/u",
+    "Con «manual» tildado podés escribir cualquier texto en el combo de "
+    "unidad de ese eje (o dejarlo vacío para no mostrar ninguna) -- no hay "
+    "conversión de prefijos para una unidad que no sea una de las conocidas.":
+        "With “manual” ticked you can type any text in that axis' unit combo "
+        "(or leave it empty to show none) -- there is no prefix conversion "
+        "for a unit that is not one of the known ones.",
+    "Unidad en la que vienen los datos del archivo. Con «Magnitud: custom» "
+    "el combo de unidad acepta texto libre (o vacío, para no mostrar ninguna "
+    "unidad) -- no hay conversión de prefijos para una magnitud propia.":
+        "Unit the file's data is expressed in. With “Magnitude: custom” the "
+        "unit combo accepts free text (or empty, to show no unit at all) -- "
+        "there is no prefix conversion for a custom magnitude.",
+
+    # --- source file reconnection ------------------------------------------
+    "Reconectar archivo de origen": "Reconnect source file",
+    "Archivos de datos": "Data files",
+    "No se pudo reconectar": "Could not reconnect",
+    "El archivo elegido no tiene las columnas esperadas para esta traza.":
+        "The chosen file does not have the columns expected for this trace.",
+    "Señales reconectadas": "Signals reconnected",
+    "Se reconectaron automáticamente {n} señal(es) más desde la misma "
+    "carpeta.":
+        "{n} more signal(s) were reconnected automatically from the same "
+        "folder.",
+    "{missing} de {total} señal(es) no se pudieron recargar: el archivo de "
+    "datos original ya no está en la misma ruta que cuando se exportó la "
+    "figura. Quedaron marcadas (⚠) en la lista de trazas -- hacé clic en "
+    "una para reconectarla a mano.":
+        "{missing} of {total} signal(s) could not be reloaded: the original "
+        "data file is no longer at the same path it was when the figure was "
+        "exported. They are flagged (⚠) in the trace list -- click one to "
+        "reconnect it by hand.",
 }
 
 

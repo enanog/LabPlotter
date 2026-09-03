@@ -20,6 +20,7 @@ Two deliberate structural choices:
 
 from __future__ import annotations
 
+import math
 from tkinter import colorchooser, filedialog, messagebox
 from typing import Callable, Optional
 
@@ -30,7 +31,8 @@ from core.units import parse_eng
 
 from .overlays import (
     ANNOTATION_KINDS, ARROW_STYLES, AnnotationManager, AnnotationSpec,
-    CursorManager, KIND_DEFAULTS, LINESTYLES, STYLE_PRESETS, format_eng,
+    CursorManager, FONT_FAMILIES, FONT_STYLES, FONT_WEIGHTS, HA_CHOICES,
+    KIND_DEFAULTS, LINESTYLES, STYLE_PRESETS, VA_CHOICES, format_eng,
     load_overlays, save_overlays,
 )
 from .theme import col, font, spaced
@@ -63,6 +65,15 @@ _KIND_FIELDS: dict[str, set[str]] = {
     "vspan": {"x", "x2", "text", "alpha", "label_pos", "fontsize", "boxed", "color"},
     "hspan": {"y", "y2", "text", "alpha", "label_pos", "fontsize", "boxed", "color"},
 }
+
+# Sentinel for "inherit the rcParams family": an empty string cannot be shown
+# in a CTkComboBox without looking like a rendering glitch.
+FONT_DEFAULT = "(por defecto)"
+
+# Every kind carries a text label, so the typography controls apply to all.
+_TEXT_STYLE_FIELDS = {"fontfamily", "fontweight", "fontstyle", "ha", "va"}
+for _kind in _KIND_FIELDS:
+    _KIND_FIELDS[_kind] |= _TEXT_STYLE_FIELDS
 
 
 def _parse_float(text: str, fallback: float = 0.0) -> float:
@@ -207,6 +218,25 @@ class OverlayPanel(ctk.CTkFrame):
                     on_enter=self._apply_cursor_position, rule=False,
                     label_width=124)
 
+        # ---- Live position slider ---------------------------------------- #
+        # Normalised 0..1 travel: the mapping to data coordinates is rebuilt on
+        # every selection and every replot (`_sync_cursor_slider`), so the same
+        # widget serves a linear time axis and a log frequency axis.
+        stacked_label(box, t("Mover cursor"))
+        self.cursor_slider = ctk.CTkSlider(
+            box, from_=0.0, to=1.0, number_of_steps=1000,
+            command=self._on_cursor_slide, height=14)
+        self.cursor_slider.pack(fill="x", pady=(0, 2))
+        self.cursor_slider.set(0.5)
+        self.cursor_slider.configure(state="disabled")
+        self.slider_readout = hint(box, t("Seleccioná un cursor de la lista."),
+                                   wraplength=390)
+        self.slider_readout.pack(fill="x", pady=(0, 4))
+
+        self._slider_range: tuple[float, float, bool] = (0.0, 1.0, False)
+        self._slider_syncing = False   # guards set() -> command re-entrancy
+        self._slider_job = None        # debounce handle for the heavy refresh
+
     def _arm_cursor(self, orientation: str) -> None:
         self.annotations.disarm()
         self.cursors.arm(orientation)
@@ -229,6 +259,89 @@ class OverlayPanel(ctk.CTkFrame):
         spec.position = _parse_float(self.cursor_pos_var.get(), spec.position)
         self._refresh_canvas()
         self.refresh_cursor_ui()
+
+    # --------------------------- live slider ----------------------------- #
+    def _slider_to_data(self, fraction: float) -> float:
+        """Map slider travel (0..1) to data coordinates, log-aware."""
+        lo, hi, log = self._slider_range
+        fraction = min(1.0, max(0.0, float(fraction)))
+        if log and lo > 0.0:
+            # Linear interpolation on a decade axis bunches every useful
+            # position into the last 10 % of the travel; interpolate the
+            # exponent instead so the drag feels uniform across decades.
+            return math.exp(math.log(lo) + fraction * (math.log(hi) - math.log(lo)))
+        return lo + fraction * (hi - lo)
+
+    def _data_to_slider(self, value: float) -> float:
+        """Inverse of `_slider_to_data`, clamped to the travel."""
+        lo, hi, log = self._slider_range
+        try:
+            if log and lo > 0.0 and value > 0.0:
+                span = math.log(hi) - math.log(lo)
+                fraction = (math.log(value) - math.log(lo)) / span if span else 0.0
+            else:
+                span = hi - lo
+                fraction = (value - lo) / span if span else 0.0
+        except (ValueError, ZeroDivisionError):
+            fraction = 0.0
+        return min(1.0, max(0.0, fraction))
+
+    def _on_cursor_slide(self, value: float) -> None:
+        """
+        Per-tick handler: moves ONE cursor's artists and nothing else.
+
+        No `on_refresh()` here on purpose -- that re-renders every overlay and
+        would make the drag stutter. The expensive part (readout table, cursor
+        list rebuild) is debounced in `_schedule_slider_commit`.
+        """
+        if self._slider_syncing or self._sel_cursor is None:
+            return
+        position = self._slider_to_data(value)
+        # snap=False: snapping fights a continuous drag. The exact-position
+        # field and the canvas drag still honour the global snap setting.
+        if not self.cursors.move(self._sel_cursor, position, snap=False):
+            return
+        self.cursor_pos_var.set(f"{position:.6g}")
+        spec = self.cursors.get(self._sel_cursor)
+        x_unit, y_unit = self._units()
+        unit = x_unit if (spec is not None and spec.orientation == "v") else y_unit
+        self.slider_readout.configure(text=format_eng(position, unit))
+        self._schedule_slider_commit()
+
+    def _schedule_slider_commit(self, delay_ms: int = 120) -> None:
+        if self._slider_job is not None:
+            try:
+                self.after_cancel(self._slider_job)
+            except Exception:
+                pass
+        self._slider_job = self.after(delay_ms, self._commit_slider)
+
+    def _commit_slider(self) -> None:
+        """Settled: now refresh the measurement table and the cursor list."""
+        self._slider_job = None
+        self.cursors.notify()   # -> App._on_cursor_change -> refresh_cursor_ui
+
+    def _sync_cursor_slider(self) -> None:
+        """Re-map the slider to the selected cursor's axis range and position."""
+        rng = (None if self._sel_cursor is None
+               else self.cursors.range_for(self._sel_cursor))
+        spec = (None if self._sel_cursor is None
+                else self.cursors.get(self._sel_cursor))
+        if rng is None or spec is None:
+            self.cursor_slider.configure(state="disabled")
+            self.slider_readout.configure(
+                text=t("Seleccioná un cursor de la lista."))
+            return
+        self._slider_range = rng
+        self.cursor_slider.configure(state="normal")
+        self._slider_syncing = True
+        try:
+            self.cursor_slider.set(self._data_to_slider(spec.position))
+        finally:
+            self._slider_syncing = False
+        x_unit, y_unit = self._units()
+        unit = x_unit if spec.orientation == "v" else y_unit
+        self.slider_readout.configure(text=format_eng(spec.position, unit))
 
     def _remove_cursor(self) -> None:
         if self._sel_cursor is None:
@@ -268,6 +381,9 @@ class OverlayPanel(ctk.CTkFrame):
         if not self.cursors.armed:
             self.cursor_hint.configure(
                 text=t(t("Clic sobre el gráfico para colocarlo; arrastralos para medir.")))
+        # Keep the slider tracking the selection and the current axis limits:
+        # a zoom or a replot changes the travel range under it.
+        self._sync_cursor_slider()
 
     def _render_cursor_list(self) -> None:
         for widget in self.cursor_list.winfo_children():
@@ -439,6 +555,33 @@ class OverlayPanel(ctk.CTkFrame):
                                               rule=False)]
         self.widgets["text"] = []
 
+        # ---- Typography and label placement ------------------------------ #
+        typography = StaticSection(parent, t("Tipografía y ubicación"))
+        typography.pack(fill="x", pady=(0, 12))
+        box = typography.body
+
+        self.fontfamily_var = ctk.StringVar(value=FONT_DEFAULT)
+        self.fontweight_var = ctk.StringVar(value="normal")
+        self.fontstyle_var = ctk.StringVar(value="normal")
+        self.ha_var = ctk.StringVar(value="center")
+        self.va_var = ctk.StringVar(value="center")
+
+        self.widgets["fontfamily"] = [combo_field(
+            box, t("Fuente"), self.fontfamily_var,
+            [FONT_DEFAULT] + FONT_FAMILIES, width=140)]
+        self.widgets["fontweight"] = [combo_field(
+            box, t("Peso"), self.fontweight_var, FONT_WEIGHTS, width=110)]
+        self.widgets["fontstyle"] = [combo_field(
+            box, t("Estilo"), self.fontstyle_var, FONT_STYLES, width=110)]
+        self.widgets["ha"] = [combo_field(
+            box, t("Alineación H"), self.ha_var, HA_CHOICES, width=110)]
+        self.widgets["va"] = [combo_field(
+            box, t("Alineación V"), self.va_var, VA_CHOICES, width=110,
+            rule=False)]
+        hint(box, t("La fuente aplica al texto plano; los tramos entre $...$ "
+                    "siguen el set de mathtext."),
+             wraplength=380).pack(fill="x", pady=(4, 0))
+
         actions = ctk.CTkFrame(parent, fg_color="transparent")
         actions.pack(fill="x")
         primary_button(actions, t("Agregar"), self._add_annotation,
@@ -566,6 +709,14 @@ class OverlayPanel(ctk.CTkFrame):
             "arrow": self.arrow_var.get(),
             "label_pos": _parse_float(self.vars["label_pos"].get(), 0.5),
             "alpha": _parse_float(self.vars["alpha"].get(), 1.0),
+            # "" means "inherit": the renderer keeps the rcParams family and
+            # the per-kind alignment default.
+            "fontfamily": ("" if self.fontfamily_var.get() == FONT_DEFAULT
+                           else self.fontfamily_var.get()),
+            "fontweight": self.fontweight_var.get(),
+            "fontstyle": self.fontstyle_var.get(),
+            "ha": self.ha_var.get(),
+            "va": self.va_var.get(),
         }
 
     def _load_form(self, spec: AnnotationSpec) -> None:
@@ -581,6 +732,11 @@ class OverlayPanel(ctk.CTkFrame):
         self.linestyle_var.set(spec.linestyle)
         self.arrow_var.set(spec.arrow)
         self.boxed_var.set(spec.boxed)
+        self.fontfamily_var.set(spec.fontfamily or FONT_DEFAULT)
+        self.fontweight_var.set(spec.fontweight or "normal")
+        self.fontstyle_var.set(spec.fontstyle or "normal")
+        self.ha_var.set(spec.ha or "center")
+        self.va_var.set(spec.va or "center")
         self._axes_index = spec.axes_index
 
     # ----------------------------- actions ------------------------------- #
@@ -690,6 +846,17 @@ class OverlayPanel(ctk.CTkFrame):
     def refresh_all(self) -> None:
         self.refresh_cursor_ui()
         self.refresh_annotation_list()
+
+    def clear_selection(self) -> None:
+        """
+        Drop any cursor/annotation selection before the underlying managers
+        are repopulated with a different tab's content (`from_dict`) --
+        otherwise a selected id from the OLD tab could point at nothing (or
+        worse, at an unrelated cursor/annotation that happens to reuse the
+        same id) in the new one.
+        """
+        self._sel_cursor = None
+        self._sel_annotation = None
 
 
 class OverlayWindow(ctk.CTkToplevel):

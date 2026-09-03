@@ -191,12 +191,26 @@ def figure_state_path(fig_path: str) -> Path:
     return Path(base + FIGURE_STATE_SUFFIX)
 
 
+def save_figure_state_to(json_path: str, state: dict) -> bool:
+    """
+    Write the sidecar directly at `json_path` -- no figure file involved.
+
+    Used by "save settings only" (no PNG/PDF/SVG/PGF exported alongside).
+    Unlike `save_figure_state`, which derives the sidecar path FROM an image
+    path via `figure_state_path`, this writes exactly the path it is given,
+    so it also works for a path that already ends in `.labplotter.json`
+    (running that through `figure_state_path` would double the suffix).
+    """
+    payload = {"version": FIGURE_STATE_VERSION, **state}
+    path = Path(json_path)
+    _stamp_relative_paths(payload, path.parent)
+    return _write_json(path, payload)
+
+
 def save_figure_state(fig_path: str, state: dict) -> bool:
     """Write the sidecar for `fig_path`. Best-effort: a failure here must
     never undo an export that already succeeded."""
-    payload = {"version": FIGURE_STATE_VERSION, **state}
-    _stamp_relative_paths(payload, Path(fig_path).parent)
-    return _write_json(figure_state_path(fig_path), payload)
+    return save_figure_state_to(str(figure_state_path(fig_path)), state)
 
 
 def load_figure_state(path: str) -> Optional[dict]:

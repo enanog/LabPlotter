@@ -29,9 +29,13 @@ from typing import Callable, Optional, Sequence
 
 import numpy as np
 
-# Every artist created by this module carries this gid, so data curves can be
-# told apart from overlay artists without relying on labels.
+# Every artist created by this module carries a gid prefixed with OVERLAY_GID,
+# so data curves can be told apart from overlay artists without relying on
+# labels. Each manager uses its own suffix, so a gid sweep performed by one
+# manager can never delete artists owned by the other.
 OVERLAY_GID = "_labplotter_overlay"
+CURSOR_GID = f"{OVERLAY_GID}:cursor"
+ANNOTATION_GID = f"{OVERLAY_GID}:annotation"
 
 # Overlay chrome is intentionally greyscale: the color channel belongs to the
 # data. Annotations may override the color per item (e.g. to match a curve).
@@ -40,6 +44,16 @@ ANNOTATION_COLOR = "#2A2724"
 
 ARROW_STYLES: list[str] = ["->", "<-", "<->", "-|>", "<|-|>", "-"]
 LINESTYLES: list[str] = ["--", "-", "-.", ":"]
+# Generic Matplotlib families only: they resolve through the font manager on
+# any machine, unlike a concrete face that may not be installed. The renderer
+# runs on mathtext (text.usetex = False), so this family applies to the plain
+# text runs; math runs follow rcParams["mathtext.fontset"].
+FONT_FAMILIES: list[str] = ["serif", "sans-serif", "monospace", "cursive",
+                            "fantasy"]
+FONT_WEIGHTS: list[str] = ["normal", "bold"]
+FONT_STYLES: list[str] = ["normal", "italic"]
+HA_CHOICES: list[str] = ["left", "center", "right"]
+VA_CHOICES: list[str] = ["top", "center", "bottom", "baseline"]
 ANNOTATION_KINDS: dict[str, str] = {
     "Punto de interés": "point",
     "Flecha": "arrow",
@@ -93,7 +107,7 @@ def format_eng(value: Optional[float], unit: str = "", digits: int = 4,
 
 def _is_data_line(artist) -> bool:
     """True for a user curve; False for overlay artists and private labels."""
-    if artist.get_gid() == OVERLAY_GID:
+    if (artist.get_gid() or "").startswith(OVERLAY_GID):
         return False
     label = artist.get_label() or "_"
     return not label.startswith("_")
@@ -117,6 +131,48 @@ def _sibling_axes(base) -> list:
         if np.allclose(ax.get_position().bounds, bounds, rtol=1e-3, atol=1e-4):
             axes_list.append(ax)
     return axes_list
+
+
+def _all_axes(axes: Sequence) -> list:
+    """Every axes involved, twins included (Bode "Juntos" uses twinx)."""
+    out: list = []
+    for base in axes:
+        for ax in _sibling_axes(base):
+            if not any(ax is seen for seen in out):
+                out.append(ax)
+    return out
+
+
+def purge_overlay_artists(axes: Sequence, gid: Optional[str] = None,
+                          keep: Sequence = ()) -> int:
+    """
+    Remove every overlay artist still living on `axes` that is not in `keep`.
+
+    Safety net against "ghost overlays": an artist whose owning manager
+    dropped its reference (see `attach`), or one added by a kind renderer
+    that raised half-way through. Matching is by gid, never by label, so a
+    data curve can never be swept by accident.
+    """
+    prefix = gid or OVERLAY_GID
+    kept = {id(a) for a in keep}
+    removed = 0
+    for ax in _all_axes(axes):
+        # ArtistList views are live in Matplotlib >= 3.7: snapshot before
+        # mutating, otherwise the iteration skips elements.
+        groups = (list(ax.lines), list(ax.texts), list(ax.patches),
+                  list(ax.collections), list(getattr(ax, "artists", [])))
+        for group in groups:
+            for artist in group:
+                if not (artist.get_gid() or "").startswith(prefix):
+                    continue
+                if id(artist) in kept:
+                    continue
+                try:
+                    artist.remove()
+                    removed += 1
+                except (NotImplementedError, ValueError, AttributeError):
+                    pass
+    return removed
 
 
 def _sorted_xy(line) -> Optional[tuple[np.ndarray, np.ndarray]]:
@@ -225,8 +281,18 @@ class CursorManager:
         only the specs survive. Cursors pointing at an axes index that no
         longer exists fall back to the first axes instead of being dropped.
         """
-        self.axes = list(axes)
+        # BUGFIX (ghost overlays): this used to only do `self._artists.clear()`,
+        # which is correct right after `fig.clear()` -- every artist is already
+        # dead -- but WRONG when called on live axes, which is exactly what
+        # `App._refresh_overlays()` does on every panel action: the artists
+        # stayed on the axes with their references dropped, so `redraw()` found
+        # nothing to destroy and painted a second copy on top. Destroy first,
+        # then sweep by gid to catch anything untracked.
+        for cid in list(self._artists):
+            self._destroy_artists(cid)
         self._artists.clear()
+        self.axes = list(axes)
+        purge_overlay_artists(self.axes, gid=CURSOR_GID)
         n = len(self.axes)
         for spec in self.cursors:
             if spec.axes_index >= n:
@@ -309,7 +375,7 @@ class CursorManager:
         else:
             line = ax.axhline(spec.position, color=CURSOR_COLOR, lw=0.9,
                               ls=dashes, zorder=6, label="_nolegend_")
-        line.set_gid(OVERLAY_GID)
+        line.set_gid(CURSOR_GID)
         artists = [line]
 
         if self.show_tags:
@@ -331,7 +397,7 @@ class CursorManager:
                               ha="left", va="bottom", fontsize=7,
                               color=CURSOR_COLOR, bbox=box, zorder=7,
                               clip_on=True)
-            tag.set_gid(OVERLAY_GID)
+            tag.set_gid(CURSOR_GID)
             artists.append(tag)
 
         self._artists[spec.cid] = artists
@@ -358,6 +424,52 @@ class CursorManager:
                 tag.set_position((spec.position, 0.985))
             else:
                 tag.set_position((0.012, spec.position))
+
+    def move(self, cid: int, position: float, snap: Optional[bool] = None,
+             notify: bool = False) -> bool:
+        """
+        Move one cursor in place. Returns False if the cursor is gone.
+
+        Fast path for continuous input (slider, drag): only that cursor's
+        artists are touched and the canvas is queued with `draw_idle()` --
+        no `fig.clear()`, no re-plot, no layout pass. `notify=False` keeps
+        the expensive listener chain (readout table + widget rebuild) out of
+        the per-tick path; the caller is expected to debounce `notify()`.
+        """
+        spec = self.get(cid)
+        if spec is None:
+            return False
+        use_snap = self.snap_to_data if snap is None else bool(snap)
+        value = float(position)
+        if use_snap and spec.axes_index < len(self.axes):
+            value = self._snap(spec.axes_index, spec.orientation, value)
+        spec.position = value
+        self._update_artists(spec)
+        self.canvas.draw_idle()
+        if notify:
+            self._notify(redraw=False)
+        return True
+
+    def notify(self) -> None:
+        """Public hook: announce a change without re-rendering the overlays."""
+        self._notify(redraw=False)
+
+    def range_for(self, cid: int) -> Optional[tuple[float, float, bool]]:
+        """(low, high, is_log) of the axis a cursor travels along."""
+        spec = self.get(cid)
+        if spec is None or not self.axes:
+            return None
+        ax = self.axes[min(spec.axes_index, len(self.axes) - 1)]
+        if spec.orientation == "v":
+            lo, hi = ax.get_xlim()
+            log = ax.get_xscale() == "log"
+        else:
+            lo, hi = ax.get_ylim()
+            log = ax.get_yscale() == "log"
+        lo, hi = float(min(lo, hi)), float(max(lo, hi))
+        if not (np.isfinite(lo) and np.isfinite(hi)) or hi <= lo:
+            return None
+        return lo, hi, bool(log)
 
     # --------------------------- event handling -------------------------- #
     def _axes_index_for(self, ax) -> Optional[int]:
@@ -580,6 +692,11 @@ class AnnotationSpec:
     alpha: float = 1.0
     marker: str = "o"
     markersize: float = 4.0
+    fontfamily: str = ""          # "" -> rcParams default
+    fontweight: str = "normal"    # normal | bold
+    fontstyle: str = "normal"     # normal | italic
+    ha: str = ""                  # "" -> per-kind default (see _text_kwargs)
+    va: str = ""
     visible: bool = True
 
 
@@ -637,8 +754,13 @@ class AnnotationManager:
             pass
 
     def attach(self, axes: Sequence) -> None:
-        self.axes = list(axes)
+        # Same fix as CursorManager.attach: destroy before dropping the
+        # references, then sweep orphans by gid.
+        for aid in list(self._artists):
+            self._destroy_artists(aid)
         self._artists.clear()
+        self.axes = list(axes)
+        purge_overlay_artists(self.axes, gid=ANNOTATION_GID)
         n = len(self.axes)
         for spec in self.items:
             if spec.axes_index >= n:
@@ -741,17 +863,49 @@ class AnnotationManager:
         return dict(boxstyle="square,pad=0.30", fc="white", ec="#4A473F",
                     lw=0.6, alpha=0.90)
 
+    def _tracked(self) -> list:
+        """Every artist this manager currently owns."""
+        return [artist for group in self._artists.values() for artist in group]
+
+    def _text_kwargs(self, spec: AnnotationSpec, ha: str = "center",
+                     va: str = "center") -> dict:
+        """
+        Text styling shared by every kind renderer.
+
+        `ha`/`va` are the per-kind defaults; an empty value on the spec means
+        "keep the default", so annotations saved before these fields existed
+        render exactly as they used to.
+        """
+        kwargs = {"fontsize": spec.fontsize, "color": spec.color,
+                  "ha": spec.ha or ha, "va": spec.va or va}
+        if spec.fontfamily:
+            kwargs["fontfamily"] = spec.fontfamily
+        if spec.fontweight and spec.fontweight != "normal":
+            kwargs["fontweight"] = spec.fontweight
+        if spec.fontstyle and spec.fontstyle != "normal":
+            kwargs["fontstyle"] = spec.fontstyle
+        return kwargs
+
     def _render(self, spec: AnnotationSpec) -> list:
         ax = self.axes[spec.axes_index]
         artists: list = []
         renderer = getattr(self, f"_render_{spec.kind}", None)
         if renderer is None:
             return artists
-        for artist in renderer(ax, spec):
+        try:
+            produced = renderer(ax, spec)
+        except Exception:
+            # The kind renderer may have added artists before failing (e.g.
+            # axvline succeeds, then invalid mathtext blows up in ax.text).
+            # `redraw()` swallows the exception, so without this sweep those
+            # artists survive untracked -- a permanent ghost.
+            purge_overlay_artists([ax], gid=ANNOTATION_GID, keep=self._tracked())
+            raise
+        for artist in produced:
             if artist is None:
                 continue
             try:
-                artist.set_gid(OVERLAY_GID)
+                artist.set_gid(ANNOTATION_GID)
             except AttributeError:
                 pass
             artists.append(artist)
@@ -770,10 +924,9 @@ class AnnotationManager:
                                   lw=spec.linewidth, shrinkA=0.0, shrinkB=3.0)
             out.append(ax.annotate(
                 spec.text, xy=(spec.x, spec.y), xytext=(spec.dx, spec.dy),
-                textcoords="offset points", fontsize=spec.fontsize,
-                color=spec.color, ha="center", va="center",
-                bbox=self._box(spec), arrowprops=arrowprops, zorder=8,
-                annotation_clip=False))
+                textcoords="offset points", bbox=self._box(spec),
+                arrowprops=arrowprops, zorder=8, annotation_clip=False,
+                **self._text_kwargs(spec)))
         return out
 
     def _render_arrow(self, ax, spec: AnnotationSpec) -> list:
@@ -788,9 +941,8 @@ class AnnotationManager:
             mid_y = 0.5 * (spec.y + spec.y2)
             out.append(ax.annotate(
                 spec.text, xy=(mid_x, mid_y), xytext=(spec.dx, spec.dy),
-                textcoords="offset points", fontsize=spec.fontsize,
-                color=spec.color, ha="center", va="center",
-                bbox=self._box(spec), zorder=8, annotation_clip=False))
+                textcoords="offset points", bbox=self._box(spec), zorder=8,
+                annotation_clip=False, **self._text_kwargs(spec)))
         return out
 
     def _render_vline(self, ax, spec: AnnotationSpec) -> list:
@@ -802,9 +954,9 @@ class AnnotationManager:
             out.append(ax.text(
                 spec.x, spec.label_pos, spec.text,
                 transform=ax.get_xaxis_transform(), rotation=spec.rotation,
-                rotation_mode="anchor", ha="center", va="bottom",
-                fontsize=spec.fontsize, color=spec.color,
-                bbox=self._box(spec), zorder=8, clip_on=False))
+                rotation_mode="anchor", bbox=self._box(spec), zorder=8,
+                clip_on=False,
+                **self._text_kwargs(spec, ha="center", va="bottom")))
         return out
 
     def _render_hline(self, ax, spec: AnnotationSpec) -> list:
@@ -816,15 +968,14 @@ class AnnotationManager:
             out.append(ax.text(
                 spec.label_pos, spec.y, spec.text,
                 transform=ax.get_yaxis_transform(), rotation=spec.rotation,
-                ha="center", va="bottom", fontsize=spec.fontsize,
-                color=spec.color, bbox=self._box(spec), zorder=8, clip_on=False))
+                bbox=self._box(spec), zorder=8, clip_on=False,
+                **self._text_kwargs(spec, ha="center", va="bottom")))
         return out
 
     def _render_text(self, ax, spec: AnnotationSpec) -> list:
-        return [ax.text(spec.x, spec.y, spec.text, fontsize=spec.fontsize,
-                        color=spec.color, rotation=spec.rotation,
-                        ha="center", va="center", bbox=self._box(spec),
-                        zorder=8, clip_on=False)]
+        return [ax.text(spec.x, spec.y, spec.text, rotation=spec.rotation,
+                        bbox=self._box(spec), zorder=8, clip_on=False,
+                        **self._text_kwargs(spec))]
 
     def _render_vspan(self, ax, spec: AnnotationSpec) -> list:
         span = ax.axvspan(min(spec.x, spec.x2), max(spec.x, spec.x2),
@@ -833,9 +984,9 @@ class AnnotationManager:
         if spec.text:
             out.append(ax.text(
                 0.5 * (spec.x + spec.x2), spec.label_pos, spec.text,
-                transform=ax.get_xaxis_transform(), ha="center", va="bottom",
-                fontsize=spec.fontsize, color=spec.color,
-                bbox=self._box(spec), zorder=8, clip_on=False))
+                transform=ax.get_xaxis_transform(), bbox=self._box(spec),
+                zorder=8, clip_on=False,
+                **self._text_kwargs(spec, ha="center", va="bottom")))
         return out
 
     def _render_hspan(self, ax, spec: AnnotationSpec) -> list:
@@ -845,9 +996,9 @@ class AnnotationManager:
         if spec.text:
             out.append(ax.text(
                 spec.label_pos, 0.5 * (spec.y + spec.y2), spec.text,
-                transform=ax.get_yaxis_transform(), ha="center", va="bottom",
-                fontsize=spec.fontsize, color=spec.color,
-                bbox=self._box(spec), zorder=8, clip_on=False))
+                transform=ax.get_yaxis_transform(), bbox=self._box(spec),
+                zorder=8, clip_on=False,
+                **self._text_kwargs(spec, ha="center", va="bottom")))
         return out
 
     # ----------------------------- persistence --------------------------- #

@@ -53,11 +53,12 @@ from core.i18n import LANGUAGES, get_language, set_language, t
 from core.processing import crop, decimate, decimate_to_target
 from core.units import parse_eng
 from gui.overlays import AnnotationManager, CursorManager, format_eng
-from gui.overlay_panel import OverlayWindow
+from gui.overlay_panel import OverlayPanel
 from gui.theme import (
     TRACE_CYCLE, apply_plot_chrome, apply_theme, col, font, font_scale,
     set_font_scale, set_theme_mode, spaced, tk_color,
 )
+from gui.shell import Shell
 from gui.widgets import (
     Chip, LINE_GLYPHS, MeasurementsCard, Rule, SectionHeader,
     CodeDialog, LabeledCombo, Segmented, SectionGroup, Splitter, StaticSection,
@@ -65,15 +66,17 @@ from gui.widgets import (
     ToolButton, TraceRow, VRule, check_field, combo_field, entry_field,
     ghost_button, hint, primary_button, repaint_plain_widgets, segmented_field,
     stacked_entry, stacked_label,
+    DirtyDot, DirtyGroup, Field, Tooltip, info_dot,
 )
 from gui.board_window import BoardWindow
+from gui.histogram_window import HistogramWindow
 
 # Window width at which the type scale is exactly as designed (1.0). Matches
 # the default geometry, so the app opens at native size. Clamping lives in
 # `theme.set_font_scale`.
 _REFERENCE_WIDTH = 1480
 
-# Draggable clamp for the side panels (see `App._drag_left` / `_drag_right`).
+# Draggable clamp for the side panels (see `App._drag_navigator` / `_drag_inspector`).
 _LEFT_MIN, _LEFT_MAX = 220, 480
 _RIGHT_MIN, _RIGHT_MAX = 260, 520
 
@@ -452,12 +455,19 @@ class ColumnSelectDialog(ctk.CTkToplevel):
 # ========================================================================== #
 # Main application
 # ========================================================================== #
-class App(ctk.CTk):
+class App(Shell):
     def __init__(self) -> None:
-        super().__init__()
+        # `Shell.__init__` would run its own state -> layout -> commands ->
+        # shortcuts -> stage sequence immediately, before any of App's OWN
+        # state below exists -- and `_build_layout` (inherited from Shell,
+        # overridden in pieces below) reads that state while building. So
+        # `ctk.CTk.__init__` is called directly here, and Shell's pieces are
+        # invoked by hand, in between App's own setup, at the point they can
+        # actually run. See `Shell._init_shell_state` for the counterpart.
+        ctk.CTk.__init__(self)
         self.title("LabPlotter")
         self.geometry("1480x880")
-        # Both panels are now user-resizable (see `_drag_left`/`_drag_right`),
+        # Both panels are now user-resizable (see `_drag_navigator`/`_drag_inspector`),
         # and the whole interface scales proportionally with window width
         # (see `_on_root_configure`), so the floor no longer has to fit the
         # old fixed panel widths -- just enough for a usable three-column layout.
@@ -476,7 +486,6 @@ class App(ctk.CTk):
         self.row_widgets: dict[str, dict] = {}
         self._color_index = 0
         self._axis_labels_dirty = False   # True once the user edits axis labels
-        self.overlay_window = None        # floating cursor/annotation palette
         self._shortcuts_window = None
 
         # Multi-figure board: a list of rows, each a list of `board.BoardPanel`
@@ -488,6 +497,7 @@ class App(ctk.CTk):
         # like `_last_export_path`.
         self.board_rows: list = [board.new_row()]
         self._board_window: Optional[BoardWindow] = None
+        self._histogram_window: Optional[HistogramWindow] = None
         self._board_export_dir: Optional[str] = None
 
         # Plot tabs: several independent plots (own signals + settings) held
@@ -553,7 +563,22 @@ class App(ctk.CTk):
         set_publication_style(font_family=self.font_family_var.get(),
                               base_fontsize=_parse_float(self.font_size_var.get(), 10.0))
 
-        self._build_layout()
+        self._init_shell_state()   # Shell's view-state: stage_var, selection, ...
+        self._build_layout()       # -> Shell._build_layout (rail/navigator/canvas/inspector)
+        self._register_commands()
+        self._bind_shortcuts()
+        self._set_stage(self.stage_var.get())
+        # Render the "no traces yet" state now, so the adjust-stage navigator
+        # is never an empty container on a fresh launch (previously the last
+        # step of `_build_left_panel`).
+        self._refresh_signal_list()
+        # Static navigator content that doesn't depend on the session/tab
+        # restore below -- the embedded cursor/annotation editor and the
+        # export console -- built once here and rebuilt in `_rebuild_ui`
+        # after its own `_build_layout()` recreates the navigator frames.
+        self._build_overlay_panel()
+        self._build_export_navigator()
+        self._refresh_chips()
 
         # Snapshot of every persisted setting's startup value, taken right
         # after the widgets that own them exist and before any session/tab
@@ -579,41 +604,66 @@ class App(ctk.CTk):
     # Layout construction
     # ------------------------------------------------------------------ #
     def _build_layout(self) -> None:
-        # Column layout: [left panel] [splitter] [center, weight=1] [splitter] [right panel]
-        self.grid_columnconfigure(2, weight=1)
+        """
+        Same skeleton as `Shell._build_layout` (rail | navigator | splitter |
+        workspace | splitter | inspector | statusbar), overridden here only
+        to (a) keep the two splitters as named attributes -- `_set_compact`
+        and `_apply_state` need to grid/configure them, which Shell's own
+        version doesn't expose -- and (b) wire `on_release` into the saved
+        session, and (c) seed the navigator/inspector widths from the
+        persisted `_left_width`/`_right_width` instead of Shell's fixed
+        defaults.
+        """
+        self.grid_columnconfigure(3, weight=1)
         self.grid_rowconfigure(1, weight=1)
         self._build_topbar()
-        self._build_left_panel()
-        self.left_splitter = Splitter(self, on_drag=self._drag_left,
+        self._build_rail()
+        self._build_navigator()
+        self.navigator_panel.configure(width=self._left_width)
+        self.left_splitter = Splitter(self, on_drag=self._drag_navigator,
                                       on_release=self._save_session_soon)
-        self.left_splitter.grid(row=1, column=1, sticky="ns")
-        self._build_center_panel()
-        self.right_splitter = Splitter(self, on_drag=self._drag_right,
+        self.left_splitter.grid(row=1, column=2, sticky="ns")
+        self._build_workspace()
+        self.right_splitter = Splitter(self, on_drag=self._drag_inspector,
                                        on_release=self._save_session_soon)
-        self.right_splitter.grid(row=1, column=3, sticky="ns")
-        self._build_right_panel()
-        # Global keyboard shortcuts, skipped inside text entries by their
-        # own handlers where relevant.
-        self.bind_all("<Delete>", self._on_delete_key)
-        self.bind_all("<BackSpace>", self._on_delete_key)
-        self.bind_all("<Control-o>", lambda _e: self._load_files())
-        self.bind_all("<Control-z>", lambda _e: self._undo())
-        self.bind_all("<Control-y>", lambda _e: self._redo())
-        self.bind_all("<Control-Shift-Z>", lambda _e: self._redo())
-        self.bind_all("<Control-e>", lambda _e: self._export_figure())
-        self.bind_all("<Control-s>", lambda _e: self._export_csv())
-        self.bind_all("<F1>", lambda _e: self._open_shortcuts())
+        self.right_splitter.grid(row=1, column=4, sticky="ns")
+        self._build_inspector()
+        self.inspector_panel.configure(width=self._right_width)
+        self._build_statusbar()
 
     # ------------------------------------------------------------------ #
     # Resizable panels: drag handles, compact mode, proportional scaling
     # ------------------------------------------------------------------ #
-    def _drag_left(self, delta: int) -> None:
+    def _drag_navigator(self, delta: int) -> None:
         self._left_width = max(_LEFT_MIN, min(_LEFT_MAX, self._left_width + delta))
-        self.left_panel.configure(width=self._left_width)
+        self.navigator_panel.configure(width=self._left_width)
 
-    def _drag_right(self, delta: int) -> None:
+    def _drag_inspector(self, delta: int) -> None:
         self._right_width = max(_RIGHT_MIN, min(_RIGHT_MAX, self._right_width - delta))
-        self.right_panel.configure(width=self._right_width)
+        self.inspector_panel.configure(width=self._right_width)
+
+    def _bind_shortcuts(self) -> None:
+        """Shell's own bindings (Ctrl+K/O/E/Z, F1, Ctrl+1..4) plus the ones
+        this application had before the migration and Shell doesn't know
+        about: delete-key, redo aliases and CSV export."""
+        super()._bind_shortcuts()
+        self.bind_all("<Delete>", self._on_delete_key)
+        self.bind_all("<BackSpace>", self._on_delete_key)
+        self.bind_all("<Control-y>", lambda _e: self._redo())
+        self.bind_all("<Control-Shift-Z>", lambda _e: self._redo())
+        self.bind_all("<Control-s>", lambda _e: self._export_csv())
+        self.bind_all("<Control-m>", lambda _e: self._toggle_compact())
+
+    def _register_commands(self) -> None:
+        super()._register_commands()
+        self.commands.append((t("Guardar solo ajustes (JSON)"),
+                              self._export_settings_only))
+        # "Compacto" lives on a `ToolButton` in an already-crowded tool strip
+        # that can run out of horizontal room before it does (see
+        # `_build_workspace`'s comment on the strip's width budget) -- listing
+        # it here too means the palette always reaches it even when the
+        # button itself is clipped off-screen.
+        self.commands.append((t("Compacto"), self._toggle_compact))
 
     def _toggle_compact(self) -> None:
         self._set_compact(not self._compact)
@@ -621,8 +671,8 @@ class App(ctk.CTk):
     def _set_compact(self, active: bool) -> None:
         """Hide both side panels so the plot takes the full window width."""
         self._compact = bool(active)
-        for widget in (self.left_panel, self.left_splitter,
-                       self.right_splitter, self.right_panel):
+        for widget in (self.navigator_panel, self.left_splitter,
+                       self.right_splitter, self.inspector_panel):
             widget.grid_remove() if self._compact else widget.grid()
         self.compact_button.set_active(self._compact)
 
@@ -695,8 +745,8 @@ class App(ctk.CTk):
             return
 
         targets = [self]
-        for widget in (getattr(self, "canvas", None), self.left_panel,
-                       self.right_panel):
+        for widget in (getattr(self, "canvas", None), self.navigator_panel,
+                       self.inspector_panel):
             if widget is None:
                 continue
             targets.append(widget.get_tk_widget()
@@ -776,6 +826,7 @@ class App(ctk.CTk):
                 ("Ctrl+Y", t("Rehacer")),
                 ("Ctrl+E", t("Exportar figura (y obtener el bloque LaTeX)")),
                 ("Ctrl+S", t("Exportar CSV para PGFPlots")),
+                ("Ctrl+M", t("Modo compacto (ocultar paneles laterales)")),
                 ("Supr / Backspace", t("Quitar la traza seleccionada")),
                 ("Enter", t("Aplicar el campo activo")),
                 ("F1", t("Mostrar esta ventana")),
@@ -796,7 +847,6 @@ class App(ctk.CTk):
             ]),
             (t("Ventana"), [
                 (t("Arrastrar el borde"), t("Redimensionar los paneles laterales a mano")),
-                (t("Modo compacto"), "Ocultar los paneles y usar todo el ancho para el gráfico"),
                 ("Redimensionar ventana", "La tipografía y los controles escalan proporcionalmente"),
             ]),
         ]
@@ -1006,8 +1056,8 @@ class App(ctk.CTk):
                                int(data.get("left_width", self._left_width))))
         self._right_width = max(_RIGHT_MIN, min(_RIGHT_MAX,
                                 int(data.get("right_width", self._right_width))))
-        self.left_panel.configure(width=self._left_width)
-        self.right_panel.configure(width=self._right_width)
+        self.navigator_panel.configure(width=self._left_width)
+        self.inspector_panel.configure(width=self._right_width)
         if data.get("compact"):
             self._set_compact(True)
         sections = data.get("sections")
@@ -1069,43 +1119,19 @@ class App(ctk.CTk):
             pass
         self.destroy()
 
-    def _build_topbar(self) -> None:
-        """
-        Wordmark, the list of loaded sources, and the one action that starts
-        every session. Everything else lives in a panel, so the bar never
-        becomes a second toolbar.
-        """
-        bar = ctk.CTkFrame(self, height=46, corner_radius=0, fg_color=col("bar"))
-        bar.grid(row=0, column=0, columnspan=5, sticky="ew")
-        # pack_propagate, not grid_propagate: this frame's children are packed,
-        # and grid_propagate only governs grid-managed children -- so the
-        # requested height above was being ignored entirely.
-        bar.pack_propagate(False)
-        Rule(bar, strong=True).pack(side="bottom", fill="x")
-
-        content = ctk.CTkFrame(bar, fg_color="transparent")
-        content.pack(fill="both", expand=True, padx=18)
-
-        ctk.CTkLabel(content, text=spaced("LabPlotter"), font=font("title"),
-                     text_color=col("fg")).pack(side="left", pady=11)
-        VRule(content, height=20).pack(side="left", padx=16, pady=13)
-
-# An empty `ctk.CTkFrame` keeps its constructor default of 200x200 px: with no
-# children there is nothing for geometry propagation to shrink it to. Every
-# container below can legitimately be empty (no files loaded, no traces, a mode
-# with no extra controls), so each one is created at 1x1 and grows from its
-# children instead. This is what produced the large blank bands under the top
-# bar, above the plot and inside the trace list on a fresh launch.
-        self.chip_bar = ctk.CTkFrame(content, fg_color="transparent",
-                                     width=1, height=1)
-        self.chip_bar.pack(side="left", pady=9)
-
-        primary_button(content, t("+  Abrir archivo"), self._load_files,
-                       height=28, width=140).pack(side="left", padx=10, pady=9)
-
     def _refresh_chips(self) -> None:
-        """One chip per source file: extension tag, name and sample count."""
-        for child in self.chip_bar.winfo_children():
+        """
+        One row per source file: extension tag, name and sample count.
+
+        Lives in the "Datos" stage's navigator (`App._build_export_navigator`
+        is its sibling for "export") -- it used to be a horizontal strip in
+        the top bar, truncated to 4 chips plus a "+N más" hint because the
+        bar has no room to spare. The navigator is a full column with
+        nothing else in it for this stage, so every source file gets a row
+        and nothing is ever hidden behind a "+N" count.
+        """
+        target = self.navigators["data"]
+        for child in target.winfo_children():
             child.destroy()
 
         totals: dict[str, int] = {}
@@ -1114,91 +1140,65 @@ class App(ctk.CTk):
             key = sig.source_path or sig.name
             totals[key] = totals.get(key, 0) + int(sig.t_raw.size)
 
-        items = list(totals.items())
-        for index, (path, points) in enumerate(items[:4]):
+        if not totals:
+            hint(target, t("Sin archivos. Abrí uno para empezar."),
+                 wraplength=190).pack(fill="x", pady=(4, 0))
+            return
+        for path, points in totals.items():
             name = os.path.basename(path) or path
             tag = os.path.splitext(name)[1].lstrip(".") or "dat"
-            Chip(self.chip_bar, tag, name, f"{points:,}".replace(",", "\u2009")
-                 ).pack(side="left", padx=(0 if index == 0 else 6, 0))
-        if len(items) > 4:
-            # "más" already has an _EN entry ("more") but this line built the
-            # chip text as a raw f-string bypassing t() entirely, so English
-            # mode always showed "+N más" instead of "+N more".
-            hint(self.chip_bar, f"+{len(items) - 4} {t('más')}").pack(side="left", padx=8)
+            Chip(target, tag, name, f"{points:,}".replace(",", " ")
+                 ).pack(fill="x", anchor="w", pady=(0, 4))
 
-    def _build_left_panel(self) -> None:
-        left = ctk.CTkFrame(self, width=self._left_width, corner_radius=0,
-                            fg_color=col("panel"))
-        left.grid(row=1, column=0, sticky="ns")
-        left.pack_propagate(False)   # children are packed; see _build_topbar
-        self.left_panel = left
+    def _build_topbar(self) -> None:
+        """
+        Shell already builds the wordmark, the (empty) tab-strip container
+        and the help/commands buttons; this application only adds the tab
+        strip's actual content. The loaded-sources list and the "open file"
+        action used to also live here (a `chip_bar` strip plus a button),
+        but both are now the "Datos" stage's navigator content instead --
+        one full column, always reachable at a glance, rather than a row
+        of chips truncated to fit a 46px bar.
 
-        # Buttons are packed to the bottom edge FIRST, before the expanding
-        # scroll region below, so they can never be pushed off-window.
-        footer = ctk.CTkFrame(left, fg_color="transparent")
-        footer.pack(side="bottom", fill="x", padx=16, pady=12)
-        ghost_button(footer, t("Quitar"), self._remove_selected_signal,
-                     width=90).pack(side="left")
-        ghost_button(footer, t("Quitar todas"), self._remove_all_signals,
-                     width=118).pack(side="left", padx=6)
+        "Compacto" also moved here from the tool strip (see `_build_workspace`):
+        it hides the navigator/inspector panels, which is a whole-window
+        layout choice like "Comandos" or "?", not a per-plot tool like
+        Cursor/Zoom/Encuadrar -- Undo/Redo follow the same rule and were
+        never tool-strip buttons either, only a shortcut and a palette entry.
+        Placing it in the topbar, which never runs out of room the way the
+        tool strip does, also means it stays reachable at every window size.
+        """
+        super()._build_topbar()
+        self._build_tab_strip(self.tab_strip)
+        self.compact_button = ToolButton(self.topbar_content, t("Compacto"),
+                                         width=88, command=self._toggle_compact)
+        self.compact_button.pack(side="right", padx=(0, 8), pady=9)
 
-        # ONE scroll region for the whole column. This previously held two
-        # separate CTkScrollableFrames stacked inside a fixed-width parent
-        # with grid_propagate(False). Each CTkScrollableFrame is a canvas
-        # that listens to <Configure> to recompute its scrollregion and
-        # resize its inner frame; two of them competing for vertical space
-        # inside a container whose own size is pinned drove a
-        # configure -> resize -> configure feedback loop that pegged the UI
-        # thread. It was worst with no file loaded, because the empty
-        # parameter frame's requested height oscillated -- which is exactly
-        # when the window appeared frozen on startup.
-        scroll = ctk.CTkScrollableFrame(left, fg_color="transparent",
-                                        corner_radius=0)
-        scroll.pack(fill="both", expand=True, padx=(16, 8), pady=(14, 0))
+    def _build_stage_footer(self, key: str) -> None:
+        """Shell gives "adjust" a single "Quitar" button; this application
+        also had "Quitar todas" beside it, kept here as an addition."""
+        super()._build_stage_footer(key)
+        if key == "adjust":
+            ghost_button(self.navigator_footer, t("Quitar todas"),
+                        self._remove_all_signals, height=28
+                        ).pack(fill="x", pady=(6, 0))
 
-        SectionHeader(scroll, t("Trazas")).pack(fill="x")
-        Rule(scroll).pack(fill="x", pady=(6, 4))
+    def _build_stage_tools(self, key: str) -> None:
+        """
+        Tools don't vary by stage yet -- cursor/annotate/zoom/pan/encuadrar
+        were always available regardless of workflow stage before this
+        migration. Rather than have Shell destroy and rebuild them (and
+        `plot_mode_var`/`tool_buttons` along with them) on every rail click,
+        this builds the strip ONCE from `_build_workspace` and leaves this
+        hook a no-op. Splitting tools per stage is future work.
+        """
+        return
 
-        # Plain containers now, not scroll regions of their own.
-        self.signal_list_frame = ctk.CTkFrame(scroll, fg_color="transparent",
-                                              width=1, height=1)
-        self.signal_list_frame.pack(fill="x")
-
-        Rule(scroll).pack(fill="x", pady=(6, 0))
-
-        # Contextual: the per-trace controls only exist while a trace is
-        # selected, which is what keeps this column from becoming a wall.
-        self.param_frame = ctk.CTkFrame(scroll, fg_color="transparent",
-                                        width=1, height=1)
-        self.param_frame.pack(fill="x", pady=(10, 0))
-        self._build_param_placeholder()
-        # Render the "no traces yet" state now, so the list is never an empty
-        # container on a fresh launch.
-        self._refresh_signal_list()
-
-    def _build_param_placeholder(self) -> None:
-        for w in self.param_frame.winfo_children():
-            w.destroy()
-        hint(self.param_frame, t("Seleccioná una traza de la lista para ver sus ajustes."), wraplength=250).pack(fill="x", pady=20)
-
-    def _build_center_panel(self) -> None:
-        center = ctk.CTkFrame(self, corner_radius=0, fg_color=col("app"))
-        center.grid(row=1, column=2, sticky="nsew")
-        center.grid_rowconfigure(3, weight=1)
-        center.grid_columnconfigure(0, weight=1)
-
-        # ------------------------- plot tabs ---------------------------- #
-        self._build_tab_strip(center)
+    def _build_workspace(self) -> None:
+        super()._build_workspace()
 
         # ------------------------- tool strip ------------------------- #
-        strip = ctk.CTkFrame(center, height=44, corner_radius=0, fg_color=col("bar"))
-        strip.grid(row=1, column=0, sticky="ew")
-        strip.pack_propagate(False)   # children are packed; see _build_topbar
-        Rule(strip).pack(side="bottom", fill="x")
-
-        tools = ctk.CTkFrame(strip, fg_color="transparent")
-        tools.pack(fill="both", expand=True, padx=16)
-
+        tools = self.tool_strip
         self.plot_mode_var = ctk.StringVar(value=PLOT_MODES[0])
         Segmented(tools, PLOT_MODES, self.plot_mode_var,
                   labels=_labels()["modes"],
@@ -1214,41 +1214,45 @@ class App(ctk.CTk):
                                 command=lambda k=key: self._select_tool(k))
             button.pack(side="left", padx=(0, 5), pady=9)
             self.tool_buttons[key] = button
+        # 92px, not the rounder 110 an earlier version used: at the app's
+        # default 1480x880 geometry this is already the last widget that
+        # fits in the tool strip's ~738px budget (mode segmented + 4 tool
+        # buttons leave no more room) -- asking for more here just meant
+        # Tk's pack() silently clipped the button to whatever was left,
+        # which happened to still fit the text but made the requested width
+        # meaningless. See `_build_topbar` for where "Compacto" went instead.
         ghost_button(tools, t("Encuadrar"), self._fit_to_data,
-                     width=142).pack(side="left", padx=(8, 0), pady=9)
+                     width=92).pack(side="left", padx=(8, 0), pady=9)
 
-        self.compact_button = ToolButton(tools, t("Compacto"), width=88,
-                                         command=self._toggle_compact)
-        self.compact_button.pack(side="left", padx=(6, 0), pady=9)
+        # No "Compacto" button here: it moved to the topbar (see
+        # `_build_topbar`) -- a whole-window layout toggle doesn't belong
+        # mixed in with per-plot tools, and the tool strip didn't have room
+        # for it anyway at the app's default window size (it was clipping
+        # off-screen). No "?" help button either: the topbar already has one
+        # (`Shell._build_topbar`, same `self._open_shortcuts` command) --
+        # a second one just burned space here for no reason.
 
-        help_button = ghost_button(tools, "?", self._open_shortcuts, width=28)
-        help_button.pack(side="right", pady=9)
-
-        self.status_label = ctk.CTkLabel(tools, text="", font=font("hint"),
-                                         text_color=col("fg_faint"))
-        self.status_label.pack(side="right", padx=(0, 12), pady=9)
-        self.tool_hint = hint(tools, "")
-        self.tool_hint.pack(side="right", padx=16, pady=9)
+        # `Shell._build_statusbar()` (called right after this method, from the
+        # same `_build_layout()`) already builds `self.status_label` and
+        # `self.hint_label` in a dedicated, always-visible bottom bar -- a
+        # second pair built here used to silently shadow the first
+        # (`status_label`) or sit as dead weight (`tool_hint`), while eating
+        # width in this already-cramped strip and pushing "Compacto" off the
+        # edge on realistic window sizes (pack() hides overflow, it doesn't
+        # wrap it). Tool-strip messages now go to the bottom bar instead.
 
         # ---------------- mode-specific contextual row ---------------- #
-        # Both live directly in row 2 of `center` and only one is ever shown.
-        # They used to sit inside a wrapper frame, which stayed on screen even
-        # when both children were hidden -- and an empty CTkFrame holds a
-        # 200x200 request, so it reserved a blank band above the plot in the
-        # default (Tiempo) mode, which shows neither of them.
-        center.grid_rowconfigure(2, weight=0)
-
-        self.xy_frame = ctk.CTkFrame(center, corner_radius=0, fg_color=col("bar"),
-                                     height=1)
-        self.xy_frame.grid(row=2, column=0, sticky="ew")
+        # Packed into Shell's `context_row` (height=1, so it takes no space
+        # when both children below are hidden) instead of a dedicated grid
+        # row of a bespoke "center" frame.
+        self.xy_frame = ctk.CTkFrame(self.context_row, corner_radius=0,
+                                     fg_color=col("bar"), height=1)
         xy_inner = ctk.CTkFrame(self.xy_frame, fg_color="transparent", height=1)
         xy_inner.pack(fill="x", padx=16, pady=8)
         self._build_xy_controls(xy_inner)
-        self.xy_frame.grid_remove()
 
-        self.bode_frame = ctk.CTkFrame(center, corner_radius=0, fg_color=col("bar"),
-                                       height=1)
-        self.bode_frame.grid(row=2, column=0, sticky="ew")
+        self.bode_frame = ctk.CTkFrame(self.context_row, corner_radius=0,
+                                       fg_color=col("bar"), height=1)
         bode_inner = ctk.CTkFrame(self.bode_frame, fg_color="transparent", height=1)
         bode_inner.pack(fill="x", padx=16, pady=8)
         ctk.CTkLabel(bode_inner, text=t("Disposición"), font=font("label"),
@@ -1257,15 +1261,12 @@ class App(ctk.CTk):
         Segmented(bode_inner, BODE_LAYOUTS, self.bode_layout_var,
                   labels=_labels()["bode"], width=94,
                   command=lambda _v: self.update_plot()).pack(side="left")
-        self.bode_frame.grid_remove()
+        # Neither is packed yet -- `_on_mode_change` shows the right one.
 
         # ---------------------------- canvas -------------------------- #
-        plot_container = ctk.CTkFrame(center, corner_radius=0, fg_color=col("app"))
-        plot_container.grid(row=3, column=0, sticky="nsew", padx=20, pady=18)
-
         self.fig = Figure(figsize=(7.6, 5.2), dpi=100)
         self.axes: list = [self.fig.add_subplot(111)]
-        self.canvas = FigureCanvasTkAgg(self.fig, master=plot_container)
+        self.canvas = FigureCanvasTkAgg(self.fig, master=self.plot_container)
         canvas_widget = self.canvas.get_tk_widget()
         canvas_widget.configure(borderwidth=0, highlightthickness=1,
                                 highlightbackground=tk_color("border_str"),
@@ -1275,12 +1276,12 @@ class App(ctk.CTk):
         # The stock Matplotlib toolbar is created but never displayed: the
         # tool strip above drives pan/zoom/margins through it, so the window
         # keeps a single visual language instead of two.
-        self._toolbar_host = tk.Frame(plot_container)
+        self._toolbar_host = tk.Frame(self.plot_container)
         self.mpl_toolbar = EditableNavigationToolbar(self.canvas, self._toolbar_host)
         self.mpl_toolbar.on_margins_applied = self._on_margins_applied
         self.mpl_toolbar.update()
 
-        self.measurements = MeasurementsCard(plot_container, width=230)
+        self.measurements = MeasurementsCard(self.plot_container, width=230)
         self.measurements.bind_close(self._hide_measurements)
         self._measurements_visible = False
 
@@ -1450,7 +1451,8 @@ class App(ctk.CTk):
         self._sync_unit_options()
         self._refresh_signal_list()
         self._refresh_xy_combos()
-        self._build_param_placeholder()
+        self.selection = None
+        self._sync_inspector()
 
         # Swap in THIS tab's own cursors/annotations -- `from_dict` clears
         # whatever the previously active tab had left in the shared managers
@@ -1458,6 +1460,13 @@ class App(ctk.CTk):
         # showing the last tab's cursors/annotations (see `_gather_plot_state`).
         self.cursors.from_dict(data.get("cursors") or {})
         self.annotations.from_dict(data.get("annotations") or {})
+        # The embedded editor (`_build_overlay_panel`) is a persistent widget
+        # across tab switches, unlike the trace list/inspector -- its own
+        # `_sel_cursor`/`_sel_annotation` would otherwise keep pointing at an
+        # id from the tab just left, and its lists wouldn't show this tab's
+        # cursors/annotations until something else happened to redraw them.
+        self.overlay_panel.clear_selection()
+        self.overlay_panel.refresh_all()
 
         self._plot_suspended = True
         try:
@@ -1626,23 +1635,27 @@ class App(ctk.CTk):
 
         if key == "zoom":
             self.mpl_toolbar.zoom()
-            self.tool_hint.configure(text="Arrastrá sobre el gráfico para acercar.")
+            self.hint_label.configure(text="Arrastrá sobre el gráfico para acercar.")
         elif key == "pan":
             self.mpl_toolbar.pan()
-            self.tool_hint.configure(text="Arrastrá para desplazar el gráfico.")
+            self.hint_label.configure(text="Arrastrá para desplazar el gráfico.")
         elif key == "cursor":
             self.annotations.disarm()
             self.cursors.arm("v")
             self._show_measurements()
-            self.tool_hint.configure(
+            self.hint_label.configure(
                 text="Clic sobre el gráfico para colocar un cursor; arrastralo para medir.")
         elif key == "annotate":
             self.cursors.disarm()
-            self._open_overlay_window(tab="annotations")
-            self.tool_hint.configure(
+            # The annotation editor lives in the "Anotar" stage's navigator
+            # now (see `_build_overlay_panel`) instead of a floating window,
+            # so this quick-access tool just takes you there.
+            self.rail.select("annotate")
+            self.overlay_panel.show_pane("annotations")
+            self.hint_label.configure(
                 text="Definí la anotación en el panel y capturá el punto.")
         else:
-            self.tool_hint.configure(text="")
+            self.hint_label.configure(text="")
 
     def _on_margins_applied(self, margins: Optional[dict]) -> None:
         """
@@ -1719,36 +1732,35 @@ class App(ctk.CTk):
     def _on_cursor_change(self) -> None:
         if self._measurements_visible:
             self.measurements.set_rows(self._measurement_rows())
-        window = self.overlay_window
-        if window is not None and window.winfo_exists():
-            window.panel.refresh_cursor_ui()
+        self.overlay_panel.refresh_cursor_ui()
 
     # ------------------------------------------------------------------ #
     # Right panel: one accordion, one section open at a time
     # ------------------------------------------------------------------ #
-    def _build_right_panel(self) -> None:
-        right = ctk.CTkFrame(self, width=self._right_width, corner_radius=0,
-                             fg_color=col("panel"))
-        right.grid(row=1, column=4, sticky="ns")
-        right.pack_propagate(False)   # children are packed; see _build_topbar
-        self.right_panel = right
-
-        body = ctk.CTkScrollableFrame(right, fg_color="transparent", corner_radius=0)
-        body.pack(fill="both", expand=True, padx=16, pady=(14, 12))
-
+    def _build_plot_pane(self, parent) -> None:
+        """
+        Overrides Shell's stub entirely (four empty `StaticSection`s wired to
+        a generic "Aplicar ajustes" button) rather than calling `super()`:
+        this pane's real content -- axes/labels/legend/data/export -- is the
+        same flat set of foldable sections `_build_right_panel` used to
+        build into the old right column, just retargeted to `parent` (the
+        "Gráfico" pane, already a scrollable frame via `PaneStack.add`).
+        Splitting these into their own navigator/inspector (the "export"
+        stage) is future work, out of scope for this migration pass.
+        """
         self.settings = SectionGroup()
         self._sections_header = SectionHeader(
-            body, t("Ajustes"), action=t("Minimizar todo"),
+            parent, t("Ajustes"), action=t("Minimizar todo"),
             command=self._toggle_all_sections)
         self._sections_header.pack(fill="x")
-        Rule(body, strong=True).pack(fill="x", pady=(6, 12))
-        ghost_button(body, t("Aplicar ajustes"), self._apply_settings,
+        Rule(parent, strong=True).pack(fill="x", pady=(6, 12))
+        ghost_button(parent, t("Aplicar ajustes"), self._apply_settings,
                      height=28).pack(fill="x", pady=(0, 14))
-        self._build_axes_section(body)
-        self._build_labels_section(body)
-        self._build_legend_section(body)
-        self._build_data_section(body)
-        self._build_export_section(body)
+        self._build_axes_section(parent)
+        self._build_labels_section(parent)
+        self._build_legend_section(parent)
+        self._build_data_section(parent)
+        self._build_export_section(parent)
 
     def _section(self, parent, title: str, expanded: bool = True):
         """One settings group, foldable from the caret in its header."""
@@ -1784,15 +1796,38 @@ class App(ctk.CTk):
         self.unit_x_var = ctk.StringVar(value="us")
         self.unit_x_combo = combo_field(box, t("Unidad X"), self.unit_x_var,
                                          ["s", "ms", "us", "ns"], width=110)
+        # "Manual": mientras esté tildado, `_sync_unit_options` deja de
+        # pisar lo que se haya escrito a mano en el combo de arriba (que ya
+        # es editable) cada vez que se carga/edita una señal. El factor de
+        # conversión de una unidad que no está en `x_units_for_domain`/
+        # `y_units_for_kind` cae solo a 1.0 (ver `.get(unit, 1.0)` en el
+        # armado del gráfico), así que escribir p.ej. "Pa" o dejarlo vacío
+        # ("sin unidad") no rompe nada: sólo cambia la etiqueta del eje.
+        self.unit_x_manual_var = ctk.BooleanVar(value=False)
+        check_field(box, t("Unidad X manual"), self.unit_x_manual_var,
+                    command=self.update_plot, rule=False)
+
         self.unit_y_var = ctk.StringVar(value="V")
         self.unit_y_combo = combo_field(box, t("Unidad Y1"), self.unit_y_var,
                                          ["V", "mV"], width=110)
+        self.unit_y_manual_var = ctk.BooleanVar(value=False)
+        check_field(box, t("Unidad Y1 manual"), self.unit_y_manual_var,
+                    command=self.update_plot, rule=False)
+
         # Y2 carries its own unit: the secondary axis usually holds a
         # different quantity altogether (phase in degrees against magnitude
         # in dB), so forcing both to share one unit was simply wrong.
         self.unit_y2_var = ctk.StringVar(value="V")
         self.unit_y2_combo = combo_field(box, t("Unidad Y2"), self.unit_y2_var,
                                           ["V", "mV"], width=110)
+        self.unit_y2_manual_var = ctk.BooleanVar(value=False)
+        check_field(box, t("Unidad Y2 manual"), self.unit_y2_manual_var,
+                    command=self.update_plot, rule=False)
+        hint(box, t("Con «manual» tildado podés escribir cualquier texto en "
+                    "el combo de unidad de ese eje (o dejarlo vacío para no "
+                    "mostrar ninguna) -- no hay conversión de prefijos para "
+                    "una unidad que no sea una de las conocidas."),
+             wraplength=280).pack(fill="x", pady=(0, 10))
 
         self.xscale_var = ctk.StringVar(value="linear")
         segmented_field(box, t("Escala X"), SCALES, self.xscale_var,
@@ -1988,6 +2023,9 @@ class App(ctk.CTk):
                     "y señales, en una pestaña nueva. Necesita el archivo "
                     "«.labplotter.json» que se guarda junto a la figura."),
              wraplength=280).pack(fill="x", pady=(4, 0))
+        ghost_button(box, t("Guardar solo ajustes (JSON)..."),
+                    self._export_settings_only, height=28
+                    ).pack(fill="x", pady=(6, 0))
 
         Rule(box).pack(fill="x", pady=(14, 12))
 
@@ -1998,10 +2036,18 @@ class App(ctk.CTk):
         board_actions.pack(fill="x", pady=(0, 8))
         ghost_button(board_actions, t("+ Agregar gráfico actual"), self._add_current_to_board,
                     width=170).pack(side="left")
-        ghost_button(board_actions, t("Ver tablero..."), self._open_board_window,
+        ghost_button(board_actions, t("Ver tablero..."), self._open_board,
                     width=100).pack(side="left", padx=(6, 0))
         self.board_status_label = hint(box, t("Tablero vacío."), wraplength=280)
         self.board_status_label.pack(fill="x")
+
+        Rule(box).pack(fill="x", pady=(14, 12))
+
+        stacked_label(box, t("Histograma"))
+        ghost_button(box, t("Ver histograma..."), self._open_histogram_window,
+                    width=140).pack(fill="x", pady=(0, 4))
+        hint(box, t("Distribución de los valores (eje X o Y) de una o más "
+                    "señales, superpuestas."), wraplength=280).pack(fill="x")
 
     def _refresh_export_profiles(self) -> None:
         self._export_profiles = session.load_profiles()
@@ -2145,7 +2191,8 @@ class App(ctk.CTk):
         self.selected_uid = None
         self._refresh_signal_list()
         self._refresh_xy_combos()
-        self._build_param_placeholder()
+        self.selection = None
+        self._sync_inspector()
         self.update_plot()
 
     def _remove_all_signals(self) -> None:
@@ -2164,7 +2211,8 @@ class App(ctk.CTk):
         self.selected_uid = None
         self._refresh_signal_list()
         self._refresh_xy_combos()
-        self._build_param_placeholder()
+        self.selection = None
+        self._sync_inspector()
         self.update_plot()
 
     def _on_delete_key(self, event=None) -> None:
@@ -2181,26 +2229,32 @@ class App(ctk.CTk):
         self._remove_selected_signal()
 
     def _refresh_signal_list(self) -> None:
-        for w in self.signal_list_frame.winfo_children():
+        # Shell's "adjust"-stage navigator: a CTkScrollableFrame holding
+        # nothing but the trace list now that per-trace settings moved to
+        # the inspector (`_build_trace_inspector`).
+        target = self.navigators["adjust"]
+        for w in target.winfo_children():
             w.destroy()
         self.row_widgets.clear()
 
         if not self.signal_order:
-            hint(self.signal_list_frame,
-                 t("Sin trazas. Abrí un archivo para empezar."),
+            hint(target, t("Sin trazas. Abrí un archivo para empezar."),
                  wraplength=240).pack(fill="x", pady=14)
             self._refresh_chips()
             return
 
         for uid in self.signal_order:
             sig = self.signals[uid]
-            tag = {"dB": "dB", "deg": "fase"}.get(sig.y_kind, "V")
+            if sig.y_kind == "custom":
+                tag = sig.unit_v_in or t("s/u")   # "sin unidad", abreviado
+            else:
+                tag = {"dB": "dB", "deg": "fase"}.get(sig.y_kind, "V")
             # A missing trace (source file not found -- see `_restore_signal`)
             # gets a "⚠" marker in its label and is clicked to reconnect
-            # (`_select_signal`) instead of opening the normal param panel.
+            # (`_select_signal`) instead of opening the trace inspector.
             label = sig.display_name or sig.name
             row = TraceRow(
-                self.signal_list_frame, name=f"⚠ {label}" if sig.missing else label,
+                target, name=f"⚠ {label}" if sig.missing else label,
                 color=sig.color or "#8A8A8A", tag=tag, visible=sig.visible,
                 on_select=lambda u=uid: self._select_signal(u),
                 on_toggle=lambda value, u=uid: self._toggle_signal(u, value),
@@ -2255,7 +2309,7 @@ class App(ctk.CTk):
         sig.color = hex_color
         self._refresh_signal_list()
         if self.selected_uid == uid:
-            self._build_param_panel(uid)   # keep the open per-trace panel in sync
+            self._build_trace_inspector(uid)   # keep the open inspector in sync
         self.update_plot()
 
     def _highlight_selected(self) -> None:
@@ -2269,7 +2323,27 @@ class App(ctk.CTk):
         if sig is not None and sig.missing:
             self._relink_signal(uid)
             return
-        self._build_param_panel(uid)
+        self.select("trace", uid)   # Shell.select() -> App._sync_inspector()
+
+    def _sync_inspector(self) -> None:
+        """
+        Overrides Shell's stub (header text + placeholder only) to route a
+        trace selection to `_build_trace_inspector`. Anything else --
+        no selection, or a future cursor/annotation selection -- falls back
+        to Shell's default, which today just shows the placeholder hint.
+        """
+        if self.selection is None or self.selection[0] != "trace":
+            super()._sync_inspector()
+            return
+        _, uid = self.selection
+        sig = self.signals.get(uid)
+        if sig is None:              # selection stale (trace removed)
+            self.selection = None
+            super()._sync_inspector()
+            return
+        self.subject.set_subject(sig.display_name or sig.name,
+                                  color=sig.color, tag="trace")
+        self._build_trace_inspector(uid)
 
     def _refresh_xy_combos(self) -> None:
         names = [self.signals[uid].name for uid in self.signal_order]
@@ -2302,14 +2376,24 @@ class App(ctk.CTk):
             self.xscale_var.set("linear")
 
     def _sync_unit_options(self) -> None:
-        """Match the X/Y unit dropdowns to the dominant domain and magnitude type."""
+        """Match the X/Y unit dropdowns to the dominant domain and magnitude type.
+
+        Skips whichever axis has its "manual" checkbox on (see
+        `_build_axes_section`): that axis's combo already accepts free
+        text, and this function forcing it back to a preset the moment a
+        signal is loaded/edited is exactly what used to make a manually
+        typed unit (e.g. "Pa", or "" for no unit) impossible to keep.
+        """
         domain = self._dominant_domain()
         kinds = {self.signals[u].y_kind for u in self.signal_order}
 
         x_values = list(x_units_for_domain(domain).keys())
-        self.unit_x_combo.configure(values=x_values)
-        if self.unit_x_var.get() not in x_values:
-            self.unit_x_var.set("Hz" if domain == "freq" else "us")
+        if self.unit_x_manual_var.get():
+            self.unit_x_combo.configure(values=sorted({self.unit_x_var.get(), *x_values}))
+        else:
+            self.unit_x_combo.configure(values=x_values)
+            if self.unit_x_var.get() not in x_values:
+                self.unit_x_var.set("Hz" if domain == "freq" else "us")
 
         # `next(iter(...))`, not `.pop()`: `kinds` is a set and `.pop()`
         # mutates it in place, removing the very element it returns -- when
@@ -2319,17 +2403,23 @@ class App(ctk.CTk):
         # voltage-only units instead of the dB/deg units actually in use.
         y_kind = next(iter(kinds)) if len(kinds) == 1 else "voltage"
         y_values = list(y_units_for_kind(y_kind).keys())
-        self.unit_y_combo.configure(values=y_values)
-        if self.unit_y_var.get() not in y_values:
-            self.unit_y_var.set(y_values[0])
+        if self.unit_y_manual_var.get():
+            self.unit_y_combo.configure(values=sorted({self.unit_y_var.get(), *y_values}))
+        else:
+            self.unit_y_combo.configure(values=y_values)
+            if self.unit_y_var.get() not in y_values:
+                self.unit_y_var.set(y_values[0])
 
         # Y2 offers every unit any loaded signal could need, since the
         # secondary axis often holds a different quantity from Y1.
         y2_values = sorted({u for kind in (kinds or {"voltage"})
                             for u in y_units_for_kind(kind)} | set(y_values))
-        self.unit_y2_combo.configure(values=y2_values)
-        if self.unit_y2_var.get() not in y2_values:
-            self.unit_y2_var.set(y2_values[0])
+        if self.unit_y2_manual_var.get():
+            self.unit_y2_combo.configure(values=sorted({self.unit_y2_var.get(), *y2_values}))
+        else:
+            self.unit_y2_combo.configure(values=y2_values)
+            if self.unit_y2_var.get() not in y2_values:
+                self.unit_y2_var.set(y2_values[0])
 
         # Frequency sweeps default to a log X axis, the standard for filters.
         # One-directional on purpose: this runs after routine file loads and
@@ -2343,26 +2433,37 @@ class App(ctk.CTk):
     # ------------------------------------------------------------------ #
     # Per-channel parameter panel
     # ------------------------------------------------------------------ #
-    def _build_param_panel(self, uid: str) -> None:
+    def _build_trace_inspector(self, uid: str) -> None:
         """
-        Per-trace controls. Only the four things you change on every trace are
-        visible; correction and source metadata sit behind two collapsibles,
-        so the column stays readable with several traces loaded.
+        Replaces `_build_param_panel`. Builds into `self.selection_body`
+        (owned by `Shell._build_selection_pane`) instead of the old
+        `self.param_frame`, grouped into four independent `StaticSection`s
+        -- Apariencia, Correcciones, Unidades y Eje, Muestreo -- in the
+        order a trace is actually worked on: how it looks, how it is
+        corrected, where it came from, how much of it is shown.
         """
-        sig = self.signals[uid]
-        for w in self.param_frame.winfo_children():
+        sig = self.signals.get(uid)
+        if sig is None:
+            return
+        for w in self.selection_body.winfo_children():
             w.destroy()
+        parent = self.selection_body
 
-        SectionHeader(self.param_frame, t("Ajustes de la traza")).pack(fill="x")
-        Rule(self.param_frame).pack(fill="x", pady=(6, 12))
+        # ---- Apariencia --------------------------------------------------- #
+        appearance = StaticSection(parent, t("Apariencia"), expanded=True)
+        appearance.pack(fill="x", pady=(0, 10))
+        box = appearance.body
 
         legend_var = ctk.StringVar(value=sig.legend_label or "")
-        stacked_entry(self.param_frame, t("Cómo aparece en la leyenda"), legend_var)
+        stacked_entry(box, t("Cómo aparece en la leyenda"), legend_var)
+        alias_var = ctk.StringVar(value=sig.display_name or "")
+        stacked_entry(box, t("Alias en la lista"), alias_var)
+        name_var = ctk.StringVar(value=sig.name)
+        stacked_entry(box, t("Nombre"), name_var)
 
-        # --- colour ---------------------------------------------------- #
-        stacked_label(self.param_frame, t("Color"))
-        color_row = ctk.CTkFrame(self.param_frame, fg_color="transparent")
-        color_row.pack(fill="x", pady=(0, 12))
+        stacked_label(box, t("Color"))
+        color_row = ctk.CTkFrame(box, fg_color="transparent")
+        color_row.pack(fill="x", pady=(0, 10))
         color_var = ctk.StringVar(value=sig.color or TRACE_CYCLE[0])
         swatch = ctk.CTkButton(color_row, text="", width=22, height=26,
                                 corner_radius=0, border_width=1,
@@ -2393,9 +2494,16 @@ class App(ctk.CTk):
 
         swatch.configure(command=_pick_color)
 
-        # --- stroke ---------------------------------------------------- #
-        stacked_label(self.param_frame, t("Estilo de línea"))
+        width_var = ctk.StringVar(value=f"{self._lw(uid):.1f}")
+        SliderField(box, t("Grosor de traza"), width_var,
+                    minimum=0.4, maximum=5.0, steps=46, decimals=1,
+                    label_width=104,
+                    on_change=lambda v=width_var: self._preview_width(uid, v)
+                    ).pack(fill="x", pady=(4, 8))
+
+        stacked_label(box, t("Estilo de línea"))
         style_var = ctk.StringVar(value=sig.linestyle)
+        marker_var = ctk.StringVar(value=sig.marker or "None")
 
         def _on_style_change(value: str) -> None:
             # Turning the line off with no marker set would just make the
@@ -2405,107 +2513,48 @@ class App(ctk.CTk):
             if value == "None" and marker_var.get() == "None":
                 marker_var.set("o")
 
-        Segmented(self.param_frame, LINESTYLES, style_var, labels=LINE_GLYPHS,
-                  command=_on_style_change, width=56).pack(fill="x", pady=(0, 12))
-        hint(self.param_frame, t("«Sin línea» (el último botón) grafica sólo "
-                                 "los puntos, sin interpolar entre ellos."),
-             wraplength=240).pack(fill="x", pady=(0, 12))
+        Segmented(box, LINESTYLES, style_var, labels=LINE_GLYPHS,
+                  command=_on_style_change, width=48).pack(fill="x", pady=(0, 8))
 
-        # --- marker ------------------------------------------------------ #
-        marker_var = ctk.StringVar(value=sig.marker or "None")
-        combo_field(self.param_frame, t("Marcador"), marker_var, MARKERS,
-                    width=170, labels=_labels()["marker"])
+        combo_field(box, t("Marcador"), marker_var, MARKERS, width=140,
+                    labels=_labels()["marker"])
         marker_size_var = ctk.StringVar(value=f"{sig.marker_size:g}")
-        entry_field(self.param_frame, t("Tamaño de marcador"), marker_size_var,
+        entry_field(box, t("Tamaño de marcador"), marker_size_var,
                     suffix="pt", label_width=140)
         marker_hollow_var = ctk.BooleanVar(value=sig.marker_hollow)
-        check_field(self.param_frame, t("Marcador hueco"), marker_hollow_var)
-        hint(self.param_frame, t("Hueco = sólo el borde, con el color de la traza; "
-                                 "sin relleno."),
-             wraplength=240).pack(fill="x", pady=(0, 12))
+        check_field(box, t("Marcador hueco"), marker_hollow_var, rule=False)
 
-        # --- line weight ------------------------------------------------ #
-        width_var = ctk.StringVar(value=f"{self._lw(uid):.1f}")
-        SliderField(self.param_frame, t("Grosor de traza"), width_var,
-                    minimum=0.4, maximum=5.0, steps=46, decimals=1,
-                    label_width=112,
-                    on_change=lambda u=uid, v=width_var: self._preview_width(u, v)
-                    ).pack(fill="x", pady=(0, 10))
+        # ---- Correcciones (compact demo: DirtyDot + Tooltip inline) ------- #
+        corr_vars = self._build_corrections_section(parent, sig)
 
-        # --- which Y axis ---------------------------------------------- #
-        stacked_label(self.param_frame, t("Eje vertical"))
-        axis_var = ctk.StringVar(value="secondary" if sig.secondary_y
-                                 else "primary")
-        Segmented(self.param_frame, AXIS_SIDES, axis_var,
-                  labels=_labels()["side"], width=56).pack(fill="x", pady=(0, 4))
-        hint(self.param_frame, t("«Der» usa un eje Y2 con escala propia."),
-             wraplength=240).pack(fill="x", pady=(0, 12))
-
-        # --- corrections ------------------------------------------------ #
-        corrections = StaticSection(self.param_frame, t("Correcciones"))
-        corrections.pack(fill="x", pady=(4, 8))
-        box = corrections.body
-
-        x_unit_now, y_unit_now = sig.unit_t_in, sig.unit_v_in
-        # The suffix next to each offset field must track the "Unidad X/Y"
-        # combo below (`unit_x_in_var`/`unit_y_in_var`) live: a static suffix
-        # kept showing the unit that was active when the panel was built, so
-        # changing the unit combo *without* retouching the offset field
-        # silently reinterpreted the same typed number in the new unit at
-        # "Aplicar cambios" time (e.g. "5" meant as 5 ms became 5 s). See the
-        # `_on_unit_x_change`/`_on_unit_y_change` traces below, which keep
-        # both the suffix and the numeric value in sync with the combo.
-        xoff_suffix_var = ctk.StringVar(value=x_unit_now)
-        xoff_var = ctk.StringVar(
-            value=f"{sig.t_offset / x_units_for_domain(sig.domain)[x_unit_now]:g}")
-        entry_field(box, t("Desplazar en X"), xoff_var, suffix_var=xoff_suffix_var,
-                    label_width=104)
-        yoff_suffix_var = ctk.StringVar(value=y_unit_now)
-        yoff_var = ctk.StringVar(
-            value=f"{sig.v_offset / y_units_for_kind(sig.y_kind)[y_unit_now]:g}")
-        entry_field(box, t("Desplazar en Y"), yoff_var, suffix_var=yoff_suffix_var,
-                    label_width=104)
-        gain_var = ctk.StringVar(value=f"{sig.gain:g}")
-        entry_field(box, t("Ganancia"), gain_var, suffix="×", label_width=104)
-        hint(box, t("Sólo tiene efecto en señales de tipo «voltage»: escalar "
-                    "el valor de una traza en dB o fase no tiene sentido "
-                    "físico (para eso está «Desplazar en Y»)."),
-             wraplength=240).pack(fill="x", pady=(0, 8))
-        invert_var = ctk.BooleanVar(value=sig.invert)
-        check_field(box, t("Invertir (×−1)"), invert_var, rule=False)
-
-        # --- source metadata --------------------------------------------- #
-        source = StaticSection(self.param_frame, t("De dónde salen los datos"))
-        source.pack(fill="x", pady=(0, 8))
-        box = source.body
-
-        name_var = ctk.StringVar(value=sig.name)
-        stacked_entry(box, t("Nombre"), name_var)
-        hint(box, t("Se usa en la leyenda y en los ejes por defecto "
-                    "si no hay etiqueta de leyenda propia."),
-             wraplength=240).pack(fill="x", pady=(0, 10))
-
-        alias_var = ctk.StringVar(value=sig.display_name or "")
-        stacked_entry(box, t("Alias en la lista"), alias_var)
-        hint(box, t("Solo cambia cómo se ve en la lista de trazas; nunca "
-                    "aparece en el gráfico ni en la leyenda."),
-             wraplength=240).pack(fill="x", pady=(0, 10))
+        # ---- Unidades y Eje ------------------------------------------------ #
+        units = StaticSection(parent, t("Unidades y Eje"), expanded=False)
+        units.pack(fill="x", pady=(0, 10))
+        box = units.body
 
         domain_var = ctk.StringVar(value=sig.domain)
-        combo_field(box, t("Dominio"), domain_var, ["time", "freq"], width=110)
+        combo_field(box, t("Dominio"), domain_var, ["time", "freq"], width=100)
         ykind_var = ctk.StringVar(value=sig.y_kind)
-        combo_field(box, t("Magnitud"), ykind_var, ["voltage", "dB", "deg"], width=110)
+        combo_field(box, t("Magnitud"), ykind_var,
+                    ["voltage", "dB", "deg", "custom"], width=100)
 
         unit_x_in_var = ctk.StringVar(value=sig.unit_t_in)
         unit_x_combo = combo_field(box, t("Unidad X"), unit_x_in_var,
                                     list(x_units_for_domain(sig.domain).keys()),
-                                    width=110)
+                                    width=100)
         unit_y_in_var = ctk.StringVar(value=sig.unit_v_in)
         unit_y_combo = combo_field(box, t("Unidad Y"), unit_y_in_var,
                                     list(y_units_for_kind(sig.y_kind).keys()),
-                                    width=110, rule=False)
-        hint(box, t("Unidad en la que vienen los datos del archivo."),
-             wraplength=240).pack(fill="x", pady=(6, 0))
+                                    width=100)
+        info_dot(box, t("Con «Magnitud: custom» el combo de unidad acepta "
+                        "texto libre (o vacío, para no mostrar ninguna "
+                        "unidad) -- no hay conversión de prefijos para una "
+                        "magnitud propia.")).pack(anchor="e", pady=(2, 8))
+
+        axis_var = ctk.StringVar(value="secondary" if sig.secondary_y
+                                 else "primary")
+        segmented_field(box, t("Eje vertical"), AXIS_SIDES, axis_var,
+                        labels=_labels()["side"], width=52, rule=False)
 
         def _sync_source_units(_=None):
             xs = list(x_units_for_domain(domain_var.get()).keys())
@@ -2513,54 +2562,61 @@ class App(ctk.CTk):
             if unit_x_in_var.get() not in xs:
                 unit_x_in_var.set(xs[0])
             ys = list(y_units_for_kind(ykind_var.get()).keys())
-            unit_y_combo.configure(values=ys)
-            if unit_y_in_var.get() not in ys:
-                unit_y_in_var.set(ys[0])
+            if ykind_var.get() == "custom":
+                current = unit_y_in_var.get()
+                unit_y_combo.configure(values=sorted({current, *ys}))
+            else:
+                unit_y_combo.configure(values=ys)
+                if unit_y_in_var.get() not in ys:
+                    unit_y_in_var.set(ys[0])
 
         domain_var.trace_add("write", lambda *_: _sync_source_units())
         ykind_var.trace_add("write", lambda *_: _sync_source_units())
 
-        # Keep the offset fields' displayed number and suffix meaning the
-        # same physical shift when "Unidad X"/"Unidad Y" changes -- without
-        # this, the value typed while the combo showed e.g. "ms" would be
-        # silently re-read as "s" (or whatever unit is selected at "Aplicar
-        # cambios" time), a 1000x error the field's frozen suffix used to hide.
-        _prev_x_unit = {"value": x_unit_now}
-        _prev_y_unit = {"value": y_unit_now}
+        _prev_x_unit = {"value": sig.unit_t_in}
+        _prev_y_unit = {"value": sig.unit_v_in}
 
         def _on_unit_x_change(*_a):
             new_unit = unit_x_in_var.get()
             old_unit = _prev_x_unit["value"]
             if new_unit != old_unit:
-                units = x_units_for_domain(domain_var.get())
-                if old_unit in units and new_unit in units:
-                    current = _parse_float(xoff_var.get(), 0.0)
-                    xoff_var.set(f"{current * units[old_unit] / units[new_unit]:g}")
-                xoff_suffix_var.set(new_unit)
+                units_ = x_units_for_domain(domain_var.get())
+                if old_unit in units_ and new_unit in units_:
+                    current = _parse_float(corr_vars["xoff_var"].get(), 0.0)
+                    corr_vars["xoff_var"].set(
+                        f"{current * units_[old_unit] / units_[new_unit]:g}")
+                corr_vars["xoff_suffix_var"].set(new_unit)
             _prev_x_unit["value"] = new_unit
 
         def _on_unit_y_change(*_a):
             new_unit = unit_y_in_var.get()
             old_unit = _prev_y_unit["value"]
             if new_unit != old_unit:
-                units = y_units_for_kind(ykind_var.get())
-                if old_unit in units and new_unit in units:
-                    current = _parse_float(yoff_var.get(), 0.0)
-                    yoff_var.set(f"{current * units[old_unit] / units[new_unit]:g}")
-                yoff_suffix_var.set(new_unit)
+                units_ = y_units_for_kind(ykind_var.get())
+                if old_unit in units_ and new_unit in units_:
+                    current = _parse_float(corr_vars["yoff_var"].get(), 0.0)
+                    corr_vars["yoff_var"].set(
+                        f"{current * units_[old_unit] / units_[new_unit]:g}")
+                corr_vars["yoff_suffix_var"].set(new_unit)
             _prev_y_unit["value"] = new_unit
 
         unit_x_in_var.trace_add("write", _on_unit_x_change)
         unit_y_in_var.trace_add("write", _on_unit_y_change)
 
-        # --- apply ------------------------------------------------------ #
+        # ---- Muestreo (global -- ver docstring de _build_sampling_section) - #
+        self._build_sampling_section(parent)
+
+        # ---- aplicar --------------------------------------------------------- #
         def apply_changes():
             new_domain = domain_var.get()
             new_kind = ykind_var.get()
             x_units = x_units_for_domain(new_domain)
             y_units = y_units_for_kind(new_kind)
             new_ux = unit_x_in_var.get() if unit_x_in_var.get() in x_units else list(x_units)[0]
-            new_uy = unit_y_in_var.get() if unit_y_in_var.get() in y_units else list(y_units)[0]
+            if new_kind == "custom":
+                new_uy = unit_y_in_var.get().strip()
+            else:
+                new_uy = unit_y_in_var.get() if unit_y_in_var.get() in y_units else list(y_units)[0]
 
             color = color_var.get().strip()
             try:
@@ -2580,19 +2636,11 @@ class App(ctk.CTk):
             sig.y_kind = new_kind
             sig.unit_t_in = new_ux
             sig.unit_v_in = new_uy
-            sig.t_offset = _parse_float(xoff_var.get(), 0.0) * x_units[new_ux]
-            sig.v_offset = _parse_float(yoff_var.get(), 0.0) * y_units[new_uy]
-            # `gain` multiplies the raw value (see Signal.processed() in
-            # core/data_io.py) -- physically correct for a "voltage" trace
-            # (amplitude scaling / probe attenuation), but meaningless for
-            # "dB" or "deg": multiplying a decibel or a phase-degree number
-            # by a factor is not the same as scaling the underlying transfer
-            # function (that would mean ADDING to the dB value, which is
-            # exactly what "Desplazar en Y" already does for a dB trace).
-            # Force it to a no-op for those two kinds so a stray value here
-            # can't silently corrupt a Bode magnitude/phase curve.
-            sig.gain = _parse_float(gain_var.get(), 1.0) if new_kind == "voltage" else 1.0
-            sig.invert = invert_var.get()
+            sig.t_offset = _parse_float(corr_vars["xoff_var"].get(), 0.0) * x_units[new_ux]
+            sig.v_offset = _parse_float(corr_vars["yoff_var"].get(), 0.0) * y_units.get(new_uy, 1.0)
+            sig.gain = (_parse_float(corr_vars["gain_var"].get(), 1.0)
+                       if new_kind == "voltage" else 1.0)
+            sig.invert = corr_vars["invert_var"].get()
             sig.linestyle = style_var.get()
             sig.marker = marker_var.get()
             sig.marker_size = max(1.0, _parse_float(marker_size_var.get(), sig.marker_size))
@@ -2608,8 +2656,112 @@ class App(ctk.CTk):
             self._select_signal(uid)
             self.update_plot()
 
-        primary_button(self.param_frame, t("Aplicar cambios"), apply_changes
-                       ).pack(fill="x", pady=(6, 14))
+        primary_button(parent, t("Aplicar cambios"), apply_changes
+                       ).pack(fill="x", pady=(4, 14))
+
+    def _build_corrections_section(self, parent, sig) -> dict:
+        """
+        Compact demo section: one line per field, label + inline `DirtyDot`
+        + right-aligned entry. Explanations that used to be permanent
+        `hint()` blocks (a third of this column, on screen whether or not
+        anyone was reading them) now live behind each label's `Tooltip` --
+        see that class's own docstring for the rationale.
+        """
+        section = StaticSection(parent, t("Correcciones"), expanded=True)
+        section.pack(fill="x", pady=(0, 10))
+        group = DirtyGroup(section)
+        box = section.body
+
+        def _row(label_text: str, var, default, tooltip: str,
+                 suffix_var=None, suffix: str = "") -> ctk.CTkEntry:
+            field = Field(box, label_text, rule=False, label_width=92)
+            field.pack(fill="x", pady=(0, 5))
+            dot = DirtyDot(field.row, var, default)
+            dot.pack(side="left", padx=(2, 0))
+            group.add(dot)
+            Tooltip(field.label, tooltip)
+            if suffix_var is not None:
+                ctk.CTkLabel(field.control, textvariable=suffix_var, font=font("small"),
+                            text_color=col("fg_faint"), width=20, anchor="w"
+                            ).pack(side="right", padx=(4, 0))
+            elif suffix:
+                ctk.CTkLabel(field.control, text=suffix, font=font("small"),
+                            text_color=col("fg_faint"), width=20, anchor="w"
+                            ).pack(side="right", padx=(4, 0))
+            entry = ctk.CTkEntry(field.control, textvariable=var, width=64,
+                                 height=24, font=font("mono"), justify="right")
+            entry.pack(side="right")
+            return entry
+
+        x_unit, y_unit = sig.unit_t_in, sig.unit_v_in
+        xoff_suffix_var = ctk.StringVar(value=x_unit)
+        xoff_var = ctk.StringVar(
+            value=f"{sig.t_offset / x_units_for_domain(sig.domain)[x_unit]:g}")
+        _row(t("Desplazar en X"), xoff_var, "0",
+             t("Desplaza la traza en el eje X. 0 = sin desplazamiento."),
+             suffix_var=xoff_suffix_var)
+
+        yoff_suffix_var = ctk.StringVar(value=y_unit)
+        yoff_var = ctk.StringVar(
+            value=f"{sig.v_offset / y_units_for_kind(sig.y_kind).get(y_unit, 1.0):g}")
+        _row(t("Desplazar en Y"), yoff_var, "0",
+             t("Desplaza la traza en el eje Y. 0 = sin desplazamiento."),
+             suffix_var=yoff_suffix_var)
+
+        gain_var = ctk.StringVar(value=f"{sig.gain:g}")
+        _row(t("Ganancia"), gain_var, "1",
+             t("Sólo tiene efecto en señales de tipo «voltage»: escalar "
+               "el valor de una traza en dB o fase no tiene sentido "
+               "físico (para eso está «Desplazar en Y»)."),
+             suffix="×")
+
+        invert_row = ctk.CTkFrame(box, fg_color="transparent")
+        invert_row.pack(fill="x", pady=(4, 0))
+        invert_var = ctk.BooleanVar(value=sig.invert)
+        dot = DirtyDot(invert_row, invert_var, False)
+        dot.pack(side="right")
+        group.add(dot)
+        ctk.CTkCheckBox(invert_row, text=t("Invertir (×−1)"), variable=invert_var,
+                       font=font("label"), checkbox_width=16, checkbox_height=16
+                       ).pack(side="left")
+
+        return {"xoff_var": xoff_var, "xoff_suffix_var": xoff_suffix_var,
+                "yoff_var": yoff_var, "yoff_suffix_var": yoff_suffix_var,
+                "gain_var": gain_var, "invert_var": invert_var}
+
+    def _build_sampling_section(self, parent) -> None:
+        """
+        Trim + decimation -- deliberately built from the SAME StringVars as
+        the "Datos" group of the Gráfico pane (`self.xmin_var`,
+        `self.xmax_var`, `self.dec_mode_var`, `self.dec_value_var`), not a
+        per-trace copy. `_gather_curves` crops/decimates every visible
+        signal with one shared window (see core/processing.py); a true
+        per-trace crop would mean each curve could show a different X range
+        on the same axes, which `update_plot` does not support and is out
+        of scope here. This is a convenience shortcut for whoever is
+        already looking at a trace's panel, not a new per-trace feature --
+        the info dot says so.
+        """
+        section = StaticSection(parent, t("Muestreo"), expanded=False)
+        section.pack(fill="x", pady=(0, 10))
+        box = section.body
+
+        header = ctk.CTkFrame(box, fg_color="transparent")
+        header.pack(fill="x", pady=(0, 4))
+        info_dot(header, t("Se aplica a todas las trazas visibles, no sólo a "
+                           "ésta -- es el mismo recorte/diezmado de la sección "
+                           "«Datos» del panel Gráfico.")).pack(side="right")
+
+        entry_field(box, t("X mín"), self.xmin_var, on_enter=self.update_plot,
+                    label_width=88)
+        entry_field(box, t("X máx"), self.xmax_var, on_enter=self.update_plot,
+                    label_width=88, rule=False)
+        combo_field(box, t("Reducir puntos"), self.dec_mode_var, DEC_MODES,
+                    width=120, labels=_labels()["dec"],
+                    command=lambda _=None: self.update_plot())
+        entry_field(box, t("Valor"), self.dec_value_var, on_enter=self.update_plot,
+                    label_width=88, rule=False)
+
 
     # ------------------------------------------------------------------ #
     # Settings gathering / plotting
@@ -2618,16 +2770,16 @@ class App(ctk.CTk):
         mode = self.plot_mode_var.get()
         if mode == "Modo X/Y":
             self._refresh_xy_combos()
-            self.xy_frame.grid()
-            self.bode_frame.grid_remove()
+            self.bode_frame.pack_forget()
+            self.xy_frame.pack(fill="x")
             self._reset_xscale_for_domain(self._dominant_domain())
         elif mode == "Diagrama de Bode":
-            self.xy_frame.grid_remove()
-            self.bode_frame.grid()
+            self.xy_frame.pack_forget()
+            self.bode_frame.pack(fill="x")
             self._reset_xscale_for_domain("freq")   # Bode is always frequency-domain
         else:
-            self.xy_frame.grid_remove()
-            self.bode_frame.grid_remove()
+            self.xy_frame.pack_forget()
+            self.bode_frame.pack_forget()
             self._reset_xscale_for_domain(self._dominant_domain())
 
         # CSV export: the Individual/Combinado choice is meaningless in X/Y
@@ -2714,21 +2866,36 @@ class App(ctk.CTk):
         annotations = self.annotations.to_dict()
         selected, compact = self.selected_uid, self._compact
 
-        if self.overlay_window is not None and self.overlay_window.winfo_exists():
-            self.overlay_window.destroy()
-        self.overlay_window = None
         if self._shortcuts_window is not None and self._shortcuts_window.winfo_exists():
             self._shortcuts_window.destroy()
         self._shortcuts_window = None
         if self._board_window is not None and self._board_window.winfo_exists():
             self._board_window.destroy()
         self._board_window = None
+        if self._histogram_window is not None and self._histogram_window.winfo_exists():
+            self._histogram_window.destroy()
+        self._histogram_window = None
 
         self._plot_suspended = True
         try:
             for child in list(self.winfo_children()):
                 child.destroy()
             self._build_layout()
+            # `self.stage_var`/`self.selection` are plain state, untouched by
+            # tearing down widgets -- only `_init_shell_state()` would reset
+            # them, and it isn't called again here on purpose, so the stage
+            # the user was on survives the rebuild. Re-running the commands/
+            # shortcuts registration is idempotent (same handlers rebound)
+            # and `_set_stage` repopulates the now-empty navigator/tool
+            # strip/footer for that stage.
+            self._register_commands()
+            self._bind_shortcuts()
+            self._set_stage(self.stage_var.get())
+            # Static navigator content, rebuilt into the fresh frames
+            # `_build_layout()` just created (the old ones, and everything
+            # embedded in them, were destroyed above).
+            self._build_overlay_panel()
+            self._build_export_navigator()
 
             for key, var in self._persisted_vars().items():
                 if key in settings:
@@ -2745,8 +2912,9 @@ class App(ctk.CTk):
             self.selected_uid = selected if selected in self.signals else None
             self._refresh_signal_list()
             self._refresh_xy_combos()
+            self._refresh_chips()
             if self.selected_uid is not None:
-                self._build_param_panel(self.selected_uid)
+                self.select("trace", self.selected_uid)
             if compact:
                 self._set_compact(True)
         finally:
@@ -2884,6 +3052,13 @@ class App(ctk.CTk):
             return "Magnitud [dB]"
         if kinds == {"deg"}:
             return "Fase [$^\\circ$]"
+        if kinds == {"custom"}:
+            # A custom magnitude has no fixed physical quantity to prefix
+            # with (unlike "$V$" for voltage) -- just the unit the user
+            # typed, or nothing at all when they left it blank ("sin
+            # unidad").
+            unit = settings["y_unit"]
+            return f"[{unit}]" if unit else ""
         unit = settings["y_unit"]
         return f"$V$ [{VOLT_UNIT_LATEX.get(unit, unit)}]"
 
@@ -2999,8 +3174,7 @@ class App(ctk.CTk):
         self.cursors.redraw()
         self.annotations.redraw()
         self._on_cursor_change()
-        if self.overlay_window is not None and self.overlay_window.winfo_exists():
-            self.overlay_window.panel.refresh_all()
+        self.overlay_panel.refresh_all()
 
         self.canvas.draw_idle()
         self.status_label.configure(text=f'{n_points} {t("puntos en gráfico")} · {t("modo")}: '
@@ -3435,6 +3609,37 @@ class App(ctk.CTk):
             pass   # the sidecar is a convenience: never undo a successful export
         self._show_latex_figure(out_path)
 
+    def _export_settings_only(self) -> None:
+        """
+        Write the `.labplotter.json` sidecar alone -- no PNG/PDF/SVG/PGF
+        next to it. Useful to version a figure's settings without
+        regenerating the heavy file every time, or to reopen a session
+        later via `_import_figure` with no rendered figure at all.
+        """
+        if not self.signals:
+            messagebox.showinfo(t("Sin señales"),
+                                t("Cargá al menos una señal antes de exportar."))
+            return
+
+        out_path = filedialog.asksaveasfilename(
+            title=t("Guardar ajustes (sin figura)"),
+            defaultextension=session.FIGURE_STATE_SUFFIX,
+            filetypes=[(t("Ajustes de LabPlotter"),
+                       f"*{session.FIGURE_STATE_SUFFIX}")])
+        if not out_path:
+            return
+        if not out_path.endswith(session.FIGURE_STATE_SUFFIX):
+            out_path += session.FIGURE_STATE_SUFFIX
+
+        try:
+            ok = session.save_figure_state_to(out_path, self._gather_plot_state())
+        except Exception as exc:
+            messagebox.showerror(t("Error al guardar ajustes"), str(exc))
+            return
+        if not ok:
+            messagebox.showerror(t("Error al guardar ajustes"),
+                                 t("No se pudo escribir el archivo."))
+
     def _import_figure(self) -> None:
         """
         Reopen a figure exported earlier -- with every setting and signal it
@@ -3571,20 +3776,49 @@ class App(ctk.CTk):
             board.BoardPanel(title=title, vector_path=vector_path,
                              preview_path=preview_path))
         self.board_title_var.set("")
-
-        count = board.total_panels(self.board_rows)
-        self.board_status_label.configure(
-            text=f"{count} panel(es) · {self._board_export_dir}")
+        self._update_board_status()
 
         if self._board_window is not None and self._board_window.winfo_exists():
             self._board_window._refresh()
 
-    def _open_board_window(self) -> None:
+    def _update_board_status(self) -> None:
+        """
+        Keep every place that shows the board's panel count in sync -- the
+        "Exportar" section (deep in the Gráfico pane) and the "Exportar"
+        stage's navigator (`_build_export_navigator`) both display it, and
+        neither should go stale just because the other one exists.
+        """
+        count = board.total_panels(self.board_rows)
+        text = (f"{count} panel(es) · {self._board_export_dir}" if count
+                else t("Tablero vacío."))
+        for label in (getattr(self, "board_status_label", None),
+                     getattr(self, "nav_board_status", None)):
+            if label is not None:
+                label.configure(text=text)
+
+    def _open_board(self) -> None:
         if self._board_window is not None and self._board_window.winfo_exists():
             self._board_window.lift()
             self._board_window.focus_force()
             return
         self._board_window = BoardWindow(self, self)
+
+    def _open_histogram(self) -> None:
+        # Alias for `Shell._register_commands`'s command-palette entry, which
+        # calls this name -- Shell only knows the generic verb, the real
+        # window lives in `_open_histogram_window` alongside `_open_board`.
+        self._open_histogram_window()
+
+    def _open_histogram_window(self) -> None:
+        if self._histogram_window is not None and self._histogram_window.winfo_exists():
+            # Re-scan `self.signal_order` on every reopen -- a signal loaded
+            # or removed while the window was already open otherwise stayed
+            # invisible to it until it was closed and reopened.
+            self._histogram_window.refresh_signals()
+            self._histogram_window.lift()
+            self._histogram_window.focus_force()
+            return
+        self._histogram_window = HistogramWindow(self, self)
 
     # ------------------------------------------------------------------ #
     # Overlay layer: cursors and annotations
@@ -3629,9 +3863,10 @@ class App(ctk.CTk):
         self._refresh_signal_list()
         self._refresh_xy_combos()
         if self.selected_uid is not None:
-            self._build_param_panel(self.selected_uid)
+            self.select("trace", self.selected_uid)
         else:
-            self._build_param_placeholder()
+            self.selection = None
+            self._sync_inspector()
         self.update_plot()
         self.status_label.configure(text=f"{verb}: {snapshot.label}")
 
@@ -3640,28 +3875,81 @@ class App(ctk.CTk):
         return self.cursors.x_unit, self.cursors.y_unit
 
     def _refresh_overlays(self) -> None:
-        """Re-render only the overlay artists; the data plot is untouched."""
+        """
+        Re-render only the overlay artists; the data plot is untouched.
+
+        Unlike `update_plot()`, this runs on LIVE axes (no `fig.clear()`), so
+        it relies on `attach()` actually destroying the previous artists --
+        see the ghost-overlay bugfix note in `overlays.CursorManager.attach`.
+        """
         self.cursors.attach(self.axes)
         self.annotations.attach(self.axes)
         self.cursors.redraw()
         self.annotations.redraw()
         self.canvas.draw_idle()
 
-    def _open_overlay_window(self, tab: str = "cursors") -> None:
-        if self.overlay_window is not None and self.overlay_window.winfo_exists():
-            self.overlay_window.panel.show_pane(tab)
-            self.overlay_window.lift()
-            self.overlay_window.focus()
-            return
-        self.overlay_window = OverlayWindow(
-            self, self.cursors, self.annotations,
-            on_refresh=self._refresh_overlays,
-            unit_provider=self._overlay_units,
-            on_close=self._on_overlay_closed,
-            initial_pane=tab)
+    def _build_overlay_panel(self) -> None:
+        """
+        Embed the cursor/annotation editor directly in the "Anotar" stage's
+        navigator, instead of the floating, non-modal `OverlayWindow` this
+        used to open on demand.
 
-    def _on_overlay_closed(self) -> None:
-        self.overlay_window = None
+        `OverlayPanel`'s own docstring argues for a separate `CTkToplevel`
+        so placing a cursor or capturing a point can still click *on the
+        canvas* while the palette is open -- but that rationale is about not
+        covering the canvas, and the navigator is a permanent side column
+        that never does. With a dedicated "Anotar" stage in the rail, the
+        navigator IS the always-visible, never-in-the-way surface the
+        floating window was substituting for, so embedding it here removes
+        a second, redundant entry point (the toolbar's "Anotar" tool used to
+        pop the same editor in a window of its own -- see `_select_tool`)
+        without losing the "click straight through to the canvas" property.
+
+        Called once after `__init__`'s `_build_layout()`, and again from
+        `_rebuild_ui` after ITS `_build_layout()` recreates the navigator
+        frames (the panel gets destroyed along with the old ones, but
+        `self.cursors`/`self.annotations` are untouched, so nothing about
+        the actual cursors/annotations is lost, only the widget showing them).
+        """
+        self.overlay_panel = OverlayPanel(
+            self.navigators["annotate"], self.cursors, self.annotations,
+            on_refresh=self._refresh_overlays, unit_provider=self._overlay_units)
+        self.overlay_panel.pack(fill="both", expand=True)
+
+    def _build_export_navigator(self) -> None:
+        """
+        Static content for the "Exportar" stage's navigator: the board and
+        histogram entry points used to sit at the very bottom of the long
+        "Exportar" section in the Gráfico pane, past Ejes/Etiquetas/Leyenda/
+        Datos -- reachable, but only after scrolling past four other
+        sections first, which is what made them "poco accesibles". The
+        stage's own primary action (Shell's default footer, "Exportar
+        figura") stays exactly where it was; this is everything else
+        export-related that deserves to be seen without scrolling for it.
+        """
+        parent = self.navigators["export"]
+        for w in parent.winfo_children():
+            w.destroy()
+
+        stacked_label(parent, t("Tablero"))
+        self.nav_board_status = hint(parent, t("Tablero vacío."), wraplength=190)
+        self.nav_board_status.pack(fill="x", pady=(0, 8))
+        board_actions = ctk.CTkFrame(parent, fg_color="transparent")
+        board_actions.pack(fill="x", pady=(0, 16))
+        ghost_button(board_actions, t("+ Agregar actual"), self._add_current_to_board,
+                    width=132).pack(side="left")
+        ghost_button(board_actions, t("Ver..."), self._open_board,
+                    width=58).pack(side="left", padx=(6, 0))
+
+        Rule(parent).pack(fill="x", pady=(0, 16))
+
+        stacked_label(parent, t("Histograma"))
+        hint(parent, t("Distribución de los valores de una o más señales."),
+             wraplength=200).pack(fill="x", pady=(0, 6))
+        ghost_button(parent, t("Ver histograma..."), self._open_histogram_window,
+                    height=28).pack(fill="x")
+
+        self._update_board_status()
 
 
 def main() -> None:

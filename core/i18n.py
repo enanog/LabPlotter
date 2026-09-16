@@ -169,10 +169,12 @@ _EN: dict[str, str] = {
     "Importar figura...": "Import figure...",
     "Recupera una figura exportada antes con TODOS sus ajustes "
     "y señales, en una pestaña nueva. Necesita el archivo "
-    "«.labplotter.json» que se guarda junto a la figura.":
+    "«.labplotter.json» que se guarda en la carpeta "
+    "«LabPlotter Settings», junto a la figura.":
         "Recovers a previously exported figure with ALL its settings "
         "and signals, in a new tab. Needs the "
-        "“.labplotter.json” file saved alongside the figure.",
+        "“.labplotter.json” file saved in the “LabPlotter Settings” "
+        "folder, next to the figure.",
     "Ajustes de LabPlotter": "LabPlotter settings",
     "Todos los archivos": "All files",
     "No se pudo importar": "Couldn't import",
@@ -318,10 +320,20 @@ _EN: dict[str, str] = {
     "Admite mathtext: $f_0 = 9{,}61\\,$kHz":
         "Mathtext accepted: $f_0 = 9.61\\,$kHz",
     "Punto de interés": "Point of interest",
+    "Línea diagonal": "Diagonal line",
     "Línea vertical": "Vertical line",
     "Línea horizontal": "Horizontal line",
     "Banda vertical": "Vertical band",
     "Banda horizontal": "Horizontal band",
+    "Texto paralelo a la línea": "Text parallel to the line",
+    "Ubicar el texto en un punto": "Place the text at a point",
+    "Texto X": "Text X",
+    "Texto Y": "Text Y",
+    "Capturar posición del texto": "Capture text position",
+    "El texto puede ir paralelo a la línea, o fijo en el "
+    "punto Texto X/Y en vez de la posición automática.":
+        "The text can run parallel to the line, or sit fixed at the "
+        "Text X/Y point instead of the automatic position.",
     "sin cruce": "no crossing",
     "(sin texto)": "(no text)",
 

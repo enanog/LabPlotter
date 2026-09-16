@@ -57,9 +57,14 @@ _KIND_FIELDS: dict[str, set[str]] = {
     "point": {"x", "y", "text", "dx", "dy", "arrow", "fontsize", "boxed", "color"},
     "arrow": {"x", "y", "x2", "y2", "text", "dx", "dy", "arrow", "linewidth",
               "fontsize", "boxed", "color"},
+    "line": {"x", "y", "x2", "y2", "text", "linestyle", "linewidth", "rotation",
+             "label_pos", "label_parallel", "label_free", "label_x", "label_y",
+             "fontsize", "boxed", "color", "alpha"},
     "vline": {"x", "text", "linestyle", "linewidth", "rotation", "label_pos",
+              "label_parallel", "label_free", "label_x", "label_y",
               "fontsize", "boxed", "color"},
     "hline": {"y", "text", "linestyle", "linewidth", "rotation", "label_pos",
+              "label_parallel", "label_free", "label_x", "label_y",
               "fontsize", "boxed", "color"},
     "text":  {"x", "y", "text", "rotation", "fontsize", "boxed", "color"},
     "vspan": {"x", "x2", "text", "alpha", "label_pos", "fontsize", "boxed", "color"},
@@ -499,11 +504,17 @@ class OverlayPanel(ctk.CTkFrame):
                 ("dx", "26"), ("dy", "20"), ("fontsize", "8"),
                 ("linewidth", "0.9"), ("rotation", "0"), ("label_pos", "0.5"),
                 ("alpha", "1.0"), ("color", "#2A2724"),
+                ("label_x", "0"), ("label_y", "0"),
             )
         }
         self.linestyle_var = ctk.StringVar(value="--")
         self.arrow_var = ctk.StringVar(value="->")
         self.boxed_var = ctk.BooleanVar(value=True)
+        # Advanced label placement, shared by "line"/"vline"/"hline": follow
+        # the line's on-screen angle instead of a manual `rotation`, or drop
+        # the automatic position entirely for an explicit (label_x, label_y).
+        self.label_parallel_var = ctk.BooleanVar(value=False)
+        self.label_free_var = ctk.BooleanVar(value=False)
         self.widgets: dict[str, list] = {}
 
         coords = ctk.CTkFrame(parent, fg_color="transparent", width=1, height=1)
@@ -516,9 +527,9 @@ class OverlayPanel(ctk.CTkFrame):
 
         capture = ctk.CTkFrame(parent, fg_color="transparent")
         capture.pack(fill="x", pady=(10, 4))
-        ghost_button(capture, t("Capturar X/Y"), lambda: self._capture(False),
+        ghost_button(capture, t("Capturar X/Y"), lambda: self._capture("p1"),
                      height=28).pack(fill="x")
-        ghost_button(capture, t("Capturar X₂/Y₂"), lambda: self._capture(True),
+        ghost_button(capture, t("Capturar X₂/Y₂"), lambda: self._capture("p2"),
                      height=28).pack(fill="x", pady=(6, 0))
         self.annotation_hint = hint(parent, "", wraplength=230)
         self.annotation_hint.pack(fill="x", pady=(2, 10))
@@ -580,6 +591,22 @@ class OverlayPanel(ctk.CTkFrame):
                                                  suffix="°")]
         self.widgets["label_pos"] = [entry_field(box, t("Posición en la línea"),
                                                   self.vars["label_pos"])]
+        self.widgets["label_parallel"] = [check_field(
+            box, t("Texto paralelo a la línea"), self.label_parallel_var)]
+        free_check = check_field(box, t("Ubicar el texto en un punto"),
+                                 self.label_free_var)
+        self.widgets["label_x"] = [entry_field(box, t("Texto X"), self.vars["label_x"])]
+        self.widgets["label_y"] = [entry_field(box, t("Texto Y"), self.vars["label_y"])]
+        capture_label_btn = ghost_button(box, t("Capturar posición del texto"),
+                                         lambda: self._capture("label"), height=28)
+        capture_label_btn.pack(fill="x", pady=(0, 10))
+        # Grouped under "label_free": capturing/typing a fixed point only
+        # matters once that point is actually being used, so all three are
+        # greyed out together for kinds without free-placement support.
+        self.widgets["label_free"] = [free_check, capture_label_btn]
+        hint(box, t("El texto puede ir paralelo a la línea, o fijo en el "
+                    "punto Texto X/Y en vez de la posición automática."),
+             wraplength=230).pack(fill="x", pady=(0, 10))
         self.widgets["alpha"] = [entry_field(box, t("Opacidad"), self.vars["alpha"],
                                               rule=False)]
         self.widgets["text"] = []
@@ -666,11 +693,19 @@ class OverlayPanel(ctk.CTkFrame):
     def _on_kind_change(self) -> None:
         kind = self._kind()
         self._set_field_states(kind)
+        # Advanced label placement is opt-in per annotation, not per kind
+        # (KIND_DEFAULTS never sets it): reset it on every kind switch so a
+        # "parallel"/"point" choice made for one line doesn't silently carry
+        # over into the next annotation being built.
+        self.label_parallel_var.set(False)
+        self.label_free_var.set(False)
         for key, value in KIND_DEFAULTS.get(kind, {}).items():
             if key == "boxed":
                 self.boxed_var.set(bool(value))
             elif key == "arrow":
                 self.arrow_var.set(str(value))
+            elif key == "linestyle":
+                self.linestyle_var.set(str(value))
             elif key in self.vars:
                 self.vars[key].set(f"{value:g}")
 
@@ -702,13 +737,24 @@ class OverlayPanel(ctk.CTkFrame):
         if hex_color:
             self.vars["color"].set(hex_color)
 
-    def _capture(self, second_point: bool) -> None:
+    def _capture(self, target: str = "p1") -> None:
+        """
+        Arm a one-shot canvas click. `target` selects which field pair the
+        clicked point fills: "p1" (X/Y), "p2" (X₂/Y₂) or "label" (the free
+        text position) -- capturing a point for the label also flips
+        `label_free` on, since clicking a point only makes sense if that
+        point is then actually used instead of the automatic placement.
+        """
         self.cursors.disarm()
 
         def _done(axes_index: int, x: float, y: float) -> None:
-            if second_point:
+            if target == "p2":
                 self.vars["x2"].set(f"{x:.6g}")
                 self.vars["y2"].set(f"{y:.6g}")
+            elif target == "label":
+                self.vars["label_x"].set(f"{x:.6g}")
+                self.vars["label_y"].set(f"{y:.6g}")
+                self.label_free_var.set(True)
             else:
                 self.vars["x"].set(f"{x:.6g}")
                 self.vars["y"].set(f"{y:.6g}")
@@ -740,6 +786,10 @@ class OverlayPanel(ctk.CTkFrame):
             "boxed": bool(self.boxed_var.get()),
             "arrow": self.arrow_var.get(),
             "label_pos": _parse_float(self.vars["label_pos"].get(), 0.5),
+            "label_parallel": bool(self.label_parallel_var.get()),
+            "label_free": bool(self.label_free_var.get()),
+            "label_x": _parse_float(self.vars["label_x"].get(), 0.0),
+            "label_y": _parse_float(self.vars["label_y"].get(), 0.0),
             "alpha": _parse_float(self.vars["alpha"].get(), 1.0),
             # "" means "inherit": the renderer keeps the rcParams family and
             # the per-kind alignment default.
@@ -757,13 +807,15 @@ class OverlayPanel(ctk.CTkFrame):
         self.kind_var.set(t(label))
         self._set_field_states(spec.kind)
         for key in ("x", "y", "x2", "y2", "dx", "dy", "fontsize", "linewidth",
-                    "rotation", "label_pos", "alpha"):
+                    "rotation", "label_pos", "alpha", "label_x", "label_y"):
             self.vars[key].set(f"{getattr(spec, key):g}")
         self.vars["color"].set(spec.color)
         self.text_var.set(spec.text)
         self.linestyle_var.set(spec.linestyle)
         self.arrow_var.set(spec.arrow)
         self.boxed_var.set(spec.boxed)
+        self.label_parallel_var.set(spec.label_parallel)
+        self.label_free_var.set(spec.label_free)
         self.fontfamily_var.set(spec.fontfamily or FONT_DEFAULT)
         self.fontweight_var.set(spec.fontweight or "normal")
         self.fontstyle_var.set(spec.fontstyle or "normal")

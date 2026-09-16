@@ -3905,8 +3905,9 @@ class App(Shell):
     def _import_figure(self) -> None:
         """
         Reopen a figure exported earlier -- with every setting and signal it
-        had at export time -- from the `.labplotter.json` sidecar written
-        next to it by `_export_figure`. Restored into a NEW tab rather than
+        had at export time -- from the `.labplotter.json` sidecar written by
+        `_export_figure` into the `session.FIGURE_STATE_SUBDIR` folder next
+        to it. Restored into a NEW tab rather than
         replacing the current one, same reasoning as `_add_tab`: importing
         an old figure should never cost you whatever you already have on
         screen.
@@ -3934,7 +3935,7 @@ class App(Shell):
         name = name or self._next_tab_name()
         self.plot_tabs.append(tabs.PlotTab(name=name, state=data))
         self.active_tab = len(self.plot_tabs) - 1
-        self._apply_plot_state(data, anchor_dir=os.path.dirname(path))
+        self._apply_plot_state(data, anchor_dir=session.sidecar_anchor_dir(path))
         self._refresh_tab_strip()
 
         total = len(data.get("signals", []) or [])
@@ -4273,7 +4274,8 @@ class App(Shell):
                     height=28).pack(fill="x")
         hint(parent, t("Recupera una figura exportada antes con TODOS sus ajustes "
                     "y señales, en una pestaña nueva. Necesita el archivo "
-                    "«.labplotter.json» que se guarda junto a la figura."),
+                    "«.labplotter.json» que se guarda en la carpeta "
+                    "«LabPlotter Settings», junto a la figura."),
              wraplength=190).pack(fill="x", pady=(4, 0))
 
         Rule(parent).pack(fill="x", pady=(14, 12))

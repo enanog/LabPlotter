@@ -64,6 +64,11 @@ def _read_json(path: Path) -> Optional[dict]:
 def _write_json(path: Path, payload: dict) -> bool:
     tmp = path.with_suffix(path.suffix + ".tmp")
     try:
+        # Reuse the destination folder if it is already there (e.g. a
+        # previously-created FIGURE_STATE_SUBDIR), create it otherwise --
+        # config_dir() covers session.json/export_profiles.json on its own,
+        # so this only actually does something for figure sidecars.
+        path.parent.mkdir(parents=True, exist_ok=True)
         with open(tmp, "w", encoding="utf-8") as handle:
             json.dump(payload, handle, indent=2, ensure_ascii=False)
         tmp.replace(path)   # atomic on both POSIX and Windows (same volume)
@@ -169,26 +174,54 @@ def delete_profile(name: str) -> dict[str, dict[str, Any]]:
 # Figure sidecars ("import this exported figure back with its settings")
 # ========================================================================== #
 # Unlike the session above (one fixed file under `config_dir()`), one of
-# these is written next to EVERY exported figure -- so re-opening an old
-# export later means picking that file, not hunting through a single
-# ever-growing "last session" blob. It carries exactly the shape
+# these is written for EVERY exported figure -- so re-opening an old export
+# later means picking that file, not hunting through a single ever-growing
+# "last session" blob. It carries exactly the shape
 # `App._gather_plot_state()` / `App._apply_plot_state()` already use for one
 # plot tab (settings + signals + manual margins): the same replay mechanism
 # that already restores a signal from its original data file on disk, by
 # `source_path`, is reused here rather than re-solving the same problem.
+#
+# The sidecar lives inside a `FIGURE_STATE_SUBDIR` folder next to the image
+# rather than right beside it: an export folder with several figures would
+# otherwise end up with two files per figure (the image and its
+# `.labplotter.json`) interleaved in the listing. Every figure exported into
+# the same folder shares that one subfolder -- reused if it is already
+# there, created the first time -- so it still travels with the figures if
+# the folder is moved or zipped up, and stays easy to find by name.
 FIGURE_STATE_SUFFIX = ".labplotter.json"
+FIGURE_STATE_SUBDIR = "LabPlotter Settings"
 FIGURE_STATE_VERSION = 1
 
 
 def figure_state_path(fig_path: str) -> Path:
     """
-    Sidecar path for one exported figure's settings, sitting right beside
-    the figure itself (not under `config_dir()`) so it travels with the
-    figure if the folder is moved or zipped up, and is easy to spot in the
-    export folder by name alone.
+    Sidecar path for one exported figure's settings: `FIGURE_STATE_SUBDIR`
+    inside the figure's own folder, not under `config_dir()`.
     """
-    base, _ext = os.path.splitext(fig_path)
-    return Path(base + FIGURE_STATE_SUFFIX)
+    fig = Path(fig_path)
+    stem, _ext = os.path.splitext(fig.name)
+    return fig.parent / FIGURE_STATE_SUBDIR / (stem + FIGURE_STATE_SUFFIX)
+
+
+def sidecar_anchor_dir(json_path: str) -> str:
+    """
+    Folder that relative source paths in a sidecar are stamped/resolved
+    against -- the exported image's own folder, even for a sidecar that
+    actually sits one level deeper inside `FIGURE_STATE_SUBDIR`. Without
+    this, `resolve_source_path`'s bounded directory walk (its last-resort
+    "find this filename nearby" fallback) would start from inside the
+    settings subfolder instead of the export folder, and miss a data file
+    sitting right next to the image.
+
+    A standalone sidecar saved via "save settings only" (`save_figure_state_to`
+    called with a path the user picked directly) is unaffected: it does not
+    sit inside `FIGURE_STATE_SUBDIR`, so its own folder is returned as-is.
+    """
+    parent = Path(json_path).parent
+    if parent.name == FIGURE_STATE_SUBDIR:
+        return str(parent.parent)
+    return str(parent)
 
 
 def save_figure_state_to(json_path: str, state: dict) -> bool:
@@ -203,7 +236,7 @@ def save_figure_state_to(json_path: str, state: dict) -> bool:
     """
     payload = {"version": FIGURE_STATE_VERSION, **state}
     path = Path(json_path)
-    _stamp_relative_paths(payload, path.parent)
+    _stamp_relative_paths(payload, Path(sidecar_anchor_dir(str(path))))
     return _write_json(path, payload)
 
 

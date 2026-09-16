@@ -24,6 +24,7 @@ it can be driven from a GUI panel, a script or a batch export.
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import asdict, dataclass, fields
 from typing import Callable, Optional, Sequence
 
@@ -57,6 +58,7 @@ VA_CHOICES: list[str] = ["top", "center", "bottom", "baseline"]
 ANNOTATION_KINDS: dict[str, str] = {
     "Punto de interés": "point",
     "Flecha": "arrow",
+    "Línea diagonal": "line",
     "Línea vertical": "vline",
     "Línea horizontal": "hline",
     "Texto": "text",
@@ -210,6 +212,27 @@ def _from_dict(cls, payload: dict):
     """Build a dataclass from a dict, ignoring unknown/legacy keys."""
     valid = {f.name for f in fields(cls)}
     return cls(**{k: v for k, v in payload.items() if k in valid})
+
+
+def _screen_angle(ax, x1: float, y1: float, x2: float, y2: float) -> float:
+    """
+    On-screen angle (degrees) of the segment (x1, y1)-(x2, y2).
+
+    Computed from the transformed *pixel* positions, not the raw data
+    coordinates: X and Y axes rarely share the same scale (a Bode plot, a
+    log axis, a stretched window), so a data-space angle would not match
+    what the line actually looks like on screen. Folded into (-90, 90] so
+    a near-vertical line reads as +90/-90 rather than flipping the text
+    upside down.
+    """
+    px1, py1 = ax.transData.transform((x1, y1))
+    px2, py2 = ax.transData.transform((x2, y2))
+    angle = math.degrees(math.atan2(py2 - py1, px2 - px1))
+    if angle <= -90.0:
+        angle += 180.0
+    elif angle > 90.0:
+        angle -= 180.0
+    return angle
 
 
 # ========================================================================== #
@@ -672,7 +695,7 @@ class AnnotationSpec:
     trivial; unused fields are simply ignored by the renderer of each kind.
     """
     aid: int
-    kind: str = "point"           # point | arrow | vline | hline | text | vspan | hspan
+    kind: str = "point"           # point | arrow | line | vline | hline | text | vspan | hspan
     x: float = 0.0
     y: float = 0.0
     x2: float = 0.0
@@ -688,7 +711,14 @@ class AnnotationSpec:
     rotation: float = 0.0         # label rotation in degrees
     boxed: bool = True
     arrow: str = "->"
-    label_pos: float = 0.5        # axes fraction along a reference line
+    label_pos: float = 0.5        # axes fraction along a reference line, or
+                                   # fraction along the segment for "line"
+    label_parallel: bool = False  # rotate the label to match the on-screen
+                                   # angle of the line instead of `rotation`
+    label_free: bool = False      # place the label at (label_x, label_y)
+                                   # instead of the automatic position
+    label_x: float = 0.0
+    label_y: float = 0.0
     alpha: float = 1.0
     marker: str = "o"
     markersize: float = 4.0
@@ -710,6 +740,8 @@ KIND_DEFAULTS: dict[str, dict] = {
               "dx": 26.0, "dy": 20.0, "arrow": "->"},
     "arrow": {"rotation": 0.0, "alpha": 1.0, "boxed": True,
               "dx": 0.0, "dy": 10.0, "arrow": "<->"},
+    "line": {"rotation": 0.0, "alpha": 1.0, "boxed": True, "label_pos": 0.5,
+             "linestyle": "-"},
     "vline": {"rotation": 90.0, "alpha": 1.0, "boxed": True, "label_pos": 0.45},
     "hline": {"rotation": 0.0, "alpha": 1.0, "boxed": True, "label_pos": 0.5},
     "text":  {"rotation": 0.0, "alpha": 1.0, "boxed": False},
@@ -951,12 +983,23 @@ class AnnotationManager:
                           label="_nolegend_")
         out = [line]
         if spec.text:
-            out.append(ax.text(
-                spec.x, spec.label_pos, spec.text,
-                transform=ax.get_xaxis_transform(), rotation=spec.rotation,
-                rotation_mode="anchor", bbox=self._box(spec), zorder=8,
-                clip_on=False,
-                **self._text_kwargs(spec, ha="center", va="bottom")))
+            # A vertical line is always vertical on screen no matter the data
+            # scale, so "parallel" is just the historical 90 deg default --
+            # no angle computation needed here, unlike the generic "line".
+            rotation = 90.0 if spec.label_parallel else spec.rotation
+            if spec.label_free:
+                out.append(ax.text(
+                    spec.label_x, spec.label_y, spec.text, rotation=rotation,
+                    rotation_mode="anchor", bbox=self._box(spec), zorder=8,
+                    clip_on=False,
+                    **self._text_kwargs(spec, ha="center", va="bottom")))
+            else:
+                out.append(ax.text(
+                    spec.x, spec.label_pos, spec.text,
+                    transform=ax.get_xaxis_transform(), rotation=rotation,
+                    rotation_mode="anchor", bbox=self._box(spec), zorder=8,
+                    clip_on=False,
+                    **self._text_kwargs(spec, ha="center", va="bottom")))
         return out
 
     def _render_hline(self, ax, spec: AnnotationSpec) -> list:
@@ -965,11 +1008,39 @@ class AnnotationManager:
                           label="_nolegend_")
         out = [line]
         if spec.text:
+            rotation = 0.0 if spec.label_parallel else spec.rotation
+            if spec.label_free:
+                out.append(ax.text(
+                    spec.label_x, spec.label_y, spec.text, rotation=rotation,
+                    rotation_mode="anchor", bbox=self._box(spec), zorder=8,
+                    clip_on=False,
+                    **self._text_kwargs(spec, ha="center", va="bottom")))
+            else:
+                out.append(ax.text(
+                    spec.label_pos, spec.y, spec.text,
+                    transform=ax.get_yaxis_transform(), rotation=rotation,
+                    bbox=self._box(spec), zorder=8, clip_on=False,
+                    **self._text_kwargs(spec, ha="center", va="bottom")))
+        return out
+
+    def _render_line(self, ax, spec: AnnotationSpec) -> list:
+        """Straight segment between two arbitrary points, at any angle."""
+        seg, = ax.plot([spec.x, spec.x2], [spec.y, spec.y2], color=spec.color,
+                       ls=spec.linestyle, lw=spec.linewidth, alpha=spec.alpha,
+                       solid_capstyle="butt", zorder=5, label="_nolegend_")
+        out = [seg]
+        if spec.text:
+            if spec.label_free:
+                tx, ty = spec.label_x, spec.label_y
+            else:
+                tx = spec.x + spec.label_pos * (spec.x2 - spec.x)
+                ty = spec.y + spec.label_pos * (spec.y2 - spec.y)
+            rotation = (_screen_angle(ax, spec.x, spec.y, spec.x2, spec.y2)
+                       if spec.label_parallel else spec.rotation)
             out.append(ax.text(
-                spec.label_pos, spec.y, spec.text,
-                transform=ax.get_yaxis_transform(), rotation=spec.rotation,
+                tx, ty, spec.text, rotation=rotation, rotation_mode="anchor",
                 bbox=self._box(spec), zorder=8, clip_on=False,
-                **self._text_kwargs(spec, ha="center", va="bottom")))
+                **self._text_kwargs(spec)))
         return out
 
     def _render_text(self, ax, spec: AnnotationSpec) -> list:

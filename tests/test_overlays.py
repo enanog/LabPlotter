@@ -213,7 +213,7 @@ class TestTypography(Base):
         self.assertEqual(texts["libre"].get_verticalalignment(), "center")
 
     def test_every_kind_renders_with_typography(self):
-        kinds = ["point", "arrow", "vline", "hline", "text", "vspan", "hspan"]
+        kinds = ["point", "arrow", "line", "vline", "hline", "text", "vspan", "hspan"]
         for kind in kinds:
             self.annotations.add(kind=kind, x=2e-4, y=0.3, x2=6e-4, y2=0.7,
                                  text=kind, fontfamily="serif", ha="right",
@@ -238,6 +238,9 @@ class TestTypography(Base):
         self.populate()
         self.annotations.items[0].fontfamily = "monospace"
         self.annotations.items[0].va = "top"
+        self.annotations.add(kind="line", x=1e-4, y=-0.5, x2=8e-4, y2=0.8,
+                             text="diag", label_parallel=True, label_free=True,
+                             label_x=6e-4, label_y=0.9)
         path = os.path.join(tempfile.mkdtemp(), "ov.json")
         save_overlays(path, self.cursors, self.annotations)
         c2 = CursorManager(self.canvas, max_cursors=None)
@@ -246,6 +249,88 @@ class TestTypography(Base):
         self.assertEqual(len(c2.cursors), len(self.cursors.cursors))
         self.assertEqual(a2.items[0].fontfamily, "monospace")
         self.assertEqual(a2.items[0].va, "top")
+        line_spec = next(a for a in a2.items if a.kind == "line")
+        self.assertTrue(line_spec.label_parallel)
+        self.assertTrue(line_spec.label_free)
+        self.assertAlmostEqual(line_spec.label_x, 6e-4)
+        self.assertAlmostEqual(line_spec.label_y, 0.9)
+
+
+class TestAngledLine(Base):
+    """The new "line" kind (arbitrary-angle segment) and its label options."""
+
+    def test_segment_endpoints(self):
+        self.annotations.add(kind="line", x=1e-4, y=-0.5, x2=8e-4, y2=0.8)
+        self.annotations.redraw()
+        spec = self.annotations.items[0]
+        seg = self.annotations._artists[spec.aid][0]
+        xdata, ydata = seg.get_xdata(), seg.get_ydata()
+        self.assertEqual((xdata[0], xdata[-1]), (1e-4, 8e-4))
+        self.assertEqual((ydata[0], ydata[-1]), (-0.5, 0.8))
+
+    def test_linestyle_is_configurable(self):
+        self.annotations.add(kind="line", x=0, y=0, x2=1e-3, y2=1, linestyle=":")
+        self.annotations.redraw()
+        spec = self.annotations.items[0]
+        seg = self.annotations._artists[spec.aid][0]
+        self.assertEqual(seg.get_linestyle(), ":")
+
+    def test_label_defaults_to_midpoint(self):
+        self.annotations.add(kind="line", x=0.0, y=0.0, x2=1.0, y2=2.0, text="m")
+        self.annotations.redraw()
+        spec = self.annotations.items[0]
+        label = self.annotations._artists[spec.aid][1]
+        self.assertEqual(label.get_position(), (0.5, 1.0))
+
+    def test_label_pos_moves_along_segment(self):
+        self.annotations.add(kind="line", x=0.0, y=0.0, x2=1.0, y2=2.0, text="m",
+                             label_pos=0.25)
+        self.annotations.redraw()
+        spec = self.annotations.items[0]
+        label = self.annotations._artists[spec.aid][1]
+        self.assertEqual(label.get_position(), (0.25, 0.5))
+
+    def test_label_free_overrides_automatic_position(self):
+        self.annotations.add(kind="line", x=0.0, y=0.0, x2=1.0, y2=2.0, text="m",
+                             label_free=True, label_x=9.0, label_y=-3.0)
+        self.annotations.redraw()
+        spec = self.annotations.items[0]
+        label = self.annotations._artists[spec.aid][1]
+        self.assertEqual(label.get_position(), (9.0, -3.0))
+
+    def test_label_parallel_follows_screen_angle_not_manual_rotation(self):
+        # A perfectly horizontal segment on screen: the parallel angle must
+        # be 0 deg regardless of the (deliberately wrong) manual `rotation`.
+        self.annotations.add(kind="line", x=0.0, y=0.5, x2=1.0, y2=0.5,
+                             text="h", label_parallel=True, rotation=45.0)
+        self.annotations.redraw()
+        spec = self.annotations.items[0]
+        label = self.annotations._artists[spec.aid][1]
+        self.assertAlmostEqual(label.get_rotation(), 0.0, places=3)
+
+    def test_label_manual_rotation_used_when_not_parallel(self):
+        self.annotations.add(kind="line", x=0.0, y=0.5, x2=1.0, y2=0.5,
+                             text="h", label_parallel=False, rotation=45.0)
+        self.annotations.redraw()
+        spec = self.annotations.items[0]
+        label = self.annotations._artists[spec.aid][1]
+        self.assertAlmostEqual(label.get_rotation(), 45.0, places=3)
+
+    def test_vline_label_free_uses_data_point_not_axes_fraction(self):
+        self.annotations.add(kind="vline", x=5e-4, text="v",
+                             label_free=True, label_x=7e-4, label_y=0.6)
+        self.annotations.redraw()
+        spec = self.annotations.items[0]
+        label = self.annotations._artists[spec.aid][1]
+        self.assertEqual(label.get_position(), (7e-4, 0.6))
+
+    def test_hline_label_parallel_is_horizontal(self):
+        self.annotations.add(kind="hline", y=0.3, text="h",
+                             label_parallel=True, rotation=90.0)
+        self.annotations.redraw()
+        spec = self.annotations.items[0]
+        label = self.annotations._artists[spec.aid][1]
+        self.assertAlmostEqual(label.get_rotation(), 0.0, places=3)
 
 
 class TestSliderMath(unittest.TestCase):

@@ -414,7 +414,7 @@ class OverlayPanel(ctk.CTkFrame):
                 self.cursor_pos_var.set(f"{spec.position:.6g}")
         if not self.cursors.armed:
             self.cursor_hint.configure(
-                text=t(t("Clic sobre el gráfico para colocarlo; arrastralos para medir.")))
+                text=t("Clic sobre el gráfico para colocarlo; arrastralos para medir."))
         # Keep the slider tracking the selection and the current axis limits:
         # a zoom or a replot changes the travel range under it.
         self._sync_cursor_slider()

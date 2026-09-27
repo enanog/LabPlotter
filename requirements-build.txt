@@ -1,0 +1,2 @@
+# Dependencias usadas únicamente por build_windows.bat.
+pyinstaller>=6.10

@@ -70,6 +70,7 @@ from gui.widgets import (
     DirtyDot, DirtyGroup, Field, Tooltip, info_dot,
 )
 from gui.board_window import BoardEditor
+from gui.circuit_editor import CircuitEditor, CircuitEditorState
 
 # Window width at which the type scale is exactly as designed (1.0). Matches
 # the default geometry, so the app opens at native size. Clamping lives in
@@ -502,6 +503,12 @@ class App(Shell):
         self.board_editor: Optional[BoardEditor] = None
         self._board_export_dir: Optional[str] = None
 
+        # Schematic editor: unlike its widgets, this state survives language
+        # changes and stage switches. The circuit has its own undo/redo stack
+        # and project file, independent from plot history/session state.
+        self.circuit_state = CircuitEditorState()
+        self.circuit_editor: Optional[CircuitEditor] = None
+
         # Plot tabs: several independent plots (own signals + settings) held
         # in memory at once, so building the next figure for the tablero
         # never means losing the previous one. `active_tab` is the index
@@ -584,6 +591,7 @@ class App(Shell):
         # after its own `_build_layout()` recreates the navigator frames.
         self._build_overlay_panel()
         self._build_board_panel()
+        self._build_circuit_panel()
         self._build_export_navigator()
         self._refresh_chips()
 
@@ -662,8 +670,16 @@ class App(Shell):
         self.bind_all("<BackSpace>", self._on_delete_key)
         self.bind_all("<Control-y>", lambda _e: self._redo())
         self.bind_all("<Control-Shift-Z>", lambda _e: self._redo())
-        self.bind_all("<Control-s>", lambda _e: self._export_csv())
+        self.bind_all("<Control-s>", self._save_shortcut)
         self.bind_all("<Control-m>", lambda _e: self._toggle_compact())
+
+    def _save_shortcut(self, _event=None) -> str:
+        """Save the document that belongs to the active workflow stage."""
+        if self.stage_var.get() == "circuit" and self.circuit_editor is not None:
+            self.circuit_editor.save()
+        else:
+            self._export_csv()
+        return "break"
 
     def _register_commands(self) -> None:
         super()._register_commands()
@@ -1129,6 +1145,8 @@ class App(Shell):
             pass
 
     def _on_close(self) -> None:
+        if self.circuit_editor is not None and not self.circuit_editor.can_close():
+            return
         try:
             session.save_session(self._gather_state())
         except Exception:
@@ -1221,7 +1239,7 @@ class App(Shell):
         # `PLOT_MODES`), not a stage that hides the main canvas, so it needs
         # no entry here -- the main canvas (and its tools) stay live in every
         # stage except "board".
-        main_stage = key != "board"
+        main_stage = key not in ("board", "circuit")
         if not main_stage and self._active_tool is not None:
             self._set_tool(None)
         for button in self.tool_buttons.values():
@@ -1241,16 +1259,16 @@ class App(Shell):
 
     def _show_plot_frame(self, key: str) -> None:
         """
-        Swap what the workspace canvas shows. Every stage except "board"
-        keeps looking at the main figure (`self.fig`) -- "board" draws its
-        own, separate `Figure` (`BoardEditor`'s preview), so entering it has
-        to change the canvas itself, not just the navigator beside it.
+        Swap what the workspace canvas shows. Most stages keep looking at the
+        main figure (`self.fig`); "board" and "circuit" each draw a separate
+        figure, so entering either one changes the canvas as well as the
+        navigator beside it.
         Histograma has no frame of its own here: it is a mode of `self.fig`
         (see `PLOT_MODES`/`update_plot`), so it shows in whichever stage's
         navigator the user already is in. -> `_build_workspace` (frames),
-        `_build_board_panel` (content).
+        `_build_board_panel` / `_build_circuit_panel` (content).
         """
-        target = key if key == "board" else "main"
+        target = key if key in self._plot_frames else "main"
         for name, frame in self._plot_frames.items():
             frame.pack_forget()
             if name == target:
@@ -1342,9 +1360,12 @@ class App(Shell):
         self._main_plot_frame.pack(fill="both", expand=True)
         self._board_plot_frame = ctk.CTkFrame(self.plot_container, corner_radius=0,
                                               fg_color=col("app"))
+        self._circuit_plot_frame = ctk.CTkFrame(self.plot_container, corner_radius=0,
+                                                fg_color=col("app"))
         self._plot_frames = {
             "main": self._main_plot_frame,
             "board": self._board_plot_frame,
+            "circuit": self._circuit_plot_frame,
         }
 
         # ---------------------------- canvas -------------------------- #
@@ -1752,7 +1773,7 @@ class App(Shell):
             self.cursors.arm("v")
             self._show_measurements()
             self.hint_label.configure(
-                text="Clic sobre el gráfico para colocar un cursor; arrastralo para medir.")
+                text=t("Clic sobre el gráfico para colocar un cursor; arrastralo para medir."))
         elif key == "annotate":
             self.cursors.disarm()
             # The annotation editor lives in the "Anotar" stage's navigator
@@ -2352,6 +2373,9 @@ class App(Shell):
         """
         focused = self.focus_get()
         if isinstance(focused, (tk.Entry, tk.Text)):
+            return
+        if self.stage_var.get() == "circuit" and self.circuit_editor is not None:
+            self.circuit_editor.delete_selected()
             return
         if self.selected_uid is None:
             return
@@ -3024,6 +3048,7 @@ class App(Shell):
         # loop below) -- no separate `.destroy()` needed, unlike the old
         # floating Toplevel this replaced.
         self.board_editor = None
+        self.circuit_editor = None
 
         self._plot_suspended = True
         try:
@@ -3045,6 +3070,7 @@ class App(Shell):
             # embedded in them, were destroyed above).
             self._build_overlay_panel()
             self._build_board_panel()
+            self._build_circuit_panel()
             self._build_export_navigator()
 
             for key, var in self._persisted_vars().items():
@@ -4059,6 +4085,9 @@ class App(Shell):
         # stage now (see `Shell.STAGES`); entering it is entering the stage.
         self.rail.select("board")
 
+    def _open_circuit(self) -> None:
+        self.rail.select("circuit")
+
     def _open_histogram(self) -> None:
         """
         Command-palette "Histograma" entry (`Shell._register_commands`).
@@ -4094,6 +4123,9 @@ class App(Shell):
         self.history.push(self._snapshot(label))
 
     def _undo(self) -> None:
+        if self.stage_var.get() == "circuit" and self.circuit_editor is not None:
+            self.circuit_editor.undo()
+            return
         restored = self.history.undo(self._snapshot(t("Deshacer")))
         if restored is None:
             self.status_label.configure(text=t("Nada para deshacer."))
@@ -4101,6 +4133,9 @@ class App(Shell):
         self._apply_history(restored, t("Deshecho"))
 
     def _redo(self) -> None:
+        if self.stage_var.get() == "circuit" and self.circuit_editor is not None:
+            self.circuit_editor.redo()
+            return
         restored = self.history.redo(self._snapshot(t("Rehacer")))
         if restored is None:
             self.status_label.configure(text=t("Nada para rehacer."))
@@ -4185,6 +4220,12 @@ class App(Shell):
         """
         self.board_editor = BoardEditor(
             self, self.navigators["board"], self._board_plot_frame)
+
+    def _build_circuit_panel(self) -> None:
+        """Build the integrated schematic editor without touching its state."""
+        self.circuit_editor = CircuitEditor(
+            self, self.navigators["circuit"], self._circuit_plot_frame,
+            self.circuit_state)
 
     def _export_figure_as(self, fmt: str) -> None:
         self.fig_format_var.set(fmt)

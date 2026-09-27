@@ -21,6 +21,7 @@ selected), with a **rail** that narrows both to one stage of the workflow.
     adjust     the trace list           the selected trace, or the plot
     annotate   cursors + annotations    the plot (figure-level settings)
     board      row/panel editor         the plot (figure-level settings)
+    circuit    schematic tools          the selected component
     export     figure / board queue     the plot (figure-level settings)
 
     Only "adjust" ever has an object worth showing in "Selección" (a
@@ -69,6 +70,10 @@ from .widgets import (
 # means a histogram is just whatever `self.fig` currently shows, so
 # `App._add_current_to_board` (add the current plot to the board) and every
 # export action already work on it with no special case.
+#
+# "circuit" is an independent document workflow embedded in the same shell.
+# It owns its canvas and navigator but keeps the same rail, theme and command
+# palette, avoiding a detached utility window.
 def STAGES() -> list[tuple[str, str]]:
     """
     (key, label) pairs, translated fresh on every call.
@@ -86,6 +91,7 @@ def STAGES() -> list[tuple[str, str]]:
         ("adjust", t("Ajuste")),
         ("annotate", t("Anotar")),
         ("board", t("Tablero")),
+        ("circuit", t("Circuitos")),
         ("export", t("Exportar")),
     ]
 
@@ -95,10 +101,11 @@ INSPECTOR_WIDTH = 308
 
 # Stages whose navigator content doesn't fit the default column width without
 # clipping (forms with several fields side by side, not a simple list) --
-# "annotate" (cursor/annotation editor) and "board" (used to be a floating
-# ~1040px-wide window). `App._set_stage` widens the navigator to this on
-# first entering one of them, unless the user already dragged it.
-WIDE_STAGES = frozenset({"annotate", "board"})
+# "annotate" (cursor/annotation editor), "board" (used to be a floating
+# ~1040px-wide window) and "circuit" (component library plus properties).
+# `App._set_stage` widens the navigator on first entry unless the user has
+# already dragged it.
+WIDE_STAGES = frozenset({"annotate", "board", "circuit"})
 WIDE_NAVIGATOR_WIDTH = 340
 
 
@@ -405,6 +412,7 @@ class Shell(ctk.CTk):
         return {"data": t("Archivos de datos"), "adjust": t("Trazas"),
                 "annotate": t("Cursores y anotaciones"),
                 "board": t("Tablero de figuras"),
+                "circuit": t("Editor de circuitos"),
                 "export": t("Exportar")}.get(key, "")
 
     @staticmethod
@@ -414,6 +422,7 @@ class Shell(ctk.CTk):
             "adjust": t("Estilo, correcciones y unidades de cada traza."),
             "annotate": t("Cursores de medición y anotaciones de la figura."),
             "board": t("Combina varias figuras ya exportadas en una grilla para el informe."),
+            "circuit": t("Dibuja esquemas y exportalos como PDF o CircuitikZ."),
             "export": t("Formato, DPI y el bloque LaTeX que incluye la figura."),
         }.get(key, "")
 
@@ -480,6 +489,7 @@ class Shell(ctk.CTk):
             (t("Rehacer"), self._redo),
             (t("Histograma"), self._open_histogram),
             (t("Tablero"), self._open_board),
+            (t("Circuitos"), self._open_circuit),
             (t("Atajos de teclado"), self._open_shortcuts),
         ]
 
@@ -511,4 +521,5 @@ class Shell(ctk.CTk):
     def _redo(self) -> None: ...                            # -> App
     def _open_histogram(self) -> None: ...                  # -> App
     def _open_board(self) -> None: ...                      # -> App
+    def _open_circuit(self) -> None: ...                    # -> App
     def _open_shortcuts(self) -> None: ...                  # -> App

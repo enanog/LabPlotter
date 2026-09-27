@@ -2,7 +2,7 @@
 
 LabPlotter es una aplicación de escritorio (Python 3.10+, CustomTkinter + Matplotlib) que resuelve un problema puntual del flujo de trabajo en ingeniería electrónica: convertir capturas crudas de osciloscopio y barridos de LTspice en figuras y tablas de calidad de publicación para informes en LaTeX, sin pasar por Excel, sin exportar manualmente cada traza y sin depender de una instalación de TeX para previsualizar cómo va a quedar la figura final.
 
-El programa carga archivos CSV/TXT de osciloscopio (multicanal, con autodetección de separador, separador decimal y encoding) y de LTspice, incluyendo el formato complejo de barridos AC `(-40.1dB, 89.4°)`, que descompone automáticamente en magnitud, fase y módulo lineal. Sobre esos datos permite editar de forma no destructiva cada canal (offset, ganancia, inversión, recorte temporal, diezmado, unidades), superponer cursores de medición y anotaciones tipo informe, y armar hasta un "tablero" multipanel combinando varias figuras ya exportadas en una sola grilla. Todo el ajuste ocurre sobre el mismo motor de renderizado que después exporta el archivo final, así que lo que se ve en pantalla es exactamente lo que termina en el PDF.
+El programa carga archivos CSV/TXT de osciloscopio (multicanal, con autodetección de separador, separador decimal y encoding) y de LTspice, incluyendo el formato complejo de barridos AC `(-40.1dB, 89.4°)`, que descompone automáticamente en magnitud, fase y módulo lineal. Sobre esos datos permite editar de forma no destructiva cada canal (offset, ganancia, inversión, recorte temporal, diezmado, unidades), superponer cursores de medición y anotaciones tipo informe, armar un "tablero" multipanel y dibujar circuitos electrónicos. Todo el ajuste ocurre sobre el mismo motor de renderizado que después exporta el archivo final, así que lo que se ve en pantalla es exactamente lo que termina en el PDF.
 
 La exportación entrega tanto el vector gráfico (PDF/SVG/PGF a 300 DPI) como el CSV con las columnas ya nombradas para `pgfplots`, y el bloque LaTeX (`figure`/`subfigure`/`axis`) que los incluye, con paths y requerimientos de paquetes resueltos automáticamente. El resultado es que el ciclo "medir en el osciloscopio o simular en LTspice → figura en el informe" se reduce a cargar el archivo, ajustar visualmente y exportar, en vez de procesar los datos a mano en cada entrega.
 
@@ -37,6 +37,7 @@ LabPlotter/
 │   ├── layout.py              # Geometría de leyenda (posiciones externas, coordenadas libres)
 │   ├── latex.py               # Genera bloques LaTeX (figure/subfigure/axis) + saneamiento
 │   ├── board.py               # Modelo de datos del tablero multipanel (filas de paneles)
+│   ├── circuit.py             # Modelo, render y exportación PDF/CircuitikZ de circuitos
 │   ├── histogram.py           # Cálculo de histogramas sobre señales ya cargadas
 │   ├── history.py             # Undo/redo snapshot-based sobre el conjunto de señales
 │   ├── tabs.py                # Snapshot de una pestaña completa (señales + ajustes + historial)
@@ -44,12 +45,13 @@ LabPlotter/
 │   └── i18n.py                # Catálogo de strings es/en, keyed por el string en español
 └── gui/                       # Interfaz (CustomTkinter + Matplotlib embebido)
     ├── app.py                 # Ventana principal: paneles, canvas, pestañas, orquestación (App)
+    ├── shell.py               # Estructura visual: rail, navegador, canvas e inspector
     ├── theme.py                # Identidad visual monocromática "laboratory paper"
     ├── widgets.py              # Controles reutilizables (Field, Segmented, TraceRow, Splitter...)
     ├── overlays.py             # Estado y render de cursores/anotaciones (solo Matplotlib/NumPy)
     ├── overlay_panel.py        # Paleta flotante no-modal que edita ese estado
-    ├── board_window.py         # Ventana del tablero: arma filas de paneles y exporta el layout
-    └── histogram_window.py     # Ventana auxiliar de histograma sobre señales cargadas
+    ├── board_window.py         # Etapa del tablero: arma filas de paneles y exporta el layout
+    └── circuit_editor.py       # Editor embebido de circuitos, herramientas y propiedades
 ```
 
 **Principio de diseño central:** separación estricta entre `core/` (lógica pura, sin dependencia de GUI, importable desde cualquier script) y `gui/` (presentación). Módulos como `overlays.py` o `histogram.py` mantienen ese mismo criterio dentro de `gui/`: guardan estado en dataclasses planas y delegan el cálculo numérico a `core/`, de forma que se puedan probar sin levantar Tk. `board.py` nunca rasteriza ni reconvierte el vector exportado — guarda el path del PDF/SVG/PGF real (`vector_path`) separado del PNG liviano usado solo para la vista previa en pantalla (`preview_path`).
@@ -62,6 +64,7 @@ LabPlotter/
 - **Multi-pestaña:** varios gráficos independientes (señales + ajustes propios) en memoria simultáneamente, cada uno con su propio historial de undo/redo, sin perder el trabajo al alternar entre ellos.
 - **Cursores de medición y anotaciones tipo informe:** cursores arrastrables (verticales/horizontales) con lectura por curva y delta entre cursores; anotaciones con flecha líder, flechas sueltas, líneas de referencia con label rotado, texto libre y bandas sombreadas — serializables a JSON para reproducir exactamente la misma figura más adelante.
 - **Tablero multipanel:** combina varias figuras ya exportadas en filas de paneles con peso relativo configurable (uno ancho, dos o tres lado a lado, grillas asimétricas), y exporta tanto los PDFs individuales como el bloque LaTeX con `subfigure` que reproduce el mismo layout.
+- **Editor de circuitos:** coloca resistencias, capacitores, inductores, diodos, fuentes y tierra sobre una grilla; permite cablear, seleccionar, mover, rotar, editar valores y usar undo/redo. El documento se guarda en JSON y se exporta como PDF vectorial o como fuente LaTeX/CircuitikZ independiente.
 - **Histogramas:** distribución de valores (eje X o Y) de una o más señales superpuestas, con reglas de binning de NumPy (`auto`, `sturges`, `fd`, `scott`, `sqrt`) y manejo explícito de `NaN`/`inf`.
 - **Exportación de calidad de publicación:** PDF/SVG/PGF vectorial y PNG a 300 DPI configurable, con `bbox_inches="tight"`; CSV individual o combinado sobre grilla común (lineal o logarítmica) listo para `\addplot table` de `pgfplots`.
 - **Generación automática de LaTeX:** bloques `figure`/`subfigure`/`axis` con paths normalizados a forward slashes (válido también viniendo de Windows), labels saneados y detección de los paquetes (`\usepackage{...}`) que el bloque generado requiere.
@@ -79,5 +82,9 @@ LabPlotter/
 **Ajuste interactivo:** cada cambio de parámetro sobre una traza (offset, ganancia, unidad, recorte, diezmado, estilo) se aplica sobre el `Signal` en memoria; `Signal.processed()` recalcula `(t, v)` en la unidad base del dominio (s/Hz, V/dB/deg) con offset, ganancia e inversión aplicados, sin tocar nunca los datos crudos. Antes de cada cambio, `core/history.py` guarda un snapshot de los atributos editables para permitir undo/redo. `App.update_plot()` limpia la figura y regrafica cada señal procesada, reaplica cursores/anotaciones (`gui/overlays.py`) y la cosmética de ejes y leyenda (`core/layout.py`).
 
 **Exportación:** al exportar, `core.export.set_publication_style()` fija los `rcParams` de publicación (los mismos que ya rigen la vista previa) y `export_figure()`/`export_csv_*()` generan el vector gráfico y el CSV; `core.latex` produce el bloque LaTeX correspondiente, listo para pegar en el informe con el path y los `\usepackage` correctos. Una figura exportada puede además agregarse al tablero (`core.board`), que acumula paneles hasta que `gui/board_window.py` los organiza en filas y exporta el layout completo (PDFs individuales + LaTeX con `subfigure`).
+
+**Circuitos:** la etapa `Circuitos` mantiene un `CircuitDocument` separado de las señales. `gui/circuit_editor.py` traduce los gestos del usuario a componentes y cables; `core/circuit.py` valida y serializa el documento, lo dibuja con Matplotlib y produce el PDF vectorial o un archivo `.tex` standalone con CircuitikZ.
+
+**Empaquetado para Windows:** `build_windows.bat` crea un entorno aislado de compilación, instala `requirements.txt` y `requirements-build.txt`, y genera `dist\LabPlotter.exe` con PyInstaller. Si detecta Inno Setup 6 también compila `packaging\windows_installer.iss` para producir `dist\LabPlotter-Setup.exe`; de lo contrario conserva el ejecutable portable listo para distribuir.
 
 **Cierre:** `App` persiste el estado completo (señales, pestañas, ajustes, geometría) en `session.json` dentro del directorio de configuración del usuario; un fallo de lectura/escritura de ese archivo nunca impide que la aplicación arranque o se cierre.

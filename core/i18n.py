@@ -289,6 +289,8 @@ _EN: dict[str, str] = {
     "Sin cursores en el gráfico.": "No cursors on the plot.",
     "Clic sobre el gráfico para colocarlo; arrastralos para medir.":
         "Click the plot to place it; drag them to measure.",
+    "Clic sobre el gráfico para colocar un cursor; arrastralo para medir.":
+        "Click the plot to place a cursor; drag it to measure.",
     "Cursor armado: hacé clic sobre el gráfico para colocarlo.":
         "Cursor armed: click the plot to place it.",
     "Tipo": "Type",
@@ -692,6 +694,64 @@ _EN: dict[str, str] = {
         "Add this figure as one more panel -- editing rows and exporting "
         "the board live in the “Board” stage.",
     "Etiquetas": "Labels",
+
+    # --- Editor de circuitos -----------------------------------------------
+    "Circuitos": "Circuits",
+    "Editor de circuitos": "Circuit editor",
+    "Dibuja esquemas y exportalos como PDF o CircuitikZ.":
+        "Draw schematics and export them as PDF or CircuitikZ.",
+    "Documento": "Document",
+    "Herramientas": "Tools",
+    "Componentes": "Components",
+    "Nada seleccionado": "Nothing selected",
+    "Cable seleccionado": "Wire selected",
+    "Referencia": "Reference",
+    "Valor": "Value",
+    "Nuevo": "New",
+    "Abrir...": "Open...",
+    "Guardar": "Save",
+    "Seleccionar / mover": "Select / move",
+    "Cable": "Wire",
+    "Resistencia": "Resistor",
+    "Capacitor": "Capacitor",
+    "Inductor": "Inductor",
+    "Diodo": "Diode",
+    "Fuente de tensión": "Voltage source",
+    "Fuente de corriente": "Current source",
+    "Tierra": "Ground",
+    "Aplicar propiedades": "Apply properties",
+    "Girar 90°": "Rotate 90°",
+    "Exportar circuito": "Export circuit",
+    "Exportar PDF...": "Export PDF...",
+    "Exportar LaTeX...": "Export LaTeX...",
+    "PDF es vectorial y no requiere LaTeX. El archivo .tex usa CircuitikZ y "
+    "queda completamente editable.":
+        "PDF is vector-based and does not require LaTeX. The .tex file uses "
+        "CircuitikZ and remains fully editable.",
+    "Circuito": "Circuit",
+    "Cambios sin guardar": "Unsaved changes",
+    "Hay cambios sin guardar. ¿Querés descartarlos?":
+        "There are unsaved changes. Do you want to discard them?",
+    "Abrir circuito": "Open circuit",
+    "Guardar circuito": "Save circuit",
+    "Circuito LabPlotter": "LabPlotter circuit",
+    "No se pudo abrir": "Could not open",
+    "No se pudo guardar": "Could not save",
+    "Circuito guardado.": "Circuit saved.",
+    "Exportar circuito a PDF": "Export circuit to PDF",
+    "Exportar circuito a LaTeX": "Export circuit to LaTeX",
+    "PDF vectorial": "Vector PDF",
+    "LaTeX / CircuitikZ": "LaTeX / CircuitikZ",
+    "No se pudo exportar": "Could not export",
+    "PDF guardado en:": "PDF saved to:",
+    "CircuitikZ exportado": "CircuitikZ exported",
+    "Requiere": "Requires",
+    "Cable: elegí el segundo extremo · Esc cancela":
+        "Wire: choose the second endpoint · Esc cancels",
+    "Cable: elegí el primer extremo": "Wire: choose the first endpoint",
+    "Colocar": "Place",
+    "Clic para seleccionar · arrastrá para mover":
+        "Click to select · drag to move",
 }
 
 

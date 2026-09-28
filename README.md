@@ -3,7 +3,8 @@
 Aplicación de escritorio para convertir capturas de osciloscopio y simulaciones de LTspice en
 figuras y tablas listas para un informe en LaTeX. Carga los datos crudos, permite ajustarlos y
 anotarlos de forma interactiva, y exporta tanto el CSV que consume `pgfplots` como la figura
-vectorial que se incrusta directamente en el documento.
+vectorial que se incrusta directamente en el documento. Incluye además un editor visual de
+circuitos con exportación a PDF y CircuitikZ.
 
 **Stack:** Python 3.10+ · CustomTkinter · Matplotlib · Pandas · NumPy
 
@@ -16,6 +17,7 @@ vectorial que se incrusta directamente en el documento.
 | CSV/TXT de osciloscopio (multicanal, coma decimal, `cp1252` con `°`) | CSV de dos columnas por señal, listo para `\addplot table` |
 | Barridos AC de LTspice, incluido el formato `(-40.1dB, 89.4°)` | CSV combinado sobre grilla común (lineal o logarítmica) |
 | Cualquier tabla numérica con separador auto-detectado | PDF / SVG / PGF vectorial y PNG a DPI configurable |
+| Circuitos dibujados sobre una grilla | Proyecto JSON editable, PDF vectorial y LaTeX CircuitikZ |
 
 Toda la tipografía y el renderizado matemático usan el motor **mathtext** interno de Matplotlib
 (`text.usetex = False`). No hace falta una distribución TeX instalada, la exportación a PDF es
@@ -36,17 +38,20 @@ core/
   layout.py             # geometría de leyenda (posiciones externas y coordenadas libres)
   latex.py              # genera el bloque \figure / \subfigure listo para pegar en el informe
   board.py              # modelo de datos del tablero multi-panel (filas de paneles con peso)
+  circuit.py            # modelo, render y exportación PDF/CircuitikZ de circuitos
   history.py            # undo/redo snapshot-based sobre el conjunto de señales
   tabs.py               # snapshot de una pestaña completa (señales + ajustes + historial)
   session.py            # persistencia de sesión y perfiles de exportación (fuera del repo)
   i18n.py               # catálogo de strings es/en, keyed por el string en español
 gui/
   app.py                # ventana principal: paneles, canvas, pestañas y orquestación
+  shell.py              # estructura visual: rail, navegador, canvas e inspector
   theme.py              # identidad visual monocromática (CustomTkinter + chrome Matplotlib)
   widgets.py            # controles reutilizables (campos, secciones colapsables, chips, etc.)
   overlays.py           # estado y render de cursores y anotaciones (solo Matplotlib/NumPy)
   overlay_panel.py      # paleta flotante que edita ese estado
   board_window.py       # ventana del tablero: arma filas de paneles y exporta el layout
+  circuit_editor.py     # etapa integrada para dibujar y exportar esquemas
 ```
 
 ### 2.1 `core/` — alcance y funciones de cada módulo
@@ -257,6 +262,10 @@ layout y exporta los archivos individuales más el bloque LaTeX (ver sección 17
 - `_parse_weight(text, fallback=1.0)` — texto de peso de panel → float, con valor por defecto si
   no es un número válido.
 
+**`circuit_editor.py`** — etapa completa del rail para crear esquemas: biblioteca de componentes,
+grilla, cableado, selección, propiedades, historial propio y exportación. El documento vive en
+`core.circuit.CircuitDocument`, de modo que sobrevive a cambios de idioma y no depende de Tk.
+
 Separación de responsabilidades:
 
 - **`core/`** no importa nada de la GUI ni de CustomTkinter. Es scriptable y testeable de forma
@@ -270,6 +279,8 @@ Separación de responsabilidades:
   pide a la aplicación que vuelva a renderizar la capa mediante un callback.
 - **`gui/board_window.py`** edita `app.board_rows` (`list[core.board.BoardRow]`) in place: no hay
   una copia separada que sincronizar entre la ventana principal y la del tablero.
+- **`gui/circuit_editor.py`** sólo edita el estado visual; serialización, render y exportadores
+  permanecen en `core/circuit.py` y pueden probarse sin abrir la aplicación.
 
 ---
 
@@ -281,6 +292,8 @@ python -m venv .venv
 pip install -r requirements.txt
 python main.py
 ```
+
+En Windows también se puede ejecutar `build_windows.bat`; ver la sección 20.
 
 `requirements.txt`:
 
@@ -710,3 +723,29 @@ indefinida (`0/0`, `sqrt` de un negativo) queda como `NaN` y se dibuja como huec
 from core.math_channels import evaluate
 x, y = evaluate("A - B", {"A": (t1, v1), "B": (t2, v2)})   # arrays en unidad base
 ```
+
+---
+
+## 20. Editor de circuitos
+
+La etapa **Circuitos** del rail abre un lienzo independiente del gráfico de señales. Incluye
+resistencias, capacitores, inductores, diodos, fuentes de tensión y corriente, tierra y cables.
+
+- Los componentes se colocan y mueven sobre una grilla; pueden girarse, renombrarse y recibir un
+  valor. Los cables unidos a sus terminales acompañan el movimiento y la rotación.
+- El historial de deshacer/rehacer es propio del circuito y no altera el historial de las trazas.
+- **Guardar** conserva el proyecto editable como `*.labcircuit.json`.
+- **Exportar PDF** genera directamente un archivo vectorial sin requerir una instalación LaTeX.
+- **Exportar LaTeX** genera un documento `.tex` autónomo y editable basado en `circuitikz`.
+
+## 21. Ejecutable e instalador para Windows
+
+Al hacer doble clic en `build_windows.bat` se crea un entorno aislado `.build-venv` y se genera
+`dist\LabPlotter.exe`, un ejecutable portable de un solo archivo. Si el equipo tiene instalado
+**Inno Setup 6**, el mismo proceso también genera `dist\LabPlotter-Setup.exe`, con accesos directos
+y desinstalador.
+
+- `LabPlotter.spec` contiene la configuración reproducible de PyInstaller.
+- `requirements-build.txt` separa las herramientas de empaquetado de las dependencias de uso.
+- `packaging/windows_installer.iss` define el instalador por usuario, sin requerir privilegios de
+  administrador.

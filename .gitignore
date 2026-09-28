@@ -1,20 +1,23 @@
-# Virtual Environment
-*venv/
+# Python environments
+.venv/
+.build-venv/
 venv/
 env/
 ENV/
+__pypackages__/
 
-# Python bytecode and cache
+# Python bytecode / native extensions
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
+*.pyd
 .Python
 
-# Distribution / packaging
+# Build, distribution and installers
 build/
-develop-eggs/
 dist/
+develop-eggs/
 downloads/
 eggs/
 .eggs/
@@ -23,29 +26,52 @@ lib64/
 parts/
 sdist/
 var/
+share/python-wheels/
 wheels/
+pip-wheel-metadata/
 *.egg-info/
 .installed.cfg
 *.egg
+MANIFEST
+
+# Tests, coverage, type checking and linters
+.pytest_cache/
+.hypothesis/
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+.pytype/
+.pyright/
+.ruff_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.ipynb_checkpoints/
+
+# Generated local output and temporary QA files
+tmp/
+output/
+*.log
 
 # IDE and editor
 .vscode/
 .idea/
+*.code-workspace
 *.swp
 *.swo
 *~
-.DS_Store
-Thumbs.db
 
-# Testing
-.pytest_cache/
-.coverage
-htmlcov/
-
-# Environment variables
+# Local configuration / secrets
 .env
-.env.local
+.env.*
+!.env.example
 
-# OS
+# Operating-system metadata
 .DS_Store
 Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/

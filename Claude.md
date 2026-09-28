@@ -54,6 +54,15 @@
   - Bug preexistente encontrado en el smoke test (no reportado por el usuario): Histograma con "bins compartidos" + regla automática congelaba la app si se mezclaban trazas de escalas muy distintas (~1e8 bins). Fix acotado en `core/histogram.py` (`MAX_AUTO_BINS = 512`).
   - Verificado: `tests/test_math_channels.py` 29/29 + `tests/test_overlays.py` 123/123 (Python 3.12, Xvfb, symlink `~/mnt/LabPlotter -> /tmp/lp`); auditoría AST i18n 0 faltantes (593 entradas `_EN`); smoke test con la `App` real en es/en: crear desde el diálogo real, recálculo al cambiar ganancia de un operando, canal encadenado (`integ`), los 5 modos de gráfico, round-trip `_gather_plot_state`→JSON→`_apply_plot_state`, quitar operando → `⚠` + undo, editar + undo, expresión inválida retenida en el diálogo; 0 excepciones Tk. Capturas del diálogo e inspector revisadas.
 
+- **Fase 17 (2026-09-28)**: merge de `4ec7001` (Fases 14-16, canales matemáticos) con `origin/main` `b8ef120` (editor de circuitos, PyInstaller/Inno Setup). `.git/index.lock` huérfano (16/09, 0 bytes) borrado por el usuario. 5 conflictos resueltos en el working tree:
+  - `gui/app.py`: ambos imports (`MathChannelDialog` + `CircuitEditor`).
+  - `core/i18n.py`: ambos bloques (rediseño de anotaciones + math channels, y circuitos); removidos duplicados idénticos `"Valor"`/`"Guardar"` del bloque de circuitos. 641 claves, 0 `t(...)` faltantes.
+  - `gui/overlay_panel.py`: hint de cursor de HEAD (Fase 15).
+  - `README.md`: §19 Canales matemáticos, §20 Editor de circuitos, §21 Ejecutable Windows (renumerado).
+  - `DOCUMENTACION_TECNICA.md`: árbol `gui/` con `math_dialog.py`, `board_window.py` (texto remoto), `circuit_editor.py`.
+  - Verificado: `unittest` math_channels + circuit + overlays 157/157. GUI no probada tras el merge.
+  - Duplicado preexistente (en ambos lados, no tocado): clave `"Admite mathtext: $f_0 = 9{,}61\\,$kHz"` aparece 2 veces en `_EN` con traducciones distintas; gana la segunda.
+
 ## 2. Arquitectura y Archivos Activos
 
 ### Fase 16 (esta sesión)
@@ -379,7 +388,7 @@
 - **Traducción novato de combos limitada a los 6 grupos de esta fase** (`_LINESTYLE_LABELS`/`_ARROWSTYLE_LABELS`/`_FONT_WEIGHT_LABELS`/`_FONT_STYLE_LABELS`/`_HA_LABELS`/`_VA_LABELS`): otros combos del panel de anotaciones que también muestran valores técnicos (por ejemplo "Escala X/Y" en la sección de Ejes, `gui/app.py`, fuera del alcance de esta fase) no se tocaron -- el pedido del usuario fue específicamente sobre "esta etapa" (el panel de Cursores/Anotaciones), no sobre el resto de la app.
 - Sigue pendiente, sin tocar esta sesión: todo lo ya documentado en fases previas sin resolver -- el misterio de `axis_fontsize` en el eje opuesto (Fases 12/13, sigue siendo el ítem abierto más antiguo de este documento), `OverlayWindow`/`gui/histogram_window.py` inertes, el split de herramientas por-stage, el overflow de la barra de pestañas, el fragmento recortado del tool strip a 1480px, y la persistencia faltante de "Factor X/Y1/Y2" (Fase 11).
 - **Fase 16 -- canales matemáticos, pendientes/limitaciones**:
-  - Sin commit: todo quedó en el working tree de `D:\Documentos\ITBA\LabPlotter` (que además ya tenía cambios sin commitear de fases previas y está 1 commit detrás de `origin/main`). Revisar `git diff` y commitear.
+  - Commiteado en `4ec7001` y mergeado con `origin/main` (`b8ef120`, editor de circuitos + empaquetado Windows) -- ver Fase 17.
   - No probado en Windows real (DPI/fuentes); sólo Xvfb + DejaVu. El diálogo midió ~616×634 px con fuentes fallback.
   - Eje Y: un canal con magnitud distinta (p.ej. `V²/m`) en el mismo eje que trazas en V hereda la etiqueta de eje dominante ("V [V]") -- comportamiento preexistente de ejes mixtos; recomendado Y2 (documentado en README §19). Posible mejora: sugerir `secondary_y=True` automáticamente cuando la magnitud difiere.
   - La coma decimal no se acepta en expresiones (conflicto con separador de argumentos); documentado.

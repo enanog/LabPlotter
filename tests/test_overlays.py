@@ -718,8 +718,9 @@ class TestSliderMath(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         import ast, textwrap
-        path = os.path.expanduser("~/mnt/LabPlotter/gui/overlay_panel.py")
-        tree = ast.parse(open(path, encoding="utf-8").read())
+        from pathlib import Path
+        path = Path(__file__).resolve().parents[1] / "gui" / "overlay_panel.py"
+        tree = ast.parse(path.read_text(encoding="utf-8"))
         panel = next(n for n in tree.body
                      if isinstance(n, ast.ClassDef) and n.name == "OverlayPanel")
         wanted = {"_slider_to_data", "_data_to_slider"}
@@ -727,7 +728,7 @@ class TestSliderMath(unittest.TestCase):
                  if isinstance(n, ast.FunctionDef) and n.name in wanted]
         assert len(funcs) == 2, "slider helpers not found"
         ns = {"math": math}
-        exec(compile(ast.Module(body=funcs, type_ignores=[]), path, "exec"), ns)
+        exec(compile(ast.Module(body=funcs, type_ignores=[]), str(path), "exec"), ns)
         # staticmethod: stored bare, attribute access would bind the TestCase
         # itself as the `self` of the extracted function.
         cls.to_data = staticmethod(ns["_slider_to_data"])

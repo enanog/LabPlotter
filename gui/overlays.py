@@ -8,8 +8,8 @@ Interactive overlay layer for the Matplotlib canvas:
                         delta computation between cursors.
 * `AnnotationManager`-- report-grade annotations: points of interest with a
                         leader arrow, standalone arrows, dashed reference
-                        lines with a rotated inline label, free text and
-                        shaded bands.
+                        lines with a rotated inline label, dimension lines
+                        ("cotas"), free text and shaded bands.
 
 Both managers hold *state* (plain dataclasses), never widgets, and re-create
 their artists on demand. This is what makes them survive the full
@@ -18,7 +18,10 @@ what allows an overlay set to be serialised to JSON and reloaded later so a
 report figure is exactly reproducible.
 
 The module depends on Matplotlib and NumPy only: no CustomTkinter import, so
-it can be driven from a GUI panel, a script or a batch export.
+it can be driven from a GUI panel, a script or a batch export. It also has NO
+notion of axis UNITS (V, Hz, dB...) -- units are an application/GUI concern
+(`App`/`OverlayPanel` know which unit belongs to which axis); this module
+only ever works in the plot's raw data coordinates.
 """
 
 from __future__ import annotations
@@ -28,6 +31,8 @@ import math
 from dataclasses import asdict, dataclass, fields
 from typing import Callable, Optional, Sequence
 
+import matplotlib as mpl
+import matplotlib.ticker as mticker
 import numpy as np
 
 # Every artist created by this module carries a gid prefixed with OVERLAY_GID,
@@ -45,6 +50,9 @@ ANNOTATION_COLOR = "#2A2724"
 
 ARROW_STYLES: list[str] = ["->", "<-", "<->", "-|>", "<|-|>", "-"]
 LINESTYLES: list[str] = ["--", "-", "-.", ":"]
+# How a "dimension" (cota) annotation's two captured points are projected
+# before drawing -- see `AnnotationManager._render_dimension`.
+DIM_ORIENTATIONS: list[str] = ["auto", "horizontal", "vertical"]
 # Generic Matplotlib families only: they resolve through the font manager on
 # any machine, unlike a concrete face that may not be installed. The renderer
 # runs on mathtext (text.usetex = False), so this family applies to the plain
@@ -58,6 +66,7 @@ VA_CHOICES: list[str] = ["top", "center", "bottom", "baseline"]
 ANNOTATION_KINDS: dict[str, str] = {
     "Punto de interés": "point",
     "Flecha": "arrow",
+    "Cota": "dimension",
     "Línea diagonal": "line",
     "Línea vertical": "vline",
     "Línea horizontal": "hline",
@@ -80,8 +89,18 @@ _MATH_PREFIX = {"u": r"$\mu$"}
 # Helpers
 # ========================================================================== #
 def format_eng(value: Optional[float], unit: str = "", digits: int = 4,
-               mathtext: bool = False) -> str:
-    """Format a number in engineering notation (1.23k, 470u, -3.01)."""
+               mathtext: bool = False, decimals: Optional[int] = None) -> str:
+    """
+    Format a number in engineering notation (1.23k, 470u, -3.01).
+
+    `decimals`, when given, replaces the `digits`-significant-figures
+    rounding with a FIXED number of decimal places on the mantissa (e.g.
+    `decimals=2` always gives two, "15.23"/"3.00", never the
+    magnitude-dependent 1-to-4 decimals that `%.{digits}g` produces). This
+    is what a value meant to be read off an axis or a cursor tag wants --
+    a steady format -- as opposed to the compact, variable-precision
+    notation used for numbers typed/echoed elsewhere in the app.
+    """
     if value is None:
         return "n/a"
     try:
@@ -92,7 +111,8 @@ def format_eng(value: Optional[float], unit: str = "", digits: int = 4,
         return "n/a"
     suffix = f" {unit}" if unit else ""
     if v == 0.0:
-        return f"0{suffix}"
+        mantissa_text = f"{0.0:.{decimals}f}" if decimals is not None else "0"
+        return f"{mantissa_text}{suffix}" if decimals is not None else f"0{suffix}"
 
     magnitude = abs(v)
     factor, prefix = 1e-12, "p"
@@ -101,7 +121,8 @@ def format_eng(value: Optional[float], unit: str = "", digits: int = 4,
             factor, prefix = f, p
             break
 
-    text = f"{v / factor:.{digits}g}"
+    mantissa = v / factor
+    text = f"{mantissa:.{decimals}f}" if decimals is not None else f"{mantissa:.{digits}g}"
     if prefix and mathtext and prefix in _MATH_PREFIX:
         return f"{text} {_MATH_PREFIX[prefix]}{unit}".rstrip()
     return f"{text} {prefix}{unit}".rstrip() if (prefix or unit) else text
@@ -235,6 +256,91 @@ def _screen_angle(ax, x1: float, y1: float, x2: float, y2: float) -> float:
     return angle
 
 
+def _perp_ticks(ax, x1: float, y1: float, x2: float, y2: float,
+                tick_pt: float = 6.0):
+    """
+    Endpoints of the two short end-ticks of a dimension line, one at each
+    end of the segment (x1, y1)-(x2, y2), perpendicular to it -- the
+    end-cap convention of a technical/engineering "cota".
+
+    Computed in PIXEL space (`ax.transData`, same technique `_screen_angle`
+    already uses) rather than from the raw data slope: X and Y rarely share
+    a scale in this app (log frequency axis, a voltage Y next to a time X),
+    so a perpendicular computed from data coordinates would not look
+    perpendicular on screen. `tick_pt` is a length in points, converted with
+    the actual figure DPI (not the `rcParams` default, which may differ
+    from the figure this axes belongs to).
+
+    Returns ((a1x, a1y), (a2x, a2y), (b1x, b1y), (b2x, b2y)): the tick at
+    point 1 (a1-a2), then the tick at point 2 (b1-b2), back in DATA
+    coordinates.
+    """
+    transform = ax.transData
+    inverse = transform.inverted()
+    px1, py1 = transform.transform((x1, y1))
+    px2, py2 = transform.transform((x2, y2))
+    dx, dy = px2 - px1, py2 - py1
+    length = math.hypot(dx, dy) or 1.0
+    # Perpendicular unit vector in pixel space, scaled to a half-tick length.
+    ux, uy = -dy / length, dx / length
+    dpi = getattr(ax.figure, "dpi", 100.0) or 100.0
+    half = tick_pt * (dpi / 72.0) / 2.0
+
+    def _tick(px: float, py: float):
+        a = inverse.transform((px - ux * half, py - uy * half))
+        b = inverse.transform((px + ux * half, py + uy * half))
+        return (float(a[0]), float(a[1])), (float(b[0]), float(b[1]))
+
+    a1, a2 = _tick(px1, py1)
+    b1, b2 = _tick(px2, py2)
+    return a1, a2, b1, b2
+
+
+class _MarkedFormatter(mticker.Formatter):
+    """
+    Tick formatter that swaps in custom text at specific data positions and
+    delegates everything else to a captured base formatter.
+
+    A tick label's text is recomputed from the axis formatter on every draw
+    -- calling `.set_text()` directly on the `Text` object does not survive
+    so much as the next `get_xticks()` call -- so an axis mark has to work
+    at the formatter level, not by poking the rendered label. `set_locs`/
+    `set_axis`/`get_offset`/`fix_minus` are proxied to the base formatter
+    because several stock formatters (`ScalarFormatter`, and this app's own
+    engineering-notation `FuncFormatter`) depend on Matplotlib calling them
+    before/around `__call__`; without the proxy every non-marked tick
+    silently renders blank.
+    """
+
+    def __init__(self, base: mticker.Formatter, marks: dict[float, str]):
+        self.base = base
+        self.marks = marks
+
+    def __call__(self, x, pos=None):
+        for value, text in self.marks.items():
+            if math.isclose(x, value, rel_tol=1e-9, abs_tol=1e-12):
+                return text
+        return self.base(x, pos)
+
+    def format_ticks(self, values):
+        self.set_locs(values)
+        return [self(v, i) for i, v in enumerate(values)]
+
+    def set_locs(self, locs):
+        super().set_locs(locs)
+        self.base.set_locs(locs)
+
+    def set_axis(self, axis):
+        super().set_axis(axis)
+        self.base.set_axis(axis)
+
+    def get_offset(self):
+        return self.base.get_offset() if hasattr(self.base, "get_offset") else ""
+
+    def fix_minus(self, s):
+        return self.base.fix_minus(s) if hasattr(self.base, "fix_minus") else s
+
+
 # ========================================================================== #
 # Cursors
 # ========================================================================== #
@@ -269,8 +375,27 @@ class CursorManager:
         self.snap_to_data = True
         self.show_tags = True
         self.tag_with_value = True
-        self.x_unit = ""
-        self.y_unit = ""
+        # Decimal places used to format the value in the on-canvas tag and
+        # in the text handed to "Anotar valor" (`OverlayPanel._promote_cursor`)
+        # -- both read the exact same number, see that method's docstring.
+        # A FIXED decimal count (via `format_eng(..., decimals=...)`) rather
+        # than the app-wide `digits`-significant-figures default: a report
+        # value the user is about to burn into a permanent axis mark wants a
+        # steady, user-chosen precision, not one that silently drifts with
+        # magnitude (that drift -- e.g. "1.523" next to "15.23" -- is exactly
+        # what was reported as "me lo pasa con 3 decimales").
+        self.value_decimals = 2
+        # One (x_unit, y_unit) pair per axes index, in the SAME order as
+        # `self.axes` -- not a single global unit. A cursor sitting on a
+        # secondary Y axis (Bode "Juntos" phase, or any `secondary_y` trace)
+        # lives in a different unit than the primary axis (deg vs dB, A vs
+        # V); a flat pair used to format every cursor's tag with whatever
+        # unit the PRIMARY axis happened to have, silently wrong for a
+        # cursor placed on the secondary one. `App` populates this once per
+        # redraw, in lock-step with how it builds `self.axes` (see
+        # `App._axes_context`); a missing/out-of-range entry falls back to
+        # "" via `axis_unit()`, never an `IndexError`.
+        self.axis_units: list[tuple[str, str]] = []
 
         self._artists: dict[int, list] = {}
         self._next_id = 1
@@ -360,6 +485,19 @@ class CursorManager:
         except ValueError:
             return f"C{spec.cid}"
 
+    def axis_unit(self, axes_index: int, orientation: str) -> str:
+        """
+        The unit for `axes_index` along `orientation` ("v" -> X, "h" -> Y),
+        or "" if `axis_units` hasn't been populated (or is shorter than
+        `axes_index`) -- e.g. before the first redraw, or a plot mode this
+        manager has never seen. Never raises: an unknown unit degrades to
+        an unlabelled number, not an exception in the middle of a redraw.
+        """
+        if 0 <= axes_index < len(self.axis_units):
+            x_unit, y_unit = self.axis_units[axes_index]
+            return x_unit if orientation == "v" else y_unit
+        return ""
+
     def arm(self, orientation: str) -> None:
         """Next click on the canvas places a cursor of this orientation."""
         self._armed = orientation
@@ -404,8 +542,8 @@ class CursorManager:
         if self.show_tags:
             name = self.name_of(spec)
             if self.tag_with_value:
-                unit = self.x_unit if spec.orientation == "v" else self.y_unit
-                name = f"{name}: {format_eng(spec.position, unit, 4, mathtext=True)}"
+                unit = self.axis_unit(spec.axes_index, spec.orientation)
+                name = f"{name}: {format_eng(spec.position, unit, mathtext=True, decimals=self.value_decimals)}"
             box = dict(boxstyle="square,pad=0.24", fc="white", ec="#4A473F",
                        lw=0.6, alpha=0.92)
             if spec.orientation == "v":
@@ -440,8 +578,8 @@ class CursorManager:
             tag = artists[1]
             name = self.name_of(spec)
             if self.tag_with_value:
-                unit = self.x_unit if spec.orientation == "v" else self.y_unit
-                name = f"{name}: {format_eng(spec.position, unit, 4, mathtext=True)}"
+                unit = self.axis_unit(spec.axes_index, spec.orientation)
+                name = f"{name}: {format_eng(spec.position, unit, mathtext=True, decimals=self.value_decimals)}"
             tag.set_text(name)
             if spec.orientation == "v":
                 tag.set_position((spec.position, 0.985))
@@ -612,6 +750,12 @@ class CursorManager:
         Horizontal cursor-> X of every crossing of the cursor level (this is
                             what gives the -3 dB frequency straight off a Bode
                             magnitude trace).
+
+        Each row carries its own `axes_index` so a caller formatting the
+        table (e.g. `OverlayPanel._render_readout`) can look up the right
+        per-axis unit via `axis_unit()` instead of assuming every cursor
+        lives on the same axis -- two cursors placed on Y1 and Y2 at once
+        are a perfectly normal thing to have on screen together.
         """
         rows: list[dict] = []
         for spec in self.cursors:
@@ -619,7 +763,7 @@ class CursorManager:
                 continue
             entry = {"cid": spec.cid, "name": self.name_of(spec),
                      "orientation": spec.orientation, "position": spec.position,
-                     "values": []}
+                     "axes_index": spec.axes_index, "values": []}
             for line in self.data_lines(spec.axes_index):
                 data = _sorted_xy(line)
                 if data is None:
@@ -637,7 +781,14 @@ class CursorManager:
         return rows
 
     def deltas(self) -> list[dict]:
-        """Differences between consecutive cursors of the same orientation."""
+        """
+        Differences between consecutive cursors of the same orientation.
+
+        Only ever pairs cursors that already share `axes_index` (see the
+        `continue` below), so the pair's own unit is unambiguous -- carried
+        in the returned dict for the same reason `readout()` now carries one
+        per row.
+        """
         out: list[dict] = []
         for orientation in ("v", "h"):
             group = [c for c in self.cursors if c.orientation == orientation]
@@ -647,6 +798,7 @@ class CursorManager:
                 delta = b.position - a.position
                 item = {"from": self.name_of(a), "to": self.name_of(b),
                         "orientation": orientation, "delta": delta,
+                        "axes_index": a.axes_index,
                         "inverse": (1.0 / delta) if delta else None,
                         "curves": []}
                 if orientation == "v":
@@ -668,6 +820,7 @@ class CursorManager:
     def to_dict(self) -> dict:
         return {"snap_to_data": self.snap_to_data, "show_tags": self.show_tags,
                 "tag_with_value": self.tag_with_value,
+                "value_decimals": self.value_decimals,
                 "cursors": [asdict(c) for c in self.cursors]}
 
     def from_dict(self, payload: dict) -> None:
@@ -675,6 +828,7 @@ class CursorManager:
         self.snap_to_data = bool(payload.get("snap_to_data", self.snap_to_data))
         self.show_tags = bool(payload.get("show_tags", self.show_tags))
         self.tag_with_value = bool(payload.get("tag_with_value", self.tag_with_value))
+        self.value_decimals = int(payload.get("value_decimals", self.value_decimals))
         for item in payload.get("cursors", []):
             try:
                 spec = _from_dict(CursorSpec, item)
@@ -693,9 +847,17 @@ class AnnotationSpec:
     """
     One annotation item. A single flat record keeps JSON round-tripping
     trivial; unused fields are simply ignored by the renderer of each kind.
+
+    Which fields a given `kind` actually reads is decided by each
+    `_render_<kind>` method below -- that is the one real source of truth.
+    `gui.overlay_panel.ANNOTATION_SCHEMA` mirrors it for the FORM (which
+    rows to show for the selected kind); keeping the schema in the GUI
+    layer, not here, is deliberate: this module has no business knowing
+    how a field is edited, only how it is drawn.
     """
     aid: int
-    kind: str = "point"           # point | arrow | line | vline | hline | text | vspan | hspan
+    kind: str = "point"           # point | arrow | dimension | line | vline |
+                                   # hline | text | vspan | hspan
     x: float = 0.0
     y: float = 0.0
     x2: float = 0.0
@@ -712,13 +874,39 @@ class AnnotationSpec:
     boxed: bool = True
     arrow: str = "->"
     label_pos: float = 0.5        # axes fraction along a reference line, or
-                                   # fraction along the segment for "line"
+                                   # fraction along the segment for "line"/
+                                   # "dimension"
     label_parallel: bool = False  # rotate the label to match the on-screen
                                    # angle of the line instead of `rotation`
     label_free: bool = False      # place the label at (label_x, label_y)
                                    # instead of the automatic position
     label_x: float = 0.0
     label_y: float = 0.0
+    on_axis: bool = False        # also stamp a tick mark at x (vline) / y
+                                  # (hline) on the axis itself
+    axis_text: str = ""          # text shown at that tick; "" falls back to
+                                  # `text` -- never the raw numeric value
+    axis_fontfamily: str = ""    # "" -> inherit `fontfamily`
+    axis_fontweight: str = "bold"
+    axis_fontstyle: str = "normal"
+    axis_fontsize: float = 0.0   # 0.0 -> inherit the axis' own tick size
+                                  # (rcParams `{x,y}tick.labelsize`, read live
+                                  # so it follows GUI vs. export context)
+    axis_side: str = ""          # "" -> default side ("bottom" for vline,
+                                  # "left" for hline); "top"/"right" puts
+                                  # the mark on the opposite axis instead
+    dim_orientation: str = "auto"  # "auto" | "horizontal" | "vertical" --
+                                    # how a "dimension" kind's two captured
+                                    # points are projected before drawing
+                                    # (see `_render_dimension`)
+    dim_auto_text: bool = True    # "dimension" only: the GUI recomputes
+                                   # `text` as the measured distance (in the
+                                   # selected axis' unit) on every Agregar/
+                                   # Actualizar; False keeps whatever the
+                                   # user typed by hand. This module never
+                                   # reads it -- it only ever renders
+                                   # whatever `text` already holds (see the
+                                   # module docstring: no unit awareness here).
     alpha: float = 1.0
     marker: str = "o"
     markersize: float = 4.0
@@ -740,6 +928,9 @@ KIND_DEFAULTS: dict[str, dict] = {
               "dx": 26.0, "dy": 20.0, "arrow": "->"},
     "arrow": {"rotation": 0.0, "alpha": 1.0, "boxed": True,
               "dx": 0.0, "dy": 10.0, "arrow": "<->"},
+    "dimension": {"rotation": 0.0, "alpha": 1.0, "boxed": True,
+                  "label_pos": 0.5, "linestyle": "-", "linewidth": 0.9,
+                  "dim_orientation": "auto", "dim_auto_text": True},
     "line": {"rotation": 0.0, "alpha": 1.0, "boxed": True, "label_pos": 0.5,
              "linestyle": "-"},
     "vline": {"rotation": 90.0, "alpha": 1.0, "boxed": True, "label_pos": 0.45},
@@ -749,20 +940,29 @@ KIND_DEFAULTS: dict[str, dict] = {
     "hspan": {"rotation": 0.0, "alpha": 0.12, "boxed": True, "label_pos": 0.90},
 }
 
+# Display names kept short and jargon-free (novice-facing panel redesign):
+# what used to describe the preset's parameters in the label itself now just
+# names what the user is trying to do with it.
 STYLE_PRESETS: dict[str, dict] = {
-    "Referencia (línea + etiqueta rotada)": {
+    "Clásico": {
         "linestyle": "--", "linewidth": 0.9, "fontsize": 7.5,
         "boxed": True, "rotation": 90.0, "label_pos": 0.45,
     },
-    "Punto de interés (marcador + flecha)": {
+    "Destacar un punto": {
         "marker": "o", "markersize": 4.0, "fontsize": 8.0,
         "boxed": True, "arrow": "->", "dx": 26.0, "dy": 20.0,
     },
-    "Cota / ancho de banda (flecha doble)": {
+    "Medir una distancia": {
         "arrow": "<->", "linewidth": 0.9, "fontsize": 8.0, "boxed": True,
         "dy": 10.0, "dx": 0.0,
     },
 }
+
+
+# (primary, secondary) side per axis kind: vline marks x ("bottom"/"top"),
+# hline marks y ("left"/"right"). An empty `spec.axis_side` means "primary".
+_AXIS_SIDES: dict[str, tuple[str, str]] = {"x": ("bottom", "top"),
+                                            "y": ("left", "right")}
 
 
 class AnnotationManager:
@@ -879,6 +1079,10 @@ class AnnotationManager:
                 except Exception:
                     # A single malformed annotation must not abort the plot.
                     self._artists[spec.aid] = []
+        try:
+            self._apply_axis_marks()
+        except Exception:
+            pass   # a tick-styling glitch must never break the canvas
 
     def _destroy_artists(self, aid: int) -> None:
         for artist in self._artists.pop(aid, []):
@@ -886,6 +1090,216 @@ class AnnotationManager:
                 artist.remove()
             except (NotImplementedError, ValueError, AttributeError):
                 pass
+
+    # ------------------------------ axis marks ---------------------------- #
+    def _axis_marks(self, axes_index: int, axis_kind: str, side: str) -> dict:
+        """Specs that stamp a mark on one (axis_kind, side), keyed by position.
+
+        `side` is one of the two values `_AXIS_SIDES[axis_kind]` holds (e.g.
+        "bottom"/"top" for axis_kind="x"). A spec with an empty or invalid
+        `axis_side` falls back to the primary side -- the first entry of
+        that tuple -- which also keeps every annotation created before this
+        field existed exactly where it always rendered.
+        """
+        kind = "vline" if axis_kind == "x" else "hline"
+        primary, secondary = _AXIS_SIDES[axis_kind]
+        marks: dict[float, AnnotationSpec] = {}
+        for spec in self.items:
+            if (spec.kind != kind or not spec.visible or not spec.on_axis
+                    or spec.axes_index != axes_index):
+                continue
+            spec_side = spec.axis_side if spec.axis_side in (primary, secondary) else primary
+            if spec_side != side:
+                continue
+            text = spec.axis_text or spec.text
+            if not text:
+                continue
+            value = spec.x if axis_kind == "x" else spec.y
+            marks[float(value)] = spec
+        return marks
+
+    def _apply_axis_marks(self) -> None:
+        for index, ax in enumerate(self.axes):
+            for axis_kind, (primary, secondary) in _AXIS_SIDES.items():
+                self._mark_axis(ax, axis_kind,
+                                self._axis_marks(index, axis_kind, primary))
+                self._mark_opposite_axis(
+                    ax, axis_kind, secondary,
+                    self._axis_marks(index, axis_kind, secondary))
+
+    def uses_opposite_axis(self) -> bool:
+        """
+        True if any visible mark asks for the non-default side (top/right).
+
+        `App.update_plot`/`_refresh_overlays` check this to decide whether a
+        second `tight_layout()` pass is worth running after `redraw()` --
+        see the note on `_mark_opposite_axis` for why the first pass, run
+        before the secondary axis exists, cannot already have reserved
+        room for it.
+        """
+        for spec in self.items:
+            if (spec.kind in ("vline", "hline") and spec.visible and spec.on_axis
+                    and spec.axis_side in ("top", "right")):
+                return True
+        return False
+
+    _AXIS_TICK_PIXEL_MARGIN = 26   # see `_declutter_auto_ticks`
+
+    def _declutter_auto_ticks(self, ax, axis_kind: str, auto_locs,
+                              marks: dict) -> list:
+        """
+        Drop the automatic ticks that would visually collide with a mark.
+
+        A fixed DATA-space cutoff is meaningless here: it would be wrong on
+        a log axis (where equal data distance means very different pixel
+        distance depending on where you are in the decade) and wrong again
+        the moment the user zooms/pans. Distance is measured in PIXELS
+        instead, via `ax.transData` -- the same transform `_screen_angle`
+        already relies on elsewhere in this module -- so "too close" tracks
+        what actually overlaps on screen regardless of scale or view.
+
+        `_AXIS_TICK_PIXEL_MARGIN` is a rough half-label-width budget, not a
+        measured text extent: getting the exact rendered width of a tick
+        label needs a real draw pass with a live renderer, which isn't
+        guaranteed to exist yet at this point in `redraw()` (same
+        constraint already noted on `_screen_angle`). Erring conservative
+        (dropping a tick that might have just barely fit) reads as "the
+        axis made room for the mark", which is what was actually asked for;
+        erring the other way reads as a bug.
+        """
+        if not marks:
+            return list(auto_locs)
+        idx = 0 if axis_kind == "x" else 1
+        def px(value: float) -> float:
+            point = (value, 0.0) if axis_kind == "x" else (0.0, value)
+            return ax.transData.transform(point)[idx]
+        mark_px = [px(v) for v in marks]
+        return [loc for loc in auto_locs
+                if all(abs(px(loc) - mpx) >= self._AXIS_TICK_PIXEL_MARGIN
+                       for mpx in mark_px)]
+
+    def _style_marked_ticks(self, axis, marks: dict, axis_kind: str) -> None:
+        """
+        Bold/tint the tick label at each marked position; reset the rest.
+
+        Shared by the primary axis (where unmarked ticks come from the
+        app's own locator/formatter) and a secondary axis (where every
+        tick IS a mark, so the "reset" branch below simply never matches
+        there) -- one styling rule instead of two copies to keep in sync.
+        Tick `Text` objects are cached and reused across `set_major_locator`
+        calls, so a stale bold/tinted style from a removed or moved mark
+        must be explicitly cleared here, not just left un-reapplied.
+
+        Font SIZE is read live from `mpl.rcParams` (`"{x,y}tick.labelsize"`)
+        for the same reason `default_color` already is: `core/export.py`
+        overrides that rcParam for the export figure, and reading it live
+        here (instead of hardcoding a number) makes the reset branch follow
+        whichever context -- live GUI canvas or export render -- is
+        actually active for this `redraw()` call.
+        """
+        default_color = mpl.rcParams.get(f"{axis_kind}tick.color", "black")
+        default_fontsize = mpl.rcParams.get(f"{axis_kind}tick.labelsize")
+        for tick, loc in zip(axis.get_major_ticks(), axis.get_majorticklocs()):
+            label = tick.label1
+            spec = next((s for v, s in marks.items()
+                        if math.isclose(loc, v, rel_tol=1e-9, abs_tol=1e-12)), None)
+            if spec is not None:
+                label.set_fontweight(spec.axis_fontweight or "bold")
+                label.set_fontstyle(spec.axis_fontstyle or "normal")
+                label.set_fontfamily(spec.axis_fontfamily or spec.fontfamily or
+                                     mpl.rcParams["font.family"])
+                label.set_color(spec.color)
+                label.set_fontsize(spec.axis_fontsize or default_fontsize)
+            else:
+                label.set_fontweight("normal")
+                label.set_fontstyle("normal")
+                label.set_fontfamily(mpl.rcParams["font.family"])
+                label.set_color(default_color)
+                label.set_fontsize(default_fontsize)
+
+    def _mark_axis(self, ax, axis_kind: str, marks: dict) -> None:
+        """
+        Add/refresh custom-text tick marks on the PRIMARY side of `ax`
+        (bottom for x, left for y) -- the plot's normal tick scale stays as
+        it was, with the marked position(s) swapped to custom text and
+        styled, EXCEPT for any automatic tick close enough to collide with
+        a mark on screen (see `_declutter_auto_ticks`) -- dropped so the
+        mark doesn't render glued to a neighbouring tick label. See
+        `_mark_opposite_axis` for the top/right case.
+
+        The axis' own locator/formatter are snapshotted once per live `ax`
+        instance (guarded by `hasattr`): `redraw()` can run several times
+        against the same `ax` without an intervening `fig.clear()` (e.g.
+        toggling a checkbox), and re-snapshotting an already-wrapped
+        formatter would nest wrappers instead of restoring the real base.
+        A fresh `ax` -- created by `App._prepare_axes()`'s `fig.clear()` --
+        has neither attribute, so the next call re-snapshots correctly.
+        """
+        axis = ax.xaxis if axis_kind == "x" else ax.yaxis
+        locator_attr = f"_lp_base_{axis_kind}locator"
+        formatter_attr = f"_lp_base_{axis_kind}formatter"
+        if not hasattr(ax, locator_attr):
+            setattr(ax, locator_attr, axis.get_major_locator())
+        if not hasattr(ax, formatter_attr):
+            setattr(ax, formatter_attr, axis.get_major_formatter())
+        base_locator = getattr(ax, locator_attr)
+        base_formatter = getattr(ax, formatter_attr)
+
+        # Restore the axis' own auto locator first -- otherwise a previous
+        # call's FixedLocator (marked positions baked in) would compound
+        # with itself instead of being recomputed from the current view.
+        axis.set_major_locator(base_locator)
+        if marks:
+            kept_auto = self._declutter_auto_ticks(
+                ax, axis_kind, axis.get_majorticklocs(), marks)
+            combined = sorted(set(kept_auto) | set(marks))
+            axis.set_major_locator(mticker.FixedLocator(combined))
+            axis.set_major_formatter(_MarkedFormatter(
+                base_formatter,
+                {v: (s.axis_text or s.text) for v, s in marks.items()}))
+        else:
+            axis.set_major_formatter(base_formatter)
+
+        self._style_marked_ticks(axis, marks, axis_kind)
+
+    def _mark_opposite_axis(self, ax, axis_kind: str, side: str, marks: dict) -> None:
+        """
+        Mirror-side mark: top for a vline, right for an hline.
+
+        Unlike `_mark_axis`, which highlights one of the plot's normal
+        ticks in place, the whole point of choosing the opposite side is to
+        put a value where the regular ticks are NOT -- so this never
+        inherits or duplicates the primary scale. A `secondary_xaxis`/
+        `secondary_yaxis` is created lazily (only once marks actually ask
+        for this side, cached on `ax` the same way the base locator/
+        formatter are) and shows ONLY the marked position(s): no "base"
+        formatter to fall back to, because every tick on it is a mark.
+
+        If it was never created and there is nothing to show, this is a
+        no-op -- an unused secondary axis would otherwise leave a bare,
+        permanently empty spine the user never asked for. Once created, it
+        is kept (with an empty locator) rather than destroyed when its last
+        mark is removed: recreating axes mid-session is the kind of
+        geometry churn this codebase has already been burned by (see
+        Claude.md, the `<Configure>` cascade bug), and an empty secondary
+        spine is visually inert.
+        """
+        cache_attr = f"_lp_secondary_{side}"
+        secondary = getattr(ax, cache_attr, None)
+        if secondary is None:
+            if not marks:
+                return
+            make = ax.secondary_xaxis if axis_kind == "x" else ax.secondary_yaxis
+            secondary = make(side)
+            setattr(ax, cache_attr, secondary)
+
+        axis = secondary.xaxis if axis_kind == "x" else secondary.yaxis
+        axis.set_major_locator(mticker.FixedLocator(sorted(marks)))
+        axis.set_major_formatter(mticker.FuncFormatter(
+            lambda x, _pos=None, m=marks: next(
+                ((s.axis_text or s.text) for v, s in m.items()
+                 if math.isclose(x, v, rel_tol=1e-9, abs_tol=1e-12)), "")))
+        self._style_marked_ticks(axis, marks, axis_kind)
 
     def _box(self, spec: AnnotationSpec) -> Optional[dict]:
         if not spec.boxed:
@@ -975,6 +1389,57 @@ class AnnotationManager:
                 spec.text, xy=(mid_x, mid_y), xytext=(spec.dx, spec.dy),
                 textcoords="offset points", bbox=self._box(spec), zorder=8,
                 annotation_clip=False, **self._text_kwargs(spec)))
+        return out
+
+    def _render_dimension(self, ax, spec: AnnotationSpec) -> list:
+        """
+        Technical dimension line ("cota"): a segment between two points
+        capped with a short perpendicular tick at each end, the acotado
+        convention of a mechanical/electronic drawing. Distinct from
+        "arrow" (a leader with an arrowhead, no end caps, no measuring
+        intent) and from "line" (a bare segment, no caps either).
+
+        `dim_orientation` projects the two captured points before drawing:
+        "horizontal" flattens the second point to the first one's Y (the
+        cota reads a distance along X, drawn at a fixed height); "vertical"
+        flattens to the first point's X; "auto" draws the segment exactly
+        as captured, an arbitrary line.
+
+        The measured distance itself is never computed here -- `text`
+        already carries it (or whatever the user typed by hand): this
+        module has no notion of axis units (see the module docstring), so
+        turning a distance into "1.20 kHz" is `OverlayPanel._form_values`'s
+        job, done once, when the annotation is added/updated, exactly the
+        same "completar y confirmar" convention every other field in this
+        form already follows.
+        """
+        x1, y1, x2, y2 = spec.x, spec.y, spec.x2, spec.y2
+        if spec.dim_orientation == "horizontal":
+            y2 = y1
+        elif spec.dim_orientation == "vertical":
+            x2 = x1
+        seg, = ax.plot([x1, x2], [y1, y2], color=spec.color, ls=spec.linestyle,
+                       lw=spec.linewidth, alpha=spec.alpha, solid_capstyle="butt",
+                       zorder=5, label="_nolegend_")
+        out = [seg]
+        a1, a2, b1, b2 = _perp_ticks(ax, x1, y1, x2, y2)
+        for p1, p2 in ((a1, a2), (b1, b2)):
+            tick, = ax.plot([p1[0], p2[0]], [p1[1], p2[1]], color=spec.color,
+                            lw=spec.linewidth, alpha=spec.alpha,
+                            solid_capstyle="butt", zorder=5, label="_nolegend_")
+            out.append(tick)
+        if spec.text:
+            if spec.label_free:
+                tx, ty = spec.label_x, spec.label_y
+            else:
+                tx = x1 + spec.label_pos * (x2 - x1)
+                ty = y1 + spec.label_pos * (y2 - y1)
+            rotation = (_screen_angle(ax, x1, y1, x2, y2)
+                       if spec.label_parallel else spec.rotation)
+            out.append(ax.text(
+                tx, ty, spec.text, rotation=rotation, rotation_mode="anchor",
+                bbox=self._box(spec), zorder=8, clip_on=False,
+                **self._text_kwargs(spec)))
         return out
 
     def _render_vline(self, ax, spec: AnnotationSpec) -> list:

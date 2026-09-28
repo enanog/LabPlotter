@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import re
+import uuid
 import tkinter as tk
 from tkinter import colorchooser, filedialog, messagebox
 from typing import Optional
@@ -51,6 +52,9 @@ from core import board, latex, session, tabs
 from core.histogram import BIN_RULES, combined_range, compute_histogram
 from core.history import History, apply_snapshot
 from core.i18n import LANGUAGES, get_language, set_language, t
+from core.math_channels import (
+    MathSpec, build_math_signal, depends_on, refresh_math_signals,
+)
 from core.processing import crop, decimate, decimate_to_target
 from core.units import parse_eng
 from gui.overlays import AnnotationManager, CursorManager, format_eng
@@ -70,6 +74,7 @@ from gui.widgets import (
     DirtyDot, DirtyGroup, Field, Tooltip, info_dot,
 )
 from gui.board_window import BoardEditor
+from gui.math_dialog import MathChannelDialog
 
 # Window width at which the type scale is exactly as designed (1.0). Matches
 # the default geometry, so the app opens at native size. Clamping lives in
@@ -143,6 +148,78 @@ def _parse_float(text: str, fallback: float = 0.0) -> float:
 def _parse_optional_float(text: str) -> Optional[float]:
     """Same as `_parse_float`, but an empty field means "no limit"."""
     return parse_eng(text, None)
+
+
+def _parse_factor(text: str) -> Optional[float]:
+    """
+    A manual axis-scale divisor ("Factor X"/"Factor Y1"/"Factor Y2").
+
+    `None` (fall back to the automatic per-unit factor) for anything empty,
+    unparseable, or zero -- a zero factor would divide the axis by zero, and
+    an empty field is how the user opts back into the known-unit table
+    while leaving "Unidad ... manual" ticked (to keep a free-typed unit
+    label without forcing a numeric scale on it).
+    """
+    value = parse_eng(text, None)
+    return value if value else None
+
+
+def _parse_tick_list(text: str) -> Optional[list]:
+    """
+    Parse a manual tick-position list: tokens separated by whitespace or
+    `;` -- never `,`, which stays the decimal-comma separator every other
+    numeric field in this app already accepts (`parse_eng` handles that
+    per-token, e.g. "1,5k"). Each token goes through `parse_eng`, so
+    engineering notation works here too ("1k 2k 3k", "4u7").
+
+    Returns `None` (fall back to the automatic locator) when there is not
+    at least one valid number -- an empty field, a destildado checkbox, or
+    garbled text all collapse to the same safe "automatic" outcome instead
+    of raising or leaving the axis on stale ticks.
+    """
+    values = []
+    for token in re.split(r"[;\s]+", text.strip()):
+        if not token:
+            continue
+        value = parse_eng(token, None)
+        if value is not None:
+            values.append(value)
+    return sorted(values) if values else None
+
+
+def _parse_tick_decimals(text: str) -> Optional[int]:
+    """
+    Parse "Decimales X"/"Decimales Y": an integer 0-6, or `None` (fall back
+    to Matplotlib's own `ScalarFormatter`) for anything empty, unparseable,
+    negative, or above 6 -- deliberately permissive about what the field
+    accepts (`parse_eng` first, so "2" and "2.0" both work), strict about
+    what it hands back, since a bogus value here must never reach
+    `f"{v:.{n}f}"` and raise.
+    """
+    value = parse_eng(text, None)
+    if value is None:
+        return None
+    n = int(round(value))
+    return n if 0 <= n <= 6 else None
+
+
+def _fixed_decimals_tick_label(value: float, digits: int) -> str:
+    """
+    Format a linear-axis tick with a FIXED decimal count.
+
+    The opposite of Matplotlib's default `ScalarFormatter`, which silently
+    varies how many decimals it shows *per axis* depending on that axis'
+    own data range -- this is exactly why X and Y ticks on the same figure
+    can show a different decimal count side by side (e.g. "20.0" on X next
+    to "1.500" on Y), reported directly against a screenshot of the app.
+    `-0.0` collapses to plain "0" (zero-padded to `digits`): a tiny
+    negative rounding error on a value that is really zero should never
+    print a spurious minus sign the data itself doesn't have.
+    """
+    text = f"{value:.{digits}f}"
+    if text.startswith("-") and float(text) == 0.0:
+        text = text[1:]
+    return text
 
 
 def _configure_minor_ticks(axis, scale: str) -> None:
@@ -519,6 +596,8 @@ class App(Shell):
         # Only used to replay `read_table` + `build_signal` when restoring a
         # saved session; signals added any other way simply aren't persisted.
         self._signal_columns: dict[str, tuple[str, str]] = {}
+        # uids of math channels whose last evaluation failed (see update_plot).
+        self._math_failed: frozenset = frozenset()
         # Per-trace line weight. Held here rather than on the Signal model,
         # which this module does not own -- setting an attribute on a class
         # that may define __slots__ would fail at runtime.
@@ -675,6 +754,7 @@ class App(Shell):
         # it here too means the palette always reaches it even when the
         # button itself is clipped off-screen.
         self.commands.append((t("Compacto"), self._toggle_compact))
+        self.commands.append((t("Nuevo canal matemático"), self._new_math_channel))
 
     def _toggle_compact(self) -> None:
         self._set_compact(not self._compact)
@@ -872,6 +952,12 @@ class App(Shell):
             "unit_x": self.unit_x_var, "unit_y": self.unit_y_var,
             "xscale": self.xscale_var, "yscale": self.yscale_var,
             "xmin": self.xmin_var, "xmax": self.xmax_var,
+            "xticks_manual": self.xticks_manual_var, "xticks": self.xticks_var,
+            "yticks_manual": self.yticks_manual_var, "yticks": self.yticks_var,
+            "xtick_decimals_manual": self.xtick_decimals_manual_var,
+            "xtick_decimals": self.xtick_decimals_var,
+            "ytick_decimals_manual": self.ytick_decimals_manual_var,
+            "ytick_decimals": self.ytick_decimals_var,
             "engineering_ticks": self.engineering_ticks_var,
             "grid": self.grid_var, "minor_grid": self.minor_grid_var,
             "title": self.title_var, "xlabel": self.xlabel_var,
@@ -951,6 +1037,13 @@ class App(Shell):
         if sig is None:
             sig = build_missing_signal(record, color=record.get("color") or self._next_color())
 
+        self._apply_record_attrs(sig, record)
+        self._signal_columns[sig.uid] = (x_col, y_col)
+        return True
+
+    def _apply_record_attrs(self, sig: Signal, record: dict) -> None:
+        """Per-trace settings shared by file traces and math channels, then
+        register `sig` as a live trace (end of `signal_order`)."""
         for attr in ("unit_t_in", "unit_v_in", "t_offset", "v_offset", "gain",
                     "invert", "linestyle", "marker", "marker_size",
                     "marker_hollow", "secondary_y"):
@@ -967,8 +1060,26 @@ class App(Shell):
 
         self.signals[sig.uid] = sig
         self.signal_order.append(sig.uid)
-        self._signal_columns[sig.uid] = (x_col, y_col)
-        return True
+
+    def _restore_math_signal(self, record: dict) -> Optional[str]:
+        """
+        Replay a saved math channel. Its operands are stored as INDICES into
+        the same saved `signals` list (uids are regenerated on every load),
+        so they are resolved by the caller once every record is back --
+        see `_apply_plot_state`. Returns the new uid, or None if unusable.
+        """
+        math = record.get("math")
+        expr = math.get("expr") if isinstance(math, dict) else None
+        if not isinstance(expr, str) or not expr.strip():
+            return None
+        y_kind = record.get("y_kind", "voltage")
+        spec = MathSpec(expr=expr, operands={}, name=record.get("name") or expr,
+                        y_kind=y_kind,
+                        unit=record.get("unit_v_in", "") if y_kind == "custom" else "")
+        sig = build_math_signal(spec, str(uuid.uuid4()),
+                                color=record.get("color") or self._next_color())
+        self._apply_record_attrs(sig, record)
+        return sig.uid
 
     def _replace_missing_signal(self, uid: str, path: str) -> bool:
         """
@@ -1151,9 +1262,13 @@ class App(Shell):
             child.destroy()
 
         totals: dict[str, int] = {}
+        math_keys: set[str] = set()
         for uid in self.signal_order:
             sig = self.signals[uid]
             key = sig.source_path or sig.name
+            if sig.is_math:
+                key = sig.display_name or sig.name
+                math_keys.add(key)
             totals[key] = totals.get(key, 0) + int(sig.t_raw.size)
 
         if not totals:
@@ -1163,6 +1278,8 @@ class App(Shell):
         for path, points in totals.items():
             name = os.path.basename(path) or path
             tag = os.path.splitext(name)[1].lstrip(".") or "dat"
+            if path in math_keys:
+                name, tag = path, "ƒ"
             Chip(target, tag, name, f"{points:,}".replace(",", " ")
                  ).pack(fill="x", anchor="w", pady=(0, 4))
 
@@ -1195,6 +1312,9 @@ class App(Shell):
         also had "Quitar todas" beside it, kept here as an addition."""
         super()._build_stage_footer(key)
         if key == "adjust":
+            ghost_button(self.navigator_footer, t("ƒ  Canal matemático"),
+                        self._new_math_channel, height=28
+                        ).pack(fill="x", pady=(6, 0))
             ghost_button(self.navigator_footer, t("Quitar todas"),
                         self._remove_all_signals, height=28
                         ).pack(fill="x", pady=(6, 0))
@@ -1376,6 +1496,12 @@ class App(Shell):
         self.annotations = AnnotationManager(self.canvas)
         self.cursors.attach(self.axes)
         self.annotations.attach(self.axes)
+        # One entry per `self.axes[i]`, recomputed by `_axes_context()` at
+        # the end of every `update_plot()` -- the single source both
+        # `_overlay_units()` (per-axis unit lookup) and `_axes_labels()`
+        # (the "Eje" selector's options) read from. Empty until the first
+        # redraw; `_overlay_units`/`_axes_labels` both fall back safely.
+        self._axes_context_cache: list[dict] = []
 
     # ------------------------------------------------------------------ #
     # Plot tabs -- several independent plots held in memory at once
@@ -1459,14 +1585,27 @@ class App(Shell):
             except Exception:
                 pass   # a widget torn down mid-close: skip that one field
 
+        # Math channels have no source columns; they are saved with their
+        # expression and operands as indices into THIS list (uids are not
+        # stable across loads -- see `_restore_math_signal`).
+        saved_uids = [uid for uid in self.signal_order
+                      if uid in self.signals
+                      and (self.signals[uid].is_math or uid in self._signal_columns)]
+        index_of = {uid: i for i, uid in enumerate(saved_uids)}
         signals = []
-        for uid in self.signal_order:
-            cols = self._signal_columns.get(uid)
-            sig = self.signals.get(uid)
-            if cols is None or sig is None:
-                continue   # no known source columns: nothing to replay later
+        for uid in saved_uids:
+            sig = self.signals[uid]
+            if sig.is_math:
+                origin = {"math": {
+                    "expr": sig.math_expr,
+                    "operands": {alias: index_of[op] for alias, op
+                                 in sig.math_operands.items() if op in index_of}}}
+            else:
+                cols = self._signal_columns[uid]
+                origin = {"source_path": sig.source_path,
+                          "x_col": cols[0], "y_col": cols[1]}
             signals.append({
-                "source_path": sig.source_path, "x_col": cols[0], "y_col": cols[1],
+                **origin,
                 "name": sig.name, "display_name": sig.display_name,
                 "legend_label": sig.legend_label,
                 "domain": sig.domain, "y_kind": sig.y_kind,
@@ -1553,8 +1692,28 @@ class App(Shell):
         self._signal_columns = {}
         self.line_widths = {}
         self.selected_uid = None
-        for record in data.get("signals", []):
-            self._restore_signal(record, anchor_dir)
+        index_to_uid: dict[int, str] = {}
+        pending_math: list[tuple[str, dict]] = []
+        for index, record in enumerate(data.get("signals", [])):
+            if not isinstance(record, dict):
+                continue
+            if isinstance(record.get("math"), dict):
+                uid = self._restore_math_signal(record)
+                if uid is not None:
+                    index_to_uid[index] = uid
+                    pending_math.append((uid, record["math"].get("operands") or {}))
+            elif self._restore_signal(record, anchor_dir):
+                index_to_uid[index] = self.signal_order[-1]
+        # Second pass: saved operand indices -> uids of this load.
+        for uid, operands in pending_math:
+            resolved = {}
+            for alias, index in operands.items():
+                try:
+                    resolved[str(alias)] = index_to_uid[int(index)]
+                except (KeyError, TypeError, ValueError):
+                    continue   # operand not restored: channel shows an error
+            self.signals[uid].math_operands = resolved
+        refresh_math_signals(self.signals)
 
         self._sync_unit_options()
         self._refresh_signal_list()
@@ -1751,6 +1910,16 @@ class App(Shell):
             self.annotations.disarm()
             self.cursors.arm("v")
             self._show_measurements()
+            # Same navigation `key == "annotate"` already does below: the
+            # cursor bench (including "Anotar valor", the button that turns
+            # a cursor reading into a permanent annotation) lives in this
+            # same embedded panel's "Cursores" pane, not in a floating
+            # window of its own -- picking the "Cursor" tool used to leave
+            # the rail wherever it already was, so a person who hadn't
+            # separately opened "Anotar" had no way to see the cursor list,
+            # the readout or "Anotar valor" at all.
+            self.rail.select("annotate")
+            self.overlay_panel.show_pane("cursors")
             self.hint_label.configure(
                 text="Clic sobre el gráfico para colocar un cursor; arrastralo para medir.")
         elif key == "annotate":
@@ -1811,9 +1980,15 @@ class App(Shell):
         self.measurements.place_forget()
 
     def _measurement_rows(self) -> list[tuple[str, str]]:
-        x_unit, y_unit = self.cursors.x_unit, self.cursors.y_unit
+        # Per-row unit lookup (`entry["axes_index"]`/`item["axes_index"]`),
+        # not one fixed (x_unit, y_unit) pair for the whole card -- a cursor
+        # on a secondary axis (Y2, or a Bode phase subplot) has to read its
+        # OWN axis's unit, not whatever happens to be axes[0]'s. This is the
+        # same fix `OverlayPanel._render_readout` already applies; see
+        # `_overlay_units`/`_axes_context`.
         rows: list[tuple[str, str]] = []
         for entry in self.cursors.readout():
+            x_unit, y_unit = self._overlay_units(entry["axes_index"])
             axis = "X" if entry["orientation"] == "v" else "Y"
             unit = x_unit if entry["orientation"] == "v" else y_unit
             rows.append((f"{entry['name']}  ·  {axis}",
@@ -1830,6 +2005,7 @@ class App(Shell):
         if deltas:
             rows.append(("--", ""))
             for item in deltas:
+                x_unit, y_unit = self._overlay_units(item["axes_index"])
                 unit = x_unit if item["orientation"] == "v" else y_unit
                 rows.append((f"Δ {item['from']}→{item['to']}",
                              format_eng(item["delta"], unit)))
@@ -1931,6 +2107,9 @@ class App(Shell):
         self.unit_x_manual_var = ctk.BooleanVar(value=False)
         check_field(box, t("Unidad X manual"), self.unit_x_manual_var,
                     command=self.update_plot, rule=False)
+        self.xscale_factor_var = ctk.StringVar(value="")
+        entry_field(box, t("Factor X"), self.xscale_factor_var, width=110,
+                    on_enter=self.update_plot, rule=False)
 
         self.unit_y_var = ctk.StringVar(value="V")
         self.unit_y_combo = combo_field(box, t("Unidad Y1"), self.unit_y_var,
@@ -1938,6 +2117,9 @@ class App(Shell):
         self.unit_y_manual_var = ctk.BooleanVar(value=False)
         check_field(box, t("Unidad Y1 manual"), self.unit_y_manual_var,
                     command=self.update_plot, rule=False)
+        self.yscale_factor_var = ctk.StringVar(value="")
+        entry_field(box, t("Factor Y1"), self.yscale_factor_var, width=110,
+                    on_enter=self.update_plot, rule=False)
 
         # Y2 carries its own unit: the secondary axis usually holds a
         # different quantity altogether (phase in degrees against magnitude
@@ -1948,10 +2130,17 @@ class App(Shell):
         self.unit_y2_manual_var = ctk.BooleanVar(value=False)
         check_field(box, t("Unidad Y2 manual"), self.unit_y2_manual_var,
                     command=self.update_plot, rule=False)
+        self.y2scale_factor_var = ctk.StringVar(value="")
+        entry_field(box, t("Factor Y2"), self.y2scale_factor_var, width=110,
+                    on_enter=self.update_plot, rule=False)
         hint(box, t("Con «manual» tildado podés escribir cualquier texto en "
                     "el combo de unidad de ese eje (o dejarlo vacío para no "
-                    "mostrar ninguna) -- no hay conversión de prefijos para "
-                    "una unidad que no sea una de las conocidas."),
+                    "mostrar ninguna). Sin «Factor», una unidad que no sea "
+                    "una de las conocidas no convierte nada (queda ×1); con "
+                    "«Factor» cargado, el eje entero se escala dividiendo "
+                    "por ese número en vez de por el de la unidad elegida "
+                    "-- p. ej. unidad «u.a.» + factor «2.2k» para mostrar el "
+                    "dato crudo dividido 2200, con la etiqueta que quieras."),
              wraplength=280).pack(fill="x", pady=(0, 10))
 
         self.xscale_var = ctk.StringVar(value="linear")
@@ -1969,6 +2158,51 @@ class App(Shell):
         self.xmax_var = ctk.StringVar(value="")
         entry_field(box, t("X máx"), self.xmax_var, on_enter=self.update_plot)
         hint(box, t("Vacío = sin límite, en la unidad X elegida."),
+             wraplength=280).pack(fill="x", pady=(0, 10))
+
+        # Manual tick positions: an explicit list wins over the automatic
+        # locator (`_apply_axis_cosmetics`, via `ax.set_xticks`/`set_yticks`)
+        # -- destildado, o tildado con una lista vacía/inválida, cae solo al
+        # comportamiento automático de siempre, sin ningún fallback especial.
+        self.xticks_manual_var = ctk.BooleanVar(value=False)
+        check_field(box, t("Ticks X manuales"), self.xticks_manual_var,
+                    command=self.update_plot)
+        self.xticks_var = ctk.StringVar(value="")
+        stacked_entry(box, t("Ticks X"), self.xticks_var,
+                      on_enter=self.update_plot)
+        self.yticks_manual_var = ctk.BooleanVar(value=False)
+        check_field(box, t("Ticks Y manuales"), self.yticks_manual_var,
+                    command=self.update_plot)
+        self.yticks_var = ctk.StringVar(value="")
+        stacked_entry(box, t("Ticks Y"), self.yticks_var,
+                      on_enter=self.update_plot)
+        hint(box, t("Lista de valores separados por espacio, en la unidad "
+                    "del eje elegida (ej. «0 30 60 80 120»). Destildado, o "
+                    "sin números válidos, vuelve al escalado automático."),
+             wraplength=280).pack(fill="x", pady=(0, 10))
+
+        # Decimales fijos para los ticks de escala LINEAL -- independiente
+        # de las posiciones (arriba) y de "Notación de ingeniería" (abajo,
+        # que sólo rige en escala log). Sin esto, `ScalarFormatter` decide
+        # solo cuántos decimales mostrar en cada eje según SU PROPIO rango
+        # de datos, y dos ejes del mismo gráfico pueden terminar con una
+        # cantidad de decimales distinta uno del otro (reportado con una
+        # captura: Y con 3 decimales, X con 1).
+        self.xtick_decimals_manual_var = ctk.BooleanVar(value=False)
+        check_field(box, t("Decimales X manuales"), self.xtick_decimals_manual_var,
+                    command=self.update_plot)
+        self.xtick_decimals_var = ctk.StringVar(value="1")
+        entry_field(box, t("Decimales X"), self.xtick_decimals_var, width=60,
+                    on_enter=self.update_plot, rule=False)
+        self.ytick_decimals_manual_var = ctk.BooleanVar(value=False)
+        check_field(box, t("Decimales Y manuales"), self.ytick_decimals_manual_var,
+                    command=self.update_plot)
+        self.ytick_decimals_var = ctk.StringVar(value="1")
+        entry_field(box, t("Decimales Y"), self.ytick_decimals_var, width=60,
+                    on_enter=self.update_plot, rule=False)
+        hint(box, t("Cantidad fija de decimales para los números del eje "
+                    "(0 a 6), sólo en escala lineal. Destildado vuelve al "
+                    "formato automático de Matplotlib de siempre."),
              wraplength=280).pack(fill="x", pady=(0, 10))
 
         self.engineering_ticks_var = ctk.BooleanVar(value=True)
@@ -2306,9 +2540,16 @@ class App(Shell):
             return
         signal = self.signals.get(self.selected_uid)
         name = signal.name if signal is not None else ""
+        dependents = [s.display_name or s.name for u, s in self.signals.items()
+                      if u != self.selected_uid and s.is_math
+                      and depends_on(self.signals, u, self.selected_uid)]
+        warning = ""
+        if dependents:
+            warning = t("Estos canales matemáticos la usan y van a quedar con "
+                        "error: {names}").format(names=", ".join(dependents)) + "\n\n"
         if not messagebox.askyesno(
                 t("Quitar traza"),
-                f"{t('¿Quitar la traza')} «{name}»?\n\n"
+                f"{t('¿Quitar la traza')} «{name}»?\n\n{warning}"
                 f"{t('Esta acción se puede deshacer con Ctrl+Z.')}"):
             return
         self._record(f"{t('Quitar traza')} «{name}»")
@@ -2382,8 +2623,11 @@ class App(Shell):
             # gets a "⚠" marker in its label and is clicked to reconnect
             # (`_select_signal`) instead of opening the trace inspector.
             label = sig.display_name or sig.name
+            if sig.is_math:
+                tag = f"ƒ {tag}"
+            broken = sig.missing or bool(sig.math_error)
             row = TraceRow(
-                target, name=f"⚠ {label}" if sig.missing else label,
+                target, name=f"⚠ {label}" if broken else label,
                 color=sig.color or "#8A8A8A", tag=tag, visible=sig.visible,
                 on_select=lambda u=uid: self._select_signal(u),
                 on_toggle=lambda value, u=uid: self._toggle_signal(u, value),
@@ -2577,6 +2821,9 @@ class App(Shell):
         for w in self.selection_body.winfo_children():
             w.destroy()
         parent = self.selection_body
+
+        if sig.is_math:
+            self._build_math_section(parent, sig)
 
         # ---- Apariencia --------------------------------------------------- #
         appearance = StaticSection(parent, t("Apariencia"), expanded=True)
@@ -3120,7 +3367,18 @@ class App(Shell):
 
         domains = {self.signals[u].domain for u in self.signal_order} or {"time"}
         domain = "freq" if domains == {"freq"} else "time"
-        x_factor = x_units_for_domain(domain).get(x_unit, 1.0)
+        # Fase 11: "Factor X/Y1/Y2" -- read here once, then used both for the
+        # X mín/máx conversion right below and, via `_x_factor`/`_y_factor`,
+        # by every draw method instead of each re-deriving its own factor
+        # from `x_units_for_domain`/`y_units_for_kind`.
+        x_factor_override = (_parse_factor(self.xscale_factor_var.get())
+                              if self.unit_x_manual_var.get() else None)
+        y_factor_override = (_parse_factor(self.yscale_factor_var.get())
+                              if self.unit_y_manual_var.get() else None)
+        y2_factor_override = (_parse_factor(self.y2scale_factor_var.get())
+                               if self.unit_y2_manual_var.get() else None)
+        x_factor = (x_factor_override if x_factor_override is not None
+                    else x_units_for_domain(domain).get(x_unit, 1.0))
 
         x_min_disp = _parse_optional_float(self.xmin_var.get())
         x_max_disp = _parse_optional_float(self.xmax_var.get())
@@ -3141,6 +3399,9 @@ class App(Shell):
             "x_unit": x_unit,
             "y_unit": y_unit,
             "y2_unit": self.unit_y2_var.get(),
+            "x_factor_override": x_factor_override,
+            "y_factor_override": y_factor_override,
+            "y2_factor_override": y2_factor_override,
             "x_min": x_min_disp * x_factor if x_min_disp is not None else None,
             "x_max": x_max_disp * x_factor if x_max_disp is not None else None,
             "dec_mode": dec_mode,
@@ -3153,6 +3414,14 @@ class App(Shell):
             "ylabel2": self.ylabel2_var.get().strip(),
             "xscale": self.xscale_var.get(),
             "yscale": self.yscale_var.get(),
+            "xticks": (_parse_tick_list(self.xticks_var.get())
+                       if self.xticks_manual_var.get() else None),
+            "yticks": (_parse_tick_list(self.yticks_var.get())
+                       if self.yticks_manual_var.get() else None),
+            "xtick_decimals": (_parse_tick_decimals(self.xtick_decimals_var.get())
+                                if self.xtick_decimals_manual_var.get() else None),
+            "ytick_decimals": (_parse_tick_decimals(self.ytick_decimals_var.get())
+                                if self.ytick_decimals_manual_var.get() else None),
             "show_grid": self.grid_var.get(),
             "minor_grid": self.minor_grid_var.get(),
             "show_legend": self.legend_var.get(),
@@ -3214,6 +3483,36 @@ class App(Shell):
             out.append((uid, x, y))
         return out
 
+    def _x_factor(self, settings: dict) -> float:
+        """
+        Display-unit divisor for the X axis.
+
+        `x_units_for_domain(...)` for a recognised unit, or Fase 11's
+        "Factor X" override when «Unidad X manual» is on and a valid
+        number was typed there -- see `_read_settings` and `_parse_factor`.
+        """
+        override = settings.get("x_factor_override")
+        if override:
+            return override
+        return x_units_for_domain(settings["domain"]).get(settings["x_unit"], 1.0)
+
+    def _y_factor(self, settings: dict, y_kind: str, unit: str,
+                  secondary: bool = False) -> float:
+        """
+        Display-unit divisor for a Y curve of the given `y_kind`.
+
+        Same idea as `_x_factor`, gated off for "dB"/"deg": those are
+        already a fixed, meaningful unit on their own (a logarithmic
+        magnitude, a phase in degrees) -- dividing them by an arbitrary
+        "Factor Y" would silently corrupt the curve rather than just
+        relabel it, and is essentially never what that field is for.
+        """
+        override = settings.get("y2_factor_override" if secondary
+                                 else "y_factor_override")
+        if override and y_kind not in ("dB", "deg"):
+            return override
+        return y_units_for_kind(y_kind).get(unit, 1.0)
+
     def _default_xlabel(self, settings: dict) -> str:
         unit = settings["x_unit"]
         if settings["domain"] == "freq":
@@ -3268,6 +3567,11 @@ class App(Shell):
             ax.set_xscale("linear")
             ax.set_yscale("linear")
 
+        if settings.get("xticks"):
+            ax.set_xticks(settings["xticks"])
+        if settings.get("yticks"):
+            ax.set_yticks(settings["yticks"])
+
         # Plain "1, 10, 100, 1k, 10k..." major tick labels on log axes,
         # instead of Matplotlib's default "10^n" mathtext exponent style.
         if self.engineering_ticks_var.get():
@@ -3275,6 +3579,19 @@ class App(Shell):
                 ax.xaxis.set_major_formatter(FuncFormatter(_engineering_tick_label))
             if settings["yscale"] == "log":
                 ax.yaxis.set_major_formatter(FuncFormatter(_engineering_tick_label))
+
+        # "Decimales X/Y manuales": a FIXED decimal count on a linear axis,
+        # overriding `ScalarFormatter`'s own per-axis choice (see
+        # `_fixed_decimals_tick_label`). Log axes are untouched here --
+        # `_engineering_tick_label`, right above, already owns that case.
+        x_decimals = settings.get("xtick_decimals")
+        if settings["xscale"] == "linear" and x_decimals is not None:
+            ax.xaxis.set_major_formatter(FuncFormatter(
+                lambda v, _pos, n=x_decimals: _fixed_decimals_tick_label(v, n)))
+        y_decimals = settings.get("ytick_decimals")
+        if settings["yscale"] == "linear" and y_decimals is not None:
+            ax.yaxis.set_major_formatter(FuncFormatter(
+                lambda v, _pos, n=y_decimals: _fixed_decimals_tick_label(v, n)))
 
         if settings["show_grid"]:
             ax.grid(True, which="major", linewidth=0.4, alpha=0.5)
@@ -3300,6 +3617,13 @@ class App(Shell):
     def update_plot(self) -> None:
         if self._plot_suspended:
             return
+        # Math channels read their operands' processed data, so they are
+        # recomputed on every redraw (cheap next to the draw itself). If a
+        # channel's error state flipped, the trace list needs its ⚠ updated.
+        failed = frozenset(refresh_math_signals(self.signals))
+        if failed != self._math_failed:
+            self._math_failed = failed
+            self._refresh_signal_list()
         try:
             settings = self._read_settings()
         except Exception as exc:
@@ -3345,10 +3669,28 @@ class App(Shell):
         # overlay artists have to be rebuilt from their persistent specs.
         self.cursors.attach(self.axes)
         self.annotations.attach(self.axes)
-        self.cursors.x_unit = settings["x_unit"]
-        self.cursors.y_unit = "dB" if mode == "Diagrama de Bode" else settings["y_unit"]
+        # `self.axes` has its final shape for this redraw now (every
+        # `_draw_*` above already ran `_reset_figure`/`twinx()`) -- compute
+        # what each axes actually IS once here, instead of the old single
+        # fixed (x_unit, y_unit) pair that mislabeled a Y2/phase axis with
+        # the Y1/magnitude unit. See `_axes_context`.
+        self._axes_context_cache = self._axes_context(settings)
+        self.cursors.axis_units = [(c["x_unit"], c["y_unit"])
+                                    for c in self._axes_context_cache]
         self.cursors.redraw()
         self.annotations.redraw()
+        # A vline/hline "marcar valor en el eje" set to "arriba"/"derecha"
+        # (Annotation.axis_side) can create a secondary axis inside
+        # redraw() -- after the tight_layout()/subplots_adjust() pass a few
+        # lines up already ran, so that pass never reserved room for it.
+        # Re-running tight_layout() only in this case keeps the common
+        # path (no opposite-axis marks) exactly as cheap as before, and
+        # never overrides manual margins the user set on purpose.
+        if self._manual_margins is None and self.annotations.uses_opposite_axis():
+            try:
+                self.fig.tight_layout()
+            except Exception:
+                pass   # tight_layout can fail with an outside legend; harmless
         self._on_cursor_change()
         self.overlay_panel.refresh_all()
 
@@ -3408,13 +3750,13 @@ class App(Shell):
         ax = self.axes[0]
         ax2 = None
 
-        x_factor = x_units_for_domain(settings["domain"]).get(settings["x_unit"], 1.0)
+        x_factor = self._x_factor(settings)
         primary, secondary = [], []
         total = 0
         for uid, x, y in curves:
             sig = self.signals[uid]
             unit = settings["y2_unit"] if sig.secondary_y else settings["y_unit"]
-            y_factor = y_units_for_kind(sig.y_kind).get(unit, 1.0)
+            y_factor = self._y_factor(settings, sig.y_kind, unit, secondary=sig.secondary_y)
             x_disp, y_disp = x / x_factor, y / y_factor
             (secondary if sig.secondary_y else primary).append((sig, x_disp, y_disp))
             total += x.size
@@ -3506,7 +3848,7 @@ class App(Shell):
         ax = self.axes[0]
 
         axis = settings["hist_axis"]
-        x_factor = x_units_for_domain(settings["domain"]).get(settings["x_unit"], 1.0)
+        x_factor = self._x_factor(settings)
 
         series: list[tuple[Signal, np.ndarray]] = []
         for uid, x, y in curves:
@@ -3515,7 +3857,7 @@ class App(Shell):
                 values = x / x_factor
             else:
                 unit = settings["y2_unit"] if sig.secondary_y else settings["y_unit"]
-                y_factor = y_units_for_kind(sig.y_kind).get(unit, 1.0)
+                y_factor = self._y_factor(settings, sig.y_kind, unit, secondary=sig.secondary_y)
                 values = y / y_factor
             series.append((sig, values))
 
@@ -3603,7 +3945,7 @@ class App(Shell):
             return 0
 
         separate = settings["bode_layout"] == "separate"
-        x_factor = x_units_for_domain(settings["domain"]).get(settings["x_unit"], 1.0)
+        x_factor = self._x_factor(settings)
         xlabel = settings["xlabel"] or self._default_xlabel(settings)
         mag_label = settings["ylabel"] or "Magnitud [dB]"
         ph_label = settings["ylabel2"] or "Fase [$^\\circ$]"
@@ -3754,8 +4096,8 @@ class App(Shell):
         x_curve = np.interp(base, xb, xv)
         y_curve = np.interp(base, yb, yv)
 
-        fx = y_units_for_kind(sig_x.y_kind).get(settings["y_unit"], 1.0)
-        fy = y_units_for_kind(sig_y.y_kind).get(settings["y_unit"], 1.0)
+        fx = self._y_factor(settings, sig_x.y_kind, settings["y_unit"])
+        fy = self._y_factor(settings, sig_y.y_kind, settings["y_unit"])
         xy_color = self.xy_color_var.get().strip() or sig_y.color
         xy_label = self.xy_legend_var.get().strip() or \
             f"{self._legend_label(sig_y)} vs {self._legend_label(sig_x)}"
@@ -3819,8 +4161,10 @@ class App(Shell):
             if not out_dir:
                 return
             try:
-                paths = export_csv_individual(payload, out_dir,
-                                               settings["x_unit"], settings["y_unit"])
+                paths = export_csv_individual(
+                    payload, out_dir, settings["x_unit"], settings["y_unit"],
+                    x_factor=settings.get("x_factor_override"),
+                    y_factor=settings.get("y_factor_override"))
             except Exception as exc:
                 messagebox.showerror(t("Error al exportar"), str(exc))
                 return
@@ -3834,8 +4178,10 @@ class App(Shell):
             if not out_path:
                 return
             try:
-                export_csv_combined(payload, out_path,
-                                     settings["x_unit"], settings["y_unit"])
+                export_csv_combined(
+                    payload, out_path, settings["x_unit"], settings["y_unit"],
+                    x_factor=settings.get("x_factor_override"),
+                    y_factor=settings.get("y_factor_override"))
             except Exception as exc:
                 messagebox.showerror(t("Error al exportar"), str(exc))
                 return
@@ -4081,6 +4427,114 @@ class App(Shell):
     # ------------------------------------------------------------------ #
     DEFAULT_LINE_WIDTH = 1.4
 
+    # ------------------------------------------------------------------ #
+    # Math channels (core/math_channels.py + gui/math_dialog.py)
+    # ------------------------------------------------------------------ #
+    def _math_candidates(self, editing: Optional[str] = None) -> list[tuple[str, str]]:
+        """Traces that can be an operand: not missing, and -- when editing a
+        channel -- neither that channel nor anything computed from it
+        (that would be a circular reference)."""
+        out = []
+        for uid in self.signal_order:
+            sig = self.signals.get(uid)
+            if sig is None or sig.missing:
+                continue
+            if editing is not None and depends_on(self.signals, uid, editing):
+                continue
+            out.append((uid, sig.display_name or sig.name))
+        return out
+
+    def _validate_math_spec(self, spec: MathSpec) -> Optional[str]:
+        """Evaluate `spec` against the live traces without touching them."""
+        probe = build_math_signal(spec, "__math_probe__")
+        refresh_math_signals({**self.signals, probe.uid: probe})
+        if probe.math_error:
+            return probe.math_error
+        if not np.isfinite(probe.v_raw).any():
+            return t("El resultado no tiene ningún valor finito.")
+        return None
+
+    def _open_math_dialog(self, editing: Optional[str] = None) -> Optional[MathSpec]:
+        candidates = self._math_candidates(editing)
+        if not candidates:
+            messagebox.showinfo(t("Sin trazas"),
+                                t("Cargá al menos una traza antes de crear un "
+                                  "canal matemático."))
+            return None
+        initial = None
+        if editing is not None:
+            sig = self.signals[editing]
+            initial = MathSpec(expr=sig.math_expr, operands=dict(sig.math_operands),
+                               name=sig.name, y_kind=sig.y_kind,
+                               unit=sig.unit_v_in if sig.y_kind == "custom" else "")
+        dialog = MathChannelDialog(
+            self, candidates, initial=initial, validate=self._validate_math_spec,
+            default_kind=lambda uid: self.signals[uid].y_kind if uid in self.signals
+            else "voltage")
+        return dialog.result
+
+    def _after_math_change(self, uid: str) -> None:
+        refresh_math_signals(self.signals)
+        self._sync_unit_options()
+        self._refresh_signal_list()
+        self._refresh_xy_combos()
+        self._select_signal(uid)
+        self.update_plot()
+
+    def _new_math_channel(self) -> None:
+        spec = self._open_math_dialog()
+        if spec is None:
+            return
+        self._record(t("Nuevo canal matemático"))
+        sig = build_math_signal(spec, str(uuid.uuid4()), color=self._next_color())
+        self.signals[sig.uid] = sig
+        self.signal_order.append(sig.uid)
+        self.rail.select("adjust")
+        self._after_math_change(sig.uid)
+        self.status_label.configure(
+            text=t("Canal matemático creado: {name}").format(name=sig.name))
+
+    def _edit_math_channel(self, uid: str) -> None:
+        sig = self.signals.get(uid)
+        if sig is None or not sig.is_math:
+            return
+        spec = self._open_math_dialog(editing=uid)
+        if spec is None:
+            return
+        self._record(t("Editar canal matemático"))
+        sig.math_expr = spec.expr
+        sig.math_operands = dict(spec.operands)   # new dict: undo keeps the old one
+        sig.name = spec.name or sig.name
+        sig.y_kind = spec.y_kind
+        sig.unit_v_in = (spec.unit if spec.y_kind == "custom"
+                         else next(iter(y_units_for_kind(spec.y_kind))))
+        self._after_math_change(uid)
+
+    def _build_math_section(self, parent, sig: Signal) -> None:
+        """Inspector block for a math channel: operation, bindings, errors."""
+        section = StaticSection(parent, t("Canal matemático"), expanded=True)
+        section.pack(fill="x", pady=(0, 10))
+        box = section.body
+        names = {alias: (self.signals[u].display_name or self.signals[u].name)
+                 if u in self.signals else "?"
+                 for alias, u in sig.math_operands.items()}
+        ctk.CTkLabel(box, text=sig.math_expr, font=font("mono"), text_color=col("fg"),
+                     anchor="w", justify="left", wraplength=240
+                     ).pack(fill="x", pady=(0, 4))
+        for alias in sorted(names):
+            hint(box, f"{alias} = {names[alias]}", wraplength=240).pack(fill="x")
+        if sig.math_error:
+            ctk.CTkLabel(box, text=f"⚠ {sig.math_error}", font=font("small"),
+                         text_color=col("fg"), anchor="w", justify="left",
+                         wraplength=240).pack(fill="x", pady=(6, 0))
+        hint(box, t("Se recalcula solo al cambiar las trazas de origen. El "
+                    "dominio y las unidades de origen los define la operación; "
+                    "ganancia, offset e inversión de abajo se aplican encima."),
+             wraplength=240).pack(fill="x", pady=(6, 6))
+        ghost_button(box, t("Editar operación"),
+                     lambda u=sig.uid: self._edit_math_channel(u)
+                     ).pack(fill="x")
+
     def _lw(self, uid: str) -> float:
         return self.line_widths.get(uid, self.DEFAULT_LINE_WIDTH)
 
@@ -4123,9 +4577,77 @@ class App(Shell):
         self.update_plot()
         self.status_label.configure(text=f"{verb}: {snapshot.label}")
 
-    def _overlay_units(self) -> tuple[str, str]:
-        """Units used to format the cursor readout."""
-        return self.cursors.x_unit, self.cursors.y_unit
+    def _axes_context(self, settings: dict) -> list[dict]:
+        """
+        One entry per element of `self.axes`, in the same order, describing
+        what THAT axes actually shows on THIS redraw: its (x_unit, y_unit)
+        pair (for cursor/annotation value formatting) and a translated
+        label (for the "Eje" selector and the cursor/annotation lists).
+
+        Called from `update_plot()` right after the mode-specific `_draw_*`
+        method has finished (so `self.axes` already holds its final value
+        for this redraw -- `_reset_figure`/`twinx()` both run inside that
+        dispatch) and cached in `self._axes_context_cache`, which
+        `_overlay_units`/`_axes_labels` read from. This is the single place
+        that decides "what is axes[i]", replacing the old fixed
+        `cursors.x_unit`/`y_unit` pair that silently mislabeled a Y2 or
+        phase axis with the Y1/magnitude unit -- the bug both
+        `_measurement_rows` and `OverlayPanel` used to have.
+        """
+        mode = settings["mode"]
+        x_unit = settings["x_unit"]
+        n = len(self.axes)
+
+        if mode == "Diagrama de Bode":
+            if n >= 2:
+                # "Juntos" (twinx, one shared X) reads Y1/Y2 off the SAME
+                # plot, so the axis actually needs naming which scale it
+                # is; "Separado" is two fully independent subplots where
+                # "Magnitud"/"Fase" alone is already unambiguous.
+                shared = settings.get("bode_layout") != "separate"
+                mag = f'{t("Magnitud")} (Y1)' if shared else t("Magnitud")
+                ph = f'{t("Fase")} (Y2)' if shared else t("Fase")
+                return [{"x_unit": x_unit, "y_unit": "dB", "label": mag},
+                        {"x_unit": x_unit, "y_unit": "deg", "label": ph}]
+            return [{"x_unit": x_unit, "y_unit": "dB", "label": t("Principal")}]
+
+        if mode == "Modo X/Y":
+            # Both axes of an X/Y plot share `settings["y_unit"]` (see
+            # `_draw_xy`'s own `_y_factor` calls) -- there is no separate
+            # "x_unit" concept in this mode.
+            unit = settings["y_unit"]
+            return [{"x_unit": unit, "y_unit": unit, "label": t("Principal")}]
+
+        if mode == "Histograma de valores":
+            axis = settings.get("hist_axis", "x")
+            hist_unit = x_unit if axis == "x" else settings["y_unit"]
+            # Counts/density (the histogram's own Y axis) has no physical
+            # unit to report.
+            return [{"x_unit": hist_unit, "y_unit": "", "label": t("Principal")}]
+
+        if mode == "Pizarra en blanco":
+            return [{"x_unit": "", "y_unit": "", "label": t("Principal")}]
+
+        # Standard time/frequency: one axes, or Y1/Y2 if a `secondary_y`
+        # trace forced `_draw_standard` to open a twinx().
+        if n >= 2:
+            return [{"x_unit": x_unit, "y_unit": settings["y_unit"],
+                     "label": f'{t("Y1")} ({t("Izquierda")})'},
+                    {"x_unit": x_unit,
+                     "y_unit": settings.get("y2_unit", settings["y_unit"]),
+                     "label": f'{t("Y2")} ({t("Derecha")})'}]
+        return [{"x_unit": x_unit, "y_unit": settings["y_unit"], "label": t("Principal")}]
+
+    def _axes_labels(self) -> list[str]:
+        """Translated combo options for `OverlayPanel`'s "Eje" selector."""
+        return [ctx["label"] for ctx in self._axes_context_cache] or [t("Principal")]
+
+    def _overlay_units(self, axes_index: int = 0) -> tuple[str, str]:
+        """(x_unit, y_unit) for `self.axes[axes_index]`, from the last redraw."""
+        if 0 <= axes_index < len(self._axes_context_cache):
+            ctx = self._axes_context_cache[axes_index]
+            return ctx["x_unit"], ctx["y_unit"]
+        return "", ""
 
     def _refresh_overlays(self) -> None:
         """
@@ -4139,6 +4661,11 @@ class App(Shell):
         self.annotations.attach(self.axes)
         self.cursors.redraw()
         self.annotations.redraw()
+        if self._manual_margins is None and self.annotations.uses_opposite_axis():
+            try:
+                self.fig.tight_layout()
+            except Exception:
+                pass
         self.canvas.draw_idle()
 
     def _build_overlay_panel(self) -> None:
@@ -4167,6 +4694,7 @@ class App(Shell):
         self.overlay_panel = OverlayPanel(
             self.navigators["annotate"], self.cursors, self.annotations,
             on_refresh=self._refresh_overlays, unit_provider=self._overlay_units,
+            axes_provider=self._axes_labels,
             show_header=False)   # Shell.navigator_header already shows this title
         self.overlay_panel.pack(fill="both", expand=True)
 

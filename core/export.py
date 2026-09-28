@@ -177,11 +177,22 @@ def _y_column_name(y_kind: str, y_unit: str) -> str:
 
 
 def _scale_pair(x: np.ndarray, y: np.ndarray, domain: str, y_kind: str,
-                x_unit: str, y_unit: str) -> tuple[np.ndarray, np.ndarray]:
-    """Convert base-unit arrays into the requested display units."""
-    x_factor = x_units_for_domain(domain).get(x_unit, 1.0)
-    y_factor = y_units_for_kind(y_kind).get(y_unit, 1.0)
-    return x / x_factor, y / y_factor
+                x_unit: str, y_unit: str, x_factor: Optional[float] = None,
+                y_factor: Optional[float] = None) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Convert base-unit arrays into the requested display units.
+
+    `x_factor`/`y_factor`, when given, override the looked-up per-unit
+    factor -- the CSV-export counterpart of `App._x_factor`/`_y_factor`
+    (Fase 11's "Factor X/Y1/Y2"), so an exported table matches the figure
+    the app just drew instead of silently reverting to the automatic
+    per-unit scale. `y_factor` is still ignored for "dB"/"deg" -- see
+    `App._y_factor` for why.
+    """
+    xf = x_factor if x_factor else x_units_for_domain(domain).get(x_unit, 1.0)
+    yf = (y_factor if (y_factor and y_kind not in ("dB", "deg"))
+          else y_units_for_kind(y_kind).get(y_unit, 1.0))
+    return x / xf, y / yf
 
 
 def export_csv_individual(
@@ -191,6 +202,8 @@ def export_csv_individual(
     y_unit: str,
     fmt: str = "%.6e",
     sep: str = ",",
+    x_factor: Optional[float] = None,
+    y_factor: Optional[float] = None,
 ) -> list[str]:
     """
     Write one CSV per signal with two columns ready for
@@ -204,7 +217,8 @@ def export_csv_individual(
     for name, x, y, domain, y_kind in signals_data:
         if len(x) == 0:
             continue
-        x_disp, y_disp = _scale_pair(x, y, domain, y_kind, x_unit, y_unit)
+        x_disp, y_disp = _scale_pair(x, y, domain, y_kind, x_unit, y_unit,
+                                     x_factor, y_factor)
         x_col = ("f_" + x_unit) if domain == "freq" else ("t_" + x_unit)
         y_col = _y_column_name(y_kind, y_unit)
         path = os.path.join(out_dir, f"{_sanitize_filename(name)}.csv")
@@ -224,6 +238,8 @@ def export_csv_combined(
     n_points: int = 500,
     fmt: str = "%.6e",
     sep: str = ",",
+    x_factor: Optional[float] = None,
+    y_factor: Optional[float] = None,
 ) -> str:
     """
     Write a single CSV sharing one interpolated X grid, with one Y column per
@@ -255,14 +271,15 @@ def export_csv_combined(
     else:
         x_grid = np.linspace(x_min, x_max, n_points)
 
-    x_factor = x_units_for_domain(domain).get(x_unit, 1.0)
-    columns = [x_grid / x_factor]
+    xf = x_factor if x_factor else x_units_for_domain(domain).get(x_unit, 1.0)
+    columns = [x_grid / xf]
     headers = [("f_" + x_unit) if domain == "freq" else ("t_" + x_unit)]
 
     for name, x, y, _domain, y_kind in usable:
         y_grid = np.interp(x_grid, x, y)
-        y_factor = y_units_for_kind(y_kind).get(y_unit, 1.0)
-        columns.append(y_grid / y_factor)
+        yf = (y_factor if (y_factor and y_kind not in ("dB", "deg"))
+              else y_units_for_kind(y_kind).get(y_unit, 1.0))
+        columns.append(y_grid / yf)
         headers.append(f"{_y_column_name(y_kind, y_unit)}_{_sanitize_filename(name)}")
 
     out_dir = os.path.dirname(out_path)

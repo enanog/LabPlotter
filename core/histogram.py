@@ -27,6 +27,12 @@ import numpy as np
 # osciloscopio).
 BIN_RULES = ("auto", "sturges", "fd", "scott", "sqrt")
 
+# Upper bound for a *rule-based* bin count over a shared range. A rule sizes
+# the bin width from ONE series' spread; applied to a shared range set by a
+# series of a much larger magnitude (e.g. a math channel `integ(A)` ~1e-4
+# next to `A*B/1m` ~1e2) it asked NumPy for ~1e8 bins and froze the app.
+MAX_AUTO_BINS = 512
+
 
 @dataclass
 class HistogramResult:
@@ -88,6 +94,14 @@ def compute_histogram(
     spread = finite.max() - finite.min()
     effective_range = value_range if (value_range is not None and spread > 0) else None
 
+    if isinstance(bin_spec, str) and effective_range is not None:
+        # Estimate the rule's bin width on this series' own (bounded) range
+        # before letting NumPy apply it to the shared one -- see MAX_AUTO_BINS.
+        own = np.histogram_bin_edges(finite, bins=bin_spec)
+        width = (own[-1] - own[0]) / max(len(own) - 1, 1)
+        span = float(effective_range[1]) - float(effective_range[0])
+        if width > 0 and span / width > MAX_AUTO_BINS:
+            bin_spec = MAX_AUTO_BINS
     counts, edges = np.histogram(
         finite, bins=bin_spec, range=effective_range, density=density)
 

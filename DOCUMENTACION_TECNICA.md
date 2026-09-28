@@ -38,6 +38,7 @@ LabPlotter/
 │   ├── latex.py               # Genera bloques LaTeX (figure/subfigure/axis) + saneamiento
 │   ├── board.py               # Modelo de datos del tablero multipanel (filas de paneles)
 │   ├── histogram.py           # Cálculo de histogramas sobre señales ya cargadas
+│   ├── math_channels.py       # Canales matemáticos: parser AST seguro + evaluación en grilla común
 │   ├── history.py             # Undo/redo snapshot-based sobre el conjunto de señales
 │   ├── tabs.py                # Snapshot de una pestaña completa (señales + ajustes + historial)
 │   ├── session.py             # Persistencia de sesión y perfiles de exportación (fuera del repo)
@@ -48,6 +49,7 @@ LabPlotter/
     ├── widgets.py              # Controles reutilizables (Field, Segmented, TraceRow, Splitter...)
     ├── overlays.py             # Estado y render de cursores/anotaciones (solo Matplotlib/NumPy)
     ├── overlay_panel.py        # Paleta flotante no-modal que edita ese estado
+    ├── math_dialog.py          # Diálogo modal para crear/editar un canal matemático
     ├── board_window.py         # Ventana del tablero: arma filas de paneles y exporta el layout
     └── histogram_window.py     # Ventana auxiliar de histograma sobre señales cargadas
 ```
@@ -61,6 +63,7 @@ LabPlotter/
 - **Edición no destructiva por canal:** offset y ganancia en X/Y, inversión, recorte temporal y diezmado (por factor o por cantidad objetivo de puntos), unidades de entrada configurables por notación de ingeniería (`4u7`, `2.2k`, `-3dB`, `10 kHz`) — todo aplicado sobre los datos crudos en el momento de graficar, nunca sobre el archivo original.
 - **Multi-pestaña:** varios gráficos independientes (señales + ajustes propios) en memoria simultáneamente, cada uno con su propio historial de undo/redo, sin perder el trabajo al alternar entre ellos.
 - **Cursores de medición y anotaciones tipo informe:** cursores arrastrables (verticales/horizontales) con lectura por curva y delta entre cursores; anotaciones con flecha líder, flechas sueltas, líneas de referencia con label rotado, texto libre y bandas sombreadas — serializables a JSON para reproducir exactamente la misma figura más adelante.
+- **Canales matemáticos (tipo MATH de osciloscopio):** trazas calculadas en vivo a partir de otras (`A - B`, `A * B / 1k`, `deriv(A)`, `integ(A)`, `smooth(A, n)`...), con hasta 4 operandos, alineación en grilla común por interpolación lineal sin extrapolación, encadenables y persistidas en sesión/sidecar. La expresión se interpreta recorriendo el `ast` contra una lista blanca de operadores y funciones — nunca con `eval()` — así que un JSON de sesión no puede ejecutar código (ver README §19).
 - **Tablero multipanel:** combina varias figuras ya exportadas en filas de paneles con peso relativo configurable (uno ancho, dos o tres lado a lado, grillas asimétricas), y exporta tanto los PDFs individuales como el bloque LaTeX con `subfigure` que reproduce el mismo layout.
 - **Histogramas:** distribución de valores (eje X o Y) de una o más señales superpuestas, con reglas de binning de NumPy (`auto`, `sturges`, `fd`, `scott`, `sqrt`) y manejo explícito de `NaN`/`inf`.
 - **Exportación de calidad de publicación:** PDF/SVG/PGF vectorial y PNG a 300 DPI configurable, con `bbox_inches="tight"`; CSV individual o combinado sobre grilla común (lineal o logarítmica) listo para `\addplot table` de `pgfplots`.

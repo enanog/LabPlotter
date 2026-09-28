@@ -75,6 +75,20 @@ codificación, y descompone las celdas complejas de Bode en dB/fase/módulo line
   objetivo.
 - `resample_uniform(t, v, n_points)` — remuestrea a una grilla uniforme de `n_points`.
 
+**`math_channels.py`** — canales matemáticos (sección 19): trazas calculadas a partir de otras
+con una expresión, como la función MATH de un osciloscopio. Sin `eval()`: la expresión se parsea
+con `ast` y sólo se ejecutan operadores/funciones de una lista blanca.
+
+- `parse(expr)` / `referenced_aliases(expr)` — valida una expresión y devuelve los canales
+  (`A`..`D`) que usa; `MathError` con mensaje traducible ante cualquier cosa no permitida.
+- `evaluate(expr, operands)` — evalúa sobre `{alias: (x, y)}` en unidades base; alinea los
+  canales en una grilla común (ver sección 19).
+- `build_math_signal(spec, uid, color)` — crea el `Signal` de un canal matemático a partir de un
+  `MathSpec` (expresión, operandos, nombre, magnitud, unidad).
+- `refresh_math_signals(signals)` — recalcula todos los canales matemáticos (dependencias
+  primero); nunca lanza: un canal que falla queda vacío con `Signal.math_error`.
+- `depends_on(signals, uid, target)` — detección de dependencias (evita referencias circulares).
+
 **`units.py`** — parseo de notación de ingeniería en los campos numéricos de la GUI (`4u7`,
 `2.2k`, `-3dB`, `10 kHz`).
 
@@ -229,6 +243,11 @@ Matplotlib/NumPy, sin CustomTkinter (ver secciones 7 y 8).
 - `OverlayPanel` — el contenido de la paleta: banco de cursores + editor de anotaciones.
 - `OverlayWindow` — el `CTkToplevel` que aloja al panel anterior.
 - `refresh_cursor_ui()` — sincroniza los campos del cursor seleccionado tras un arrastre.
+
+**`math_dialog.py`** — `MathChannelDialog`: diálogo modal para crear o editar un canal
+matemático (asignación de trazas a `A`..`D`, operación, presets, nombre, magnitud y unidad).
+Valida en vivo la sintaxis y, al confirmar, evalúa de verdad contra las trazas cargadas antes de
+cerrarse. No calcula nada por sí mismo: delega en `core/math_channels.py`.
 
 **`board_window.py`** — ventana del tablero: arma filas de paneles ya exportados, previsualiza el
 layout y exporta los archivos individuales más el bloque LaTeX (ver sección 17).
@@ -623,3 +642,71 @@ por un identificador inventado: una traducción faltante cae de nuevo en el espa
 de mostrar una clave cruda, así que un hueco de traducción es un detalle cosmético y no una
 pantalla rota. Cambiar el idioma reconstruye los paneles en el acto, para que lo que está en
 pantalla y el idioma activo nunca queden desincronizados.
+
+---
+
+## 19. Canales matemáticos
+
+Un **canal matemático** es una traza calculada a partir de otras, como la función MATH de un
+osciloscopio: `A - B` (tensión diferencial), `A * B / 1k` (potencia sobre 1 kΩ), `deriv(A)`,
+`integ(A)`, etc. Se crea desde el stage **Ajuste** con **ƒ Canal matemático** (o desde la paleta
+de comandos, *Nuevo canal matemático*) y aparece en la lista de trazas marcado con `ƒ`.
+
+**Cómo se usa:**
+
+1. Asignar una traza cargada a cada canal que se vaya a usar (`A`, `B`, `C`, `D`).
+2. Escribir la operación o elegir un preset (`A + B`, `A − B`, `A × B`, `A ÷ B`, `d/dt A`,
+   `∫ A dt`, `|A|`, `Suavizar A`).
+3. Opcional: nombre (por defecto, la operación con los nombres reales de las trazas) y magnitud
+   del resultado. Con *Otra (unidad libre)* se escribe la unidad a mano (`W`, `A`, `V²`...).
+
+**Sintaxis:**
+
+| Elemento | Admitido |
+|---|---|
+| Operadores | `+ - * / **` (también `×`, `÷`, `−`, `^`), paréntesis |
+| Canales | `A`, `B`, `C`, `D` |
+| Constantes | números (`2.5`, `1e-3`), prefijos SI (`1k`, `10m`, `4.7u`, `470p`), `pi`, `e` |
+| Eje X | `t` — el eje X alineado, en unidad base (s o Hz) |
+| Funciones punto a punto | `abs`, `sqrt`, `exp`, `ln`/`log`, `log10`, `sin`, `cos`, `tan`, `db` (= 20·log₁₀\|x\|) |
+| Cálculo | `deriv(x)` (derivada respecto de X, `np.gradient`), `integ(x)` (integral acumulada trapezoidal desde el primer punto) |
+| Filtrado | `smooth(x, n)` — media móvil centrada de `n` muestras (bordes sin sesgo) |
+| Escalares | `mean`, `rms`, `min`, `max` — devuelven un valor que se extiende a toda la traza (`A - mean(A)` quita la continua) |
+
+Decimales con punto (la coma separa argumentos de función). El resultado de una operación
+indefinida (`0/0`, `sqrt` de un negativo) queda como `NaN` y se dibuja como hueco, no como error.
+
+**Comportamiento:**
+
+- **En vivo.** El canal guarda la expresión y a qué traza apunta cada alias, no las muestras. Se
+  recalcula en cada redibujado a partir de los datos *procesados* de sus operandos (unidad,
+  offset, ganancia e inversión ya aplicados): cambiar la ganancia de `CH1` actualiza `CH1 − CH2`
+  sin tocar nada más.
+- **Grilla común.** Los canales se alinean sobre las muestras del primer canal usado en la
+  expresión, recortadas al intervalo X que cubren **todos** los operandos; un operando con otra
+  base de tiempo se interpola linealmente. Nunca se extrapola.
+- **Unidades base.** El resultado queda en s/Hz y V/dB/deg (o la unidad libre elegida). Sobre
+  eso se aplican la ganancia, offset e inversión propios del canal matemático, como a cualquier
+  traza.
+- **Encadenables.** Un canal matemático puede ser operando de otro. Al editar, la lista de
+  operandos excluye el propio canal y todo lo que depende de él, así que no se pueden armar
+  referencias circulares.
+- **Errores visibles, no bloqueantes.** Si falta un operando (se borró la traza, su archivo no se
+  encontró) o los dominios no coinciden (tiempo + frecuencia), el canal queda vacío, marcado con
+  `⚠` en la lista, y el inspector muestra el motivo. Al quitar una traza, el diálogo de
+  confirmación avisa qué canales matemáticos dependen de ella. `Ctrl+Z` lo revierte.
+- **Persistencia.** Se guarda en la sesión, en cada pestaña y en el sidecar
+  `.labplotter.json` de una figura exportada, como `{"math": {"expr": ..., "operands":
+  {"A": 0, "B": 1}}}`, donde los operandos son **índices** dentro de la misma lista de señales
+  (los `uid` se regeneran en cada carga). Una versión anterior de LabPlotter simplemente ignora
+  esos registros.
+- **Exportación.** CSV, figura, histograma, X/Y y Bode usan el canal como cualquier otra traza.
+  Si el resultado tiene otra magnitud que el resto (por ejemplo `V²`), conviene mandarlo al
+  eje Y secundario desde el inspector.
+
+**Uso headless:**
+
+```python
+from core.math_channels import evaluate
+x, y = evaluate("A - B", {"A": (t1, v1), "B": (t2, v2)})   # arrays en unidad base
+```

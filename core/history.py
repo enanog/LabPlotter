@@ -36,6 +36,10 @@ TRACKED_ATTRS: tuple[str, ...] = (
     "unit_t_in", "unit_v_in", "t_offset", "v_offset", "gain", "invert",
     "linestyle", "marker", "marker_size", "marker_hollow", "color",
     "secondary_y", "visible",
+    # Math channels: editing the expression/operands must be undoable too.
+    # `math_operands` is always replaced with a new dict, never mutated in
+    # place, so holding the reference in the snapshot is enough.
+    "math_expr", "math_operands",
 )
 
 

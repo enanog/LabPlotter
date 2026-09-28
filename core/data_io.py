@@ -23,7 +23,7 @@ import csv
 import os
 import re
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 import numpy as np
@@ -62,6 +62,39 @@ CUSTOM_UNIT_KEY = ""
 def x_units_for_domain(domain: str) -> dict:
     """Devuelve el diccionario de unidades de eje X correspondiente al dominio."""
     return FREQ_UNITS if domain == "freq" else TIME_UNITS
+
+
+def _unwrap_deg_phase(v: np.ndarray) -> np.ndarray:
+    """
+    Desenvuelve una traza de fase en grados, eliminando los saltos
+    artificiales de +-360 grados que introduce un instrumento de medición
+    (o el formato Bode complejo de LTspice) al plegar una fase que en
+    realidad sigue creciendo/decreciendo de forma continua de vuelta a un
+    rango fijo (típicamente -180..180) -- ver `bode2.csv`/capturas del
+    usuario: la fase cae por debajo de -180° y el instrumento la reporta
+    como +189° en la siguiente muestra, un salto vertical de ~360° en el
+    gráfico en vez de la continuación real de la curva.
+
+    Opera en grados crudos, ANTES de ganancia/offset/inversión
+    (`Signal.processed()`): el salto de +-360° vive en la unidad del
+    instrumento, no en la unidad ya escalada -- desenvolver antes de
+    escalar/desplazar es correcto para cualquier ganancia/offset, porque
+    ambos son operaciones continuas (una escala u offset de una curva ya
+    continua no puede reintroducir un salto).
+
+    `np.unwrap(..., period=360)` asume una secuencia sin NaN; `build_signal`
+    ya descarta pares NaN al cargar, pero por si esta función se llama
+    sobre datos con huecos (p.ej. una traza de fase editada a mano), los
+    NaN se enmascaran antes de desenvolver y se reinsertan en su posición
+    original en vez de dejar que se propaguen a través de `np.diff`.
+    """
+    v = np.asarray(v, dtype=float)
+    mask = np.isfinite(v)
+    if mask.sum() < 2:
+        return v
+    out = v.copy()
+    out[mask] = np.unwrap(v[mask], period=360.0)
+    return out
 
 
 def y_units_for_kind(y_kind: str) -> dict:
@@ -149,18 +182,40 @@ class Signal:
     missing: bool = False
     source_rel: Optional[str] = None
 
+    # Math channel (see core/math_channels.py). `math_expr` is None for a
+    # trace loaded from a file. For a math channel, `t_raw`/`v_raw` hold the
+    # last evaluated result in base units and are recomputed from the
+    # operands on every redraw (`refresh_math_signals`); `math_operands`
+    # maps an alias ("A".."D") to the uid of the trace it reads, and
+    # `math_error` is the last evaluation error (runtime only, never saved).
+    math_expr: Optional[str] = None
+    math_operands: dict = field(default_factory=dict)
+    math_error: Optional[str] = None
+
+    @property
+    def is_math(self) -> bool:
+        return bool(self.math_expr)
+
     def processed(self) -> tuple[np.ndarray, np.ndarray]:
-        """Devuelve (x, y) en la unidad base del dominio/tipo, con offset/ganancia/inversión aplicados."""
+        """Devuelve (x, y) en la unidad base del dominio/tipo, con offset/ganancia/inversión aplicados.
+
+        Para `y_kind == "deg"` la fase se desenvuelve (`_unwrap_deg_phase`)
+        antes de aplicar ganancia/offset/inversión -- ver esa función para
+        el porqué.
+        """
         x_units = x_units_for_domain(self.domain)
         y_units = y_units_for_kind(self.y_kind)
         t = self.t_raw * x_units[self.unit_t_in] + self.t_offset
+        v_raw = self.v_raw
+        if self.y_kind == "deg":
+            v_raw = _unwrap_deg_phase(v_raw)
         # `.get(..., 1.0)`: for `y_kind == "custom"`, `unit_v_in` holds
         # whatever free text the user typed as the unit label (see
         # `y_units_for_kind`), which is never a key of `y_units` itself
         # (that dict only ever has the "" placeholder) -- so this must not
         # be a direct `y_units[self.unit_v_in]` index or a custom-unit
         # signal would raise KeyError on every redraw.
-        v = self.v_raw * y_units.get(self.unit_v_in, 1.0) * self.gain + self.v_offset
+        v = v_raw * y_units.get(self.unit_v_in, 1.0) * self.gain + self.v_offset
         if self.invert:
             v = -v
         return t, v

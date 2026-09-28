@@ -36,6 +36,18 @@ _EN: dict[str, str] = {
     "LabPlotter": "LabPlotter",
     "+  Abrir archivo": "+  Open file",
     "Quitar": "Remove",
+    "Anotar valor": "Annotate value",
+    "Tamaño del eje": "Axis size",
+    "Ticks X manuales": "Manual X ticks",
+    "Ticks X": "X ticks",
+    "Ticks Y manuales": "Manual Y ticks",
+    "Ticks Y": "Y ticks",
+    ("Lista de valores separados por espacio, en la unidad "
+     "del eje elegida (ej. «0 30 60 80 120»). Destildado, o "
+     "sin números válidos, vuelve al escalado automático."):
+        ("List of values separated by spaces, in the axis's chosen "
+         "unit (e.g. «0 30 60 80 120»). Unchecked, or with no valid "
+         "numbers, falls back to automatic scaling."),
     "Quitar todas": "Remove all",
     "Aplicar": "Apply",
     "Aplicar cambios": "Apply changes",
@@ -64,6 +76,7 @@ _EN: dict[str, str] = {
     "Anotaciones": "Annotations",
     "Opciones de cursor": "Cursor options",
     "Estilo": "Style",
+    "Estilo y ubicación": "Style and placement",
     "Posición de la etiqueta": "Label position",
     "Atajos": "Shortcuts",
     "Márgenes": "Margins",
@@ -334,8 +347,55 @@ _EN: dict[str, str] = {
     "punto Texto X/Y en vez de la posición automática.":
         "The text can run parallel to the line, or sit fixed at the "
         "Text X/Y point instead of the automatic position.",
+    "Marcar valor en el eje": "Mark value on the axis",
+    "Lado del eje": "Axis side",
+    "Abajo": "Bottom",
+    "Arriba": "Top",
+    "Izquierda": "Left",
+    "Derecha": "Right",
+    "Texto en el eje": "Axis text",
+    "Fuente del eje": "Axis font",
+    "Peso del eje": "Axis weight",
+    "Estilo del eje": "Axis style",
+    "Si se deja vacío, el eje muestra el mismo Texto que la "
+    "etiqueta -- nunca el número. La fuente del eje es "
+    "independiente de la de la etiqueta; \"Tamaño del eje\" "
+    "en 0 hereda el tamaño normal de los ticks. \"Lado del "
+    "eje\" decide si la marca va del lado de siempre (abajo/"
+    "izquierda) o del opuesto (arriba/derecha), lejos de "
+    "los ticks normales.":
+        "Left empty, the axis shows the same Text as the label -- "
+        "never the number. The axis font is independent from the "
+        "label's; \"Axis size\" at 0 inherits the ticks' normal "
+        "size. \"Axis side\" decides whether the mark sits on "
+        "its usual side (bottom/left) or the opposite one (top/"
+        "right), away from the normal ticks.",
     "sin cruce": "no crossing",
     "(sin texto)": "(no text)",
+    "Cota": "Dimension",
+    "Orientación": "Orientation",
+    "Automática": "Automatic",
+    "Horizontal": "Horizontal",
+    "Vertical": "Vertical",
+    "Texto automático": "Automatic text",
+    "«Automática» calcula el texto como la distancia "
+    "medida entre los dos puntos, en la unidad del eje "
+    "elegido -- «Horizontal»/«Vertical» además fuerzan la "
+    "cota a un solo eje en vez del segmento libre "
+    "capturado.":
+        "“Automatic” computes the text as the distance measured "
+        "between the two points, in the chosen axis's unit -- "
+        "“Horizontal”/“Vertical” additionally force the "
+        "dimension line onto a single axis instead of the freely "
+        "captured segment.",
+    # --- axis selector ("Eje") ---------------------------------------------
+    # Which of the axes currently on screen (Y1/Y2, or two independent Bode
+    # subplots) a cursor/annotation is anchored to. See `App._axes_context`.
+    "Eje": "Axis",
+    "Principal": "Primary",
+    "Y1": "Y1",
+    "Y2": "Y2",
+    "Fase": "Phase",
 
     # --- dialogs, messages ------------------------------------------------
     "Sin selección": "Nothing selected",
@@ -605,11 +665,36 @@ _EN: dict[str, str] = {
     "Unidad Y2 manual": "Manual Y2 unit",
     "s/u": "n/u",
     "Con «manual» tildado podés escribir cualquier texto en el combo de "
-    "unidad de ese eje (o dejarlo vacío para no mostrar ninguna) -- no hay "
-    "conversión de prefijos para una unidad que no sea una de las conocidas.":
+    "unidad de ese eje (o dejarlo vacío para no mostrar ninguna). Sin "
+    "«Factor», una unidad que no sea una de las conocidas no convierte "
+    "nada (queda ×1); con «Factor» cargado, el eje entero se escala "
+    "dividiendo por ese número en vez de por el de la unidad elegida -- "
+    "p. ej. unidad «u.a.» + factor «2.2k» para mostrar el dato crudo "
+    "dividido 2200, con la etiqueta que quieras.":
         "With “manual” ticked you can type any text in that axis' unit combo "
-        "(or leave it empty to show none) -- there is no prefix conversion "
-        "for a unit that is not one of the known ones.",
+        "(or leave it empty to show none). Without a “Factor”, a unit that "
+        "is not one of the known ones converts nothing (stays ×1); with a "
+        "“Factor” set, the whole axis is scaled by dividing by that number "
+        "instead of the chosen unit’s -- e.g. unit “u.a.” + factor “2.2k” to "
+        "show the raw data divided by 2200, with whatever label you want.",
+    "Decimales del valor": "Value decimals",
+    "Cantidad de decimales del valor que muestra el tag del cursor y el "
+    "que queda fijo al usar «Anotar valor».":
+        "Number of decimals for the value shown in the cursor tag and "
+        "the one that stays fixed when using “Anotar valor”.",
+    "Factor X": "X factor",
+    "Factor Y1": "Y1 factor",
+    "Factor Y2": "Y2 factor",
+    "Decimales X manuales": "Manual X decimals",
+    "Decimales X": "X decimals",
+    "Decimales Y manuales": "Manual Y decimals",
+    "Decimales Y": "Y decimals",
+    "Cantidad fija de decimales para los números del eje (0 a 6), sólo "
+    "en escala lineal. Destildado vuelve al formato automático de "
+    "Matplotlib de siempre.":
+        "Fixed number of decimals for the axis numbers (0 to 6), linear "
+        "scale only. Unticked reverts to Matplotlib’s usual automatic "
+        "format.",
     "Unidad en la que vienen los datos del archivo. Con «Magnitud: custom» "
     "el combo de unidad acepta texto libre (o vacío, para no mostrar ninguna "
     "unidad) -- no hay conversión de prefijos para una magnitud propia.":
@@ -692,6 +777,186 @@ _EN: dict[str, str] = {
         "Add this figure as one more panel -- editing rows and exporting "
         "the board live in the “Board” stage.",
     "Etiquetas": "Labels",
+
+    # --- "Cursores y anotaciones" panel redesign (novice-facing, 2026-09) --
+    # Cursor pane ------------------------------------------------------------
+    "Cursor vertical": "Vertical cursor",
+    "Cursor horizontal": "Horizontal cursor",
+    "Eliminar cursor": "Remove cursor",
+    "Fijar este valor": "Fix this value",
+    "Hacé clic en el gráfico para colocarlo. Arrastralo para medir una "
+    "distancia.":
+        "Click on the chart to place it. Drag it to measure a distance.",
+    "Cursor listo: hacé clic en el gráfico para colocarlo.":
+        "Cursor ready: click on the chart to place it.",
+    "Valores medidos": "Measured values",
+    "Más opciones de cursores": "More cursor options",
+    "Ajustar al punto más cercano": "Snap to nearest point",
+    "Mostrar nombre en el gráfico": "Show name on the chart",
+    "Mostrar el valor medido": "Show the measured value",
+    "Cantidad de decimales": "Number of decimals",
+    "Cuántos decimales mostrar en el valor del cursor y al usar «Fijar "
+    "este valor».":
+        "How many decimals to show in the cursor's value, and when using "
+        "«Fix this value».",
+    "Ubicar en un valor exacto": "Place at an exact value",
+    "Deslizar para mover": "Drag to move",
+    "Elegí un cursor de la lista para moverlo.":
+        "Choose a cursor from the list to move it.",
+
+    # Annotation pane: essentials always visible -----------------------------
+    "¿Qué querés agregar?": "What do you want to add?",
+    "¿En qué eje va?": "Which axis does it go on?",
+    "Texto que se muestra": "Text that appears",
+    "Podés escribir fórmulas, ej: $f_0 = 9{,}61\\,$kHz":
+        "You can write formulas, e.g. $f_0 = 9{,}61\\,$kHz",
+    "Marcar un punto en el gráfico": "Mark a point on the chart",
+    "Marcar el segundo punto": "Mark the second point",
+    "Prefiero escribir las coordenadas": "I'd rather type the coordinates",
+    "Escribí los valores exactos si preferís no hacer clic en el gráfico.":
+        "Type the exact values if you'd rather not click on the chart.",
+    "¿Cómo medir?": "How to measure?",
+    "Completar el texto automáticamente": "Fill in the text automatically",
+    "«Automática» mide la distancia real entre los dos puntos. «Horizontal» "
+    "o «Vertical» miden solo en esa dirección.":
+        "«Automatic» measures the real distance between the two points. "
+        "«Horizontal» or «Vertical» measure only along that direction.",
+    "Estilo ya armado": "Ready-made style",
+    "Usar esta plantilla": "Use this style",
+    "Aplica un conjunto de estilos ya elegidos. Podés seguir ajustando en "
+    "«Personalizar».":
+        "Applies a ready-made set of styles. You can keep tweaking them "
+        "under «Customize».",
+    "Clásico": "Classic",
+    "Destacar un punto": "Highlight a point",
+    "Medir una distancia": "Measure a distance",
+
+    # Annotation pane: "Personalizar" accordions -----------------------------
+    "Personalizar": "Customize",
+    "Estilo visual": "Visual style",
+    "Tipo de línea": "Line type",
+    "Tipo de flecha": "Arrow type",
+    "Grosor": "Thickness",
+    "Tamaño de letra": "Font size",
+    "Fondo alrededor del texto": "Background behind the text",
+    "Transparencia": "Transparency",
+    "Tipo de letra": "Font",
+    "Negrita": "Bold",
+    "Cursiva": "Italic",
+    "Alineación horizontal": "Horizontal alignment",
+    "Alineación vertical": "Vertical alignment",
+    "Centro": "Center",
+    "Línea base": "Baseline",
+    "La tipografía elegida aplica al texto normal. Lo que esté entre signos "
+    "$...$ usa el formato de fórmulas.":
+        "The chosen typography applies to plain text. Anything between "
+        "$...$ signs uses the formula formatting.",
+    "Ubicación del texto": "Text position",
+    "Separación horizontal": "Horizontal offset",
+    "Separación vertical": "Vertical offset",
+    "Girar el texto": "Rotate the text",
+    "Posición a lo largo de la línea": "Position along the line",
+    "Girar el texto junto con la línea": "Rotate the text with the line",
+    "Elegir un punto fijo para el texto": "Pin the text to a fixed point",
+    "Posición X del texto": "Text's X position",
+    "Posición Y del texto": "Text's Y position",
+    "Marcar posición en el gráfico": "Mark position on the chart",
+    "El texto puede girar junto con la línea, o quedar fijo en un punto "
+    "que vos elijas.":
+        "The text can rotate with the line, or stay fixed at a point you "
+        "choose.",
+    "Marca sobre el eje": "Mark on the axis",
+    "Mostrar este valor en el eje": "Show this value on the axis",
+    "¿De qué lado?": "Which side?",
+    "Texto a mostrar en el eje": "Text to show on the axis",
+    "Si dejás el texto vacío, se muestra el mismo Texto de arriba. El "
+    "tamaño y la tipografía de acá son independientes de la etiqueta "
+    "flotante.":
+        "If you leave the text empty, it shows the same Text from above. "
+        "The size and typography here are independent from the floating "
+        "label.",
+
+    # Annotation pane: actions, list, file I/O -------------------------------
+    "Agregar al gráfico": "Add to chart",
+    "Guardar cambios": "Save changes",
+    "Anotaciones en este gráfico": "Annotations in this chart",
+    "Borrar todas": "Delete all",
+    "Guardar en un archivo": "Save to a file",
+    "Cargar desde un archivo": "Load from a file",
+
+    # Novice labels for raw matplotlib codes (linestyle/arrow/weight/style/
+    # alignment) -- the underlying id (kept in `gui/overlays.py`) is unchanged.
+    "Discontinua": "Dashed",
+    "Sólida": "Solid",
+    "Guión y punto": "Dash-dot",
+    "Punteada": "Dotted",
+    "Flecha simple": "Simple arrow",
+    "Flecha invertida": "Reversed arrow",
+    "Flecha doble": "Double arrow",
+    "Flecha rellena": "Filled arrow",
+    "Doble flecha rellena": "Double filled arrow",
+    "Sin punta": "No arrowhead",
+    # "Izquierda"/"Derecha"/"Arriba"/"Abajo" (reused here for "Alineación
+    # horizontal" and "¿De qué lado?") already have entries above, from
+    # the axis-side combo this panel has had since an earlier session.
+
+    # --- Math channels (core/math_channels.py, gui/math_dialog.py) --- #
+    "Canal matemático": "Math channel",
+    "ƒ  Canal matemático": "ƒ  Math channel",
+    "Nuevo canal matemático": "New math channel",
+    "Editar canal matemático": "Edit math channel",
+    "Canal matemático creado: {name}": "Math channel created: {name}",
+    "Canales": "Channels",
+    "Operación": "Operation",
+    "Resultado": "Result",
+    "Unidad": "Unit",
+    "Tensión": "Voltage",
+    "Otra (unidad libre)": "Other (free unit)",
+    "ej.: W, A, V²": "e.g. W, A, V²",
+    "Crear canal": "Create channel",
+    "Editar operación": "Edit operation",
+    "Usa: {aliases}": "Uses: {aliases}",
+    "Suavizar A": "Smooth A",
+    "Sin trazas": "No traces",
+    "Combiná trazas con una operación, como el MATH de un osciloscopio. El resultado se recalcula solo cuando cambian las trazas de origen.":
+        "Combine traces with an operation, like an oscilloscope's MATH function. The result is recomputed automatically when the source traces change.",
+    "Funciones: {fns}. Constantes: pi, e; «t» es el eje X (tiempo o frecuencia). Se aceptan prefijos SI: 1k, 10m, 4.7u. Decimales con punto.":
+        "Functions: {fns}. Constants: pi, e; \"t\" is the X axis (time or frequency). SI prefixes accepted: 1k, 10m, 4.7u. Use a dot as decimal separator.",
+    "Se recalcula solo al cambiar las trazas de origen. El dominio y las unidades de origen los define la operación; ganancia, offset e inversión de abajo se aplican encima.":
+        "Recomputed automatically when the source traces change. Domain and source units come from the operation; gain, offset and inversion below are applied on top.",
+    "Cargá al menos una traza antes de crear un canal matemático.":
+        "Load at least one trace before creating a math channel.",
+    "Estos canales matemáticos la usan y van a quedar con error: {names}":
+        "These math channels use it and will show an error: {names}",
+    "El resultado no tiene ningún valor finito.": "The result has no finite value.",
+    "Escribí una operación (por ejemplo: A - B).": "Type an operation (for example: A - B).",
+    "Operación mal escrita: revisá paréntesis y operadores.":
+        "Malformed operation: check parentheses and operators.",
+    "Operador no permitido.": "Operator not allowed.",
+    "Sólo se admiten números como constantes.": "Only numbers are allowed as constants.",
+    "Nombre desconocido: «{name}».": "Unknown name: \"{name}\".",
+    "Función no permitida.": "Function not allowed.",
+    "Las funciones no aceptan argumentos con nombre.": "Functions don't take keyword arguments.",
+    "{fn}() recibe {n} argumento(s).": "{fn}() takes {n} argument(s).",
+    "Construcción no permitida en la operación.": "Construct not allowed in the operation.",
+    "«{name}» es una función: usala como {name}(...).":
+        "\"{name}\" is a function: use it as {name}(...).",
+    "El canal {alias} no está asignado a ninguna traza.": "Channel {alias} isn't bound to any trace.",
+    "El canal {alias} no tiene datos suficientes.": "Channel {alias} doesn't have enough data.",
+    "El canal {alias} tiene un error propio.": "Channel {alias} has an error of its own.",
+    "La traza del canal {alias} ya no existe.": "The trace for channel {alias} no longer exists.",
+    "La traza del canal {alias} no tiene su archivo de origen.":
+        "The trace for channel {alias} is missing its source file.",
+    "La operación tiene que usar al menos un canal (A, B, C o D).":
+        "The operation must use at least one channel (A, B, C or D).",
+    "Los canales no se superponen en el eje X.": "The channels don't overlap on the X axis.",
+    "No se pueden combinar trazas de tiempo y de frecuencia.":
+        "Time-domain and frequency-domain traces can't be combined.",
+    "El resultado no tiene la misma cantidad de muestras que los canales.":
+        "The result doesn't have the same number of samples as the channels.",
+    "Referencia circular entre canales matemáticos.": "Circular reference between math channels.",
+    "deriv() necesita al menos 2 muestras.": "deriv() needs at least 2 samples.",
+    "smooth(x, n): n tiene que ser un entero ≥ 1.": "smooth(x, n): n must be an integer ≥ 1.",
 }
 
 
